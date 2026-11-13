@@ -360,20 +360,20 @@ changeBalanceByte path acct = withSqlite path $ \db -> do
 
 headerReq :: BlockHeight -> Request
 headerReq h = Request ClsHeader cid0 (Just h) "GET"
-    (apiPrefix <> "/chain/0/header?minheight=" <> hText <> "&maxheight=" <> hText) Nothing
+    (apiPrefix <> "/chain/0/header?minheight=" <> hText <> "&maxheight=" <> hText) Nothing Nothing
   where
     hText = T.pack (show (fromIntegral h :: Integer))
 
 payloadReq :: BlockPayloadHash -> Request
 payloadReq ph = Request ClsPayload cid0 (Just firstTransferHeight) "GET"
-    (apiPrefix <> "/chain/0/payload/" <> toText ph) Nothing
+    (apiPrefix <> "/chain/0/payload/" <> toText ph) Nothing Nothing
 
 -- | A @/local@ request at 'localTarget' for the coin details of an account.
 --
 localReq :: Int64 -> T.Text -> Request
 localReq now acct = Request ClsLocal cid0 (Just localTarget) "POST"
     (apiPrefix <> "/chain/0/pact/api/v1/local?rewindDepth=" <> depthPlaceholder)
-    (Just (localBody now ("(coin.details " <> T.pack (show acct) <> ")")))
+    (Just (localBody now ("(coin.details " <> T.pack (show acct) <> ")"))) Nothing
 
 localBody :: Int64 -> T.Text -> B.ByteString
 localBody now code = BL.toStrict (encode command)

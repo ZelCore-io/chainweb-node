@@ -149,6 +149,10 @@ data Request = Request
     , _reqPath :: !T.Text
         -- ^ path and query, appended to the base URL of a side
     , _reqBody :: !(Maybe B.ByteString)
+    , _reqEntry :: !(Maybe T.Text)
+        -- ^ the name of the Pact set entry a @/local@ request (local,
+        -- history, preflight) was generated from; the report counts the
+        -- successes of each entry. Never sent.
     }
     deriving (Show, Eq)
 
@@ -176,11 +180,12 @@ instance ToJSON Request where
         , "target" .= _reqTarget r
         , "method" .= T.decodeLatin1 (_reqMethod r)
         , "path" .= _reqPath r
-        ] <> case _reqBody r of
+        ] <> (case _reqBody r of
             Nothing -> []
             Just b -> case T.decodeUtf8' b of
                 Right t -> [ "body" .= t ]
-                Left _ -> [ "bodyB64" .= encodeB64UrlNoPaddingText b ]
+                Left _ -> [ "bodyB64" .= encodeB64UrlNoPaddingText b ])
+        <> [ "entry" .= e | Just e <- [_reqEntry r] ]
 
 instance FromJSON Request where
     parseJSON = withObject "Request" $ \o -> Request
@@ -190,6 +195,7 @@ instance FromJSON Request where
         <*> (T.encodeUtf8 <$> o .: "method")
         <*> o .: "path"
         <*> body o
+        <*> o .:? "entry"
       where
         body o = (fmap T.encodeUtf8 <$> o .:? "body") >>= \case
             Just b -> return (Just b)

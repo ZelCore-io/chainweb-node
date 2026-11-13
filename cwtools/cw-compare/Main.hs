@@ -34,8 +34,10 @@
 -- sampled height is dropped at generation too, with that reason.
 --
 -- Only a run of all 7 classes can pass: one of fewer classes (@--classes@),
--- or one without a poll or SPV request with a real key compared, is at best
--- a partial pass (exit code 4), never a pass.
+-- one with a class that never got a same 2xx answer (identical errors only),
+-- one without a poll or SPV request with a real key compared, or one with a
+-- Pact set entry that expects success and never got a same success, is at
+-- best a partial pass (exit code 4), never a pass.
 --
 -- Exit codes: 0 if the run passes, 4 if it partially passes (no difference,
 -- but not every class), 2 if it fails (a difference), 3 if it is void and
@@ -323,7 +325,17 @@ main = do
             forM_ skips $ \(GenSkip (cls, cid, h) k e) -> logFunctionText logger Warn $
                 "target skipped at generation (" <> requestClassText cls <> ", chain " <> toText cid
                 <> ", height " <> T.pack (show h) <> "): " <> k <> ": " <> e
-            return (rs, _genClasses g, reportGeneration (length targets) [ (c, k) | GenSkip (c, _, _) k _ <- skips ])
+            let entries =
+                    [ (c, _peName e)
+                    | c <- _genClasses g
+                    , e <- generatedEntries (_genSameSnapshot g) pset c
+                    , expectsSuccess e
+                    ]
+            return
+                ( rs
+                , _genClasses g
+                , reportExpectEntries entries . reportGeneration (length targets) [ (c, k) | GenSkip (c, _, _) k _ <- skips ]
+                )
     let runOpts = defaultRunOptions { _roOracleLocalTimeout = 1_000_000 * _optOracleLocalTimeout o }
         compareWith test = runCompareClasses logger runOpts classCov oracle test reqs
     rep0 <- case _optTest o of

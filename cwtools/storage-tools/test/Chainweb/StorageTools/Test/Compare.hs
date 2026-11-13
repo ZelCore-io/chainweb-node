@@ -94,19 +94,19 @@ payloadC = mkHash 'M'  -- the payload of every canonical header of the stubs
 
 payloadReqFor :: BlockPayloadHash -> Request
 payloadReqFor h = Request ClsPayload cid0 (Just 100) methodGet
-    (apiPrefix <> "/chain/0/payload/" <> toText h) Nothing
+    (apiPrefix <> "/chain/0/payload/" <> toText h) Nothing Nothing
 
 payloadReq :: Request
 payloadReq = payloadReqFor payloadA
 
 headerReq :: Request
 headerReq = Request ClsHeader cid0 (Just 100) methodGet
-    (apiPrefix <> "/chain/0/header?minheight=100&maxheight=100") Nothing
+    (apiPrefix <> "/chain/0/header?minheight=100&maxheight=100") Nothing Nothing
 
 localReqAt :: BlockHeight -> Request
 localReqAt h = Request ClsLocal cid0 (Just h) methodPost
     (apiPrefix <> "/chain/0/pact/api/v1/local?rewindDepth=" <> depthPlaceholder)
-    (Just "{\"code\":\"(coin.details \\\"k:00\\\")\"}")
+    (Just "{\"code\":\"(coin.details \\\"k:00\\\")\"}") Nothing
 
 keysReqAt :: BlockHeight -> Request
 keysReqAt h = (localReqAt h) { _reqBody = Just "{\"code\":\"(keys coin.coin-table)\"}" }

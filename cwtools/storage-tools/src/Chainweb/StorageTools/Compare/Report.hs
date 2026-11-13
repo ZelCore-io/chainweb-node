@@ -45,6 +45,9 @@ module Chainweb.StorageTools.Compare.Report
 , reportCompared
 , reportPactFailures
 , reportExpectClasses
+, reportExpectEntries
+, reportEntrySuccess
+, reportHollowEntries
 , reportGeneration
 , reportGenTargets
 , reportGenSkipped
@@ -194,9 +197,13 @@ data Report = Report
     , _repGenSkipped :: !(M.Map (RequestClass, T.Text) Int)
         -- ^ per class and kind, see 'reportGeneration'
     , _repSettings :: ![(T.Text, T.Text)]
+        -- ^ see 'reportSettings'
     , _repRealKey :: !(M.Map RequestClass Int)
         -- ^ see 'reportRealKeyCompared'
-        -- ^ see 'reportSettings'
+    , _repEntrySuccess :: !(M.Map (RequestClass, T.Text) Int)
+        -- ^ see 'reportEntrySuccess'
+    , _repExpectedEntries :: ![(RequestClass, T.Text)]
+        -- ^ see 'reportExpectEntries'
     }
 
 -- | The number of differences kept with their bodies.
@@ -210,7 +217,7 @@ maxBodyBytes :: Int
 maxBodyBytes = 4_096
 
 emptyReport :: Report
-emptyReport = Report mempty mempty mempty mempty mempty 0 mempty 0 0 0 mempty mempty [] 0 mempty [] mempty
+emptyReport = Report mempty mempty mempty mempty mempty 0 mempty 0 0 0 mempty mempty [] 0 mempty [] mempty mempty []
 
 -- | Adds the outcome of a request. The result does not depend on the order
 -- in which outcomes are added.
@@ -218,7 +225,11 @@ emptyReport = Report mempty mempty mempty mempty mempty 0 mempty 0 0 0 mempty me
 addOutcome :: Report -> Outcome -> Report
 addOutcome rep0 o = case v of
     Same -> (counted KindSame rep)
-        { _repSameNon2xx = if is2xx then _repSameNon2xx rep else M.insertWith (+) cls 1 (_repSameNon2xx rep) }
+        { _repSameNon2xx = if is2xx then _repSameNon2xx rep else M.insertWith (+) cls 1 (_repSameNon2xx rep)
+        , _repEntrySuccess = case _reqEntry req of
+            Just e | pactSuccess -> M.insertWith (+) (cls, e) 1 (_repEntrySuccess rep)
+            _ -> _repEntrySuccess rep
+        }
     Allowed rule ev -> (counted KindAllowed rep)
         { _repAllowed = M.insert idx (AllowedSample idx req rule ev (_outDepths o)) (_repAllowed rep) }
     Differ detail -> (counted KindDiffer rep)
@@ -235,8 +246,10 @@ addOutcome rep0 o = case v of
         { _repNoAnswer = maybe id (\na -> M.insertWith (+) na 1) (_outNoAnswer o) (_repNoAnswer rep0)
         , _repPactFailures = if pactFailure then M.insertWith (+) cls 1 (_repPactFailures rep0) else _repPactFailures rep0
         }
-    pactFailure = isPinnedClass cls && case _outOracle o of
-        Just a -> _ansStatus a == 200 && pactResultStatus (_ansBody a) == Just "failure"
+    pactFailure = pactStatusIs "failure"
+    pactSuccess = pactStatusIs "success"
+    pactStatusIs st = isPinnedClass cls && case _outOracle o of
+        Just a -> _ansStatus a == 200 && pactResultStatus (_ansBody a) == Just st
         Nothing -> False
     v = effectiveVerdict (_outVerdict o)
     idx = _outIndex o
@@ -381,6 +394,29 @@ reportPactFailures rep c = M.findWithDefault 0 c (_repPactFailures rep)
 reportExpectClasses :: [RequestClass] -> Report -> Report
 reportExpectClasses cs rep = rep { _repExpected = cs }
 
+-- | The Pact set entries of a generated run that expect success, per class
+-- of the run: @[(class, entry name)]@. Each needs at least one 'Same' answer
+-- with Pact result status success ('reportEntrySuccess'), or the run is at
+-- best 'PartialPass': an entry whose answers are all the same error (a gas
+-- error, reads not allowed, a missing table) compares nothing.
+--
+reportExpectEntries :: [(RequestClass, T.Text)] -> Report -> Report
+reportExpectEntries es rep = rep { _repExpectedEntries = es }
+
+-- | The 'Same' answers of a class and Pact set entry ('_reqEntry') with
+-- status 200 and Pact result status success.
+--
+reportEntrySuccess :: Report -> RequestClass -> T.Text -> Int
+reportEntrySuccess rep c e = M.findWithDefault 0 (c, e) (_repEntrySuccess rep)
+
+-- | The entries of 'reportExpectEntries' without a 'Same' success.
+--
+reportHollowEntries :: Report -> [(RequestClass, T.Text)]
+reportHollowEntries rep = [ x | x@(c, e) <- _repExpectedEntries rep, reportEntrySuccess rep c e == 0 ]
+
+entryText :: (RequestClass, T.Text) -> T.Text
+entryText (c, e) = requestClassText c <> ":" <> e
+
 -- | @reportGeneration targets skipped@: of the @targets@ sampled for a
 -- generated run, the class and kind of those dropped at generation, for
 -- instance because an oracle lookup failed (ruling on Task 6a) or because a
@@ -454,9 +490,13 @@ data GateVerdict
 --
 -- * 'Fail' on any difference, including an allowed one without evidence.
 -- * Otherwise 'Void' if any of 'reportVoidReasons' holds.
--- * Otherwise 'PartialPass' if not every one of the 7 classes has a request
---   compared, with a real key for poll and spv ('reportRealKeyCompared'): a
---   run of fewer classes cannot pass the gate (ruling I1 on Task 6).
+-- * Otherwise 'PartialPass' if not every one of the 7 classes has a 'Same'
+--   2xx answer or an 'Allowed' difference, with a real key for poll and spv
+--   ('reportRealKeyCompared'): a run of fewer classes cannot pass the gate
+--   (ruling I1 on Task 6), nor can one whose class only ever got the same
+--   error (Minor 3 of the P0 review).
+-- * Otherwise 'PartialPass' if a Pact set entry that expects success has no
+--   'Same' success ('reportHollowEntries').
 -- * 'Pass' otherwise.
 --
 reportVerdict :: Report -> GateVerdict
@@ -464,17 +504,20 @@ reportVerdict rep
     | _repDiffCount rep > 0 = Fail
     | not (null (reportVoidReasons rep)) = Void
     | not (null (reportMissingClasses rep)) = PartialPass
+    | not (null (reportHollowEntries rep)) = PartialPass
     | otherwise = Pass
 
 -- | The classes that keep a run without differences from 'Pass': those
--- without a request compared, and poll and spv without one with a real key.
+-- without a 'Same' 2xx answer or an 'Allowed' difference (identical errors
+-- do not cover a class), and poll and spv without a request with a real key
+-- compared.
 --
 reportMissingClasses :: Report -> [RequestClass]
 reportMissingClasses rep = filter (not . covers) allRequestClasses
   where
     covers c
         | c `elem` [ClsPoll, ClsSpv] = reportRealKeyCompared rep c > 0
-        | otherwise = reportComparedIn rep c > 0
+        | otherwise = reportSame2xx rep c > 0 || reportCount rep c KindAllowed > 0
 
 -- | Why the run says nothing and must be rerun; empty if it does say
 -- something:
@@ -611,9 +654,15 @@ reportSummary rep = T.unlines $
     [ "verdict: " <> T.pack (show (reportVerdict rep))
     ]
     <> [ "  void: " <> r | reportVerdict rep == Void, r <- reportVoidReasons rep ]
-    <> [ "  partial: no request compared (for poll and spv: with a real key) in "
+    <> [ "  partial: no same 2xx or allowed answer (for poll and spv: no request with a real key) in "
         <> T.intercalate ", " (map requestClassText (reportMissingClasses rep))
        | reportVerdict rep == PartialPass
+       , not (null (reportMissingClasses rep))
+       ]
+    <> [ "  partial: no same Pact success for the entries that expect one: "
+        <> T.intercalate ", " (map entryText (reportHollowEntries rep))
+       | reportVerdict rep == PartialPass
+       , not (null (reportHollowEntries rep))
        ]
     <> [ "generation: " <> sh (_repGenTargets rep) <> " targets, "
         <> sh (reportGenSkippedTotal rep) <> " skipped"
@@ -679,6 +728,11 @@ instance ToJSON Report where
         [ "verdict" .= show (reportVerdict rep)
         , "voidReasons" .= reportVoidReasons rep
         , "missingClasses" .= map requestClassText (reportMissingClasses rep)
+        , "hollowEntries" .= map entryText (reportHollowEntries rep)
+        , "entrySameSuccess" .= object
+            [ K.fromText (entryText ce) .= n
+            | (ce, n) <- M.toList (M.union (_repEntrySuccess rep) (M.fromList [ (x, 0) | x <- _repExpectedEntries rep ]))
+            ]
         , "classesOfRun" .= map requestClassText (_repExpected rep)
         , "generation" .= object
             [ "targets" .= _repGenTargets rep

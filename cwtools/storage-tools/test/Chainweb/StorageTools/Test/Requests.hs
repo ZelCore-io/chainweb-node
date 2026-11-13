@@ -27,7 +27,7 @@ import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as B8
 import qualified Data.ByteString.Lazy as BL
 import Data.IORef
-import Data.List (isInfixOf, isPrefixOf, nub)
+import Data.List (isInfixOf, isPrefixOf, nub, sort)
 import qualified Data.List.NonEmpty as NE
 import qualified Data.Map.Strict as M
 import Data.Maybe (fromMaybe, mapMaybe)
@@ -96,6 +96,8 @@ tests = testGroup "Requests"
     , testCase "an oracle lookup whose connection closes without an answer is sent once, never again" lookupNotResent
     , testCase "a custom Pact set fails closed: a cont entry needs a step; a live entry needs a bound, step 0, no scan" customPactSet
     , testCase "a request file holds only the read requests of the 7 classes, pinned ones with {rewindDepth} and a target" requestFileAllowlist
+    , testCase "a class whose every compared answer is the same non-2xx is at best PartialPass" sameNon2xxOnly
+    , testCase "a Pact set entry that expects success needs a Same success in each class, or the run is at best PartialPass" hollowEntries
     ]
 
 cid0, cid3, cid10 :: ChainId
@@ -442,7 +444,7 @@ spvRealProof = do
         bad = TransactionOutputProof cid0 proof { _merkleProofObject = obj' }
         spvBody p = BL.toStrict (encode (encodeB64UrlNoPaddingText (BL.toStrict (encode p))))
         cov = Coverage (M.fromList [(cid0, [(0, 1_000)])])
-        req = Request ClsSpv cid0 (Just 300) methodPost (prefix <> "/pact/spv") (Just "{}")
+        req = Request ClsSpv cid0 (Just 300) methodPost (prefix <> "/pact/spv") (Just "{}") Nothing
         ans = Answer 200
     -- the encoded proof decodes to the same proof
     (decodeStrict (spvBody good) >>= \case
@@ -465,7 +467,7 @@ spvRealProof = do
 outcomeWith :: Int -> RequestClass -> Int -> B.ByteString -> Outcome
 outcomeWith i c s b = Outcome
     { _outIndex = i
-    , _outRequest = Request c cid0 (Just 300) methodPost (prefix <> "/pact/api/v1/local?rewindDepth=" <> depthPlaceholder) (Just "{}")
+    , _outRequest = Request c cid0 (Just 300) methodPost (prefix <> "/pact/api/v1/local?rewindDepth=" <> depthPlaceholder) (Just "{}") Nothing
     , _outVerdict = Same
     , _outOracle = Just (Answer s b Nothing)
     , _outTest = Just (Answer s b Nothing)
@@ -563,10 +565,10 @@ pactSetBounds = do
         (any (not . _peSameSnapshotOnly) (byName "namespace-before-creation"))
     -- the function finds what the checks look for
     let bad = PactSet
-            [ PactEntry "unbounded" [ClsLocal] PactExec "(coin.details \"{account}\")" 0 "no bound" False
-            , PactEntry "scan" [ClsLocal] PactExec "(keys  coin.coin-table)" 0 "Bound: none" False
-            , PactEntry "history" [ClsHistory] PactExec "( txids coin.coin-table 0)" 0 "Bound: none" False
-            , PactEntry "step1" [ClsLocal] PactCont "{pactId}" 1 "state" True
+            [ PactEntry "unbounded" [ClsLocal] PactExec "(coin.details \"{account}\")" 0 "no bound" False ExpectSuccess
+            , PactEntry "scan" [ClsLocal] PactExec "(keys  coin.coin-table)" 0 "Bound: none" False ExpectSuccess
+            , PactEntry "history" [ClsHistory] PactExec "( txids coin.coin-table 0)" 0 "Bound: none" False ExpectSuccess
+            , PactEntry "step1" [ClsLocal] PactCont "{pactId}" 1 "state" True ExpectFailure
             ]
     map (T.takeWhile (/= ':')) (pactSetProblems bad) @?= ["entry unbounded", "entry scan", "entry history", "entry step1"]
 
@@ -642,7 +644,7 @@ spvTargetCoverage = do
     let cid1 = unsafeChainId 1
         spvTo :: T.Text -> Request
         spvTo trg = Request ClsSpv cid0 (Just 300) methodPost (prefix <> "/pact/spv")
-            (Just (BL.toStrict (encode (object ["requestKey" .= ("k" :: T.Text), "targetChainId" .= trg]))))
+            (Just (BL.toStrict (encode (object ["requestKey" .= ("k" :: T.Text), "targetChainId" .= trg])))) Nothing
         cov = Coverage . M.fromList
         c0 = (cid0, [(0, 1_000)])
     preJudge (cov [c0]) (spvTo "1") @?= Just (Skipped NotCovered)
@@ -718,6 +720,21 @@ customPactSet = do
     ok2 <- loadText $ entry ["code: '(keys coin.coin-table)'", "sameSnapshotOnly: true", "why: 'no bound'"]
     either (assertFailure . show) (\s -> map _peSameSnapshotOnly (_pactEntries s) @?= [True]) ok2
 
+-- | Every class Same with status 200, but the header class only with the same
+-- 404: not a pass (Minor 3 of the P0 review).
+--
+sameNon2xxOnly :: Assertion
+sameNon2xxOnly = do
+    let body c = if c == ClsPoll then "{\"rk\":{}}" else "{}"
+        status c = if c == ClsHeader then 404 else 200
+        rep = reportExpectClasses allRequestClasses $ foldl addOutcome emptyReport
+            [ outcomeWith i c (status c) (body c) | (i, c) <- zip [0 ..] allRequestClasses ]
+    reportVerdict rep @?= PartialPass
+    reportMissingClasses rep @?= [ClsHeader]
+    -- an allowed difference covers its class
+    let allowed = rep `addOutcome` (outcomeWith 9 ClsHeader 200 "{}") { _outVerdict = Allowed AllowOrphanPayload "evidence" }
+    reportVerdict allowed @?= Pass
+
 -- | Every generated request passes 'allowedRequest'; a request file line
 -- that is not a read of the 7 classes, or a pinned one without the depth
 -- placeholder or a target, stops the file with its line number.
@@ -730,8 +747,8 @@ requestFileAllowlist = do
         rs <- sequence [gen api s c h, genSnap api s c h]
         forM_ rs $ \r -> allowedRequest v r @?= Right ()
     let local = Request ClsLocal cid0 (Just 300) methodPost
-            (prefix <> "/pact/api/v1/local?rewindDepth=" <> depthPlaceholder) (Just "{}")
-        payload = Request ClsPayload cid0 (Just 300) methodGet (prefix <> "/payload/P300") Nothing
+            (prefix <> "/pact/api/v1/local?rewindDepth=" <> depthPlaceholder) (Just "{}") Nothing
+        payload = Request ClsPayload cid0 (Just 300) methodGet (prefix <> "/payload/P300") Nothing Nothing
         file r = BL.toStrict (encode local) <> "\n\n" <> BL.toStrict (encode r) <> "\n"
         refused what r = case parseRequestFile v (file r) of
             Left e -> assertBool (what <> ": " <> e) ("3: not allowed: " `isInfixOf` e)
@@ -759,3 +776,47 @@ requestFileAllowlist = do
     case parseRequestFile v "{\"class\":\"payload\"}\n" of
         Left e -> assertBool e ("1: " `isPrefixOf` e)
         Right x -> assertFailure (show x)
+
+-- | The hollow Pact classes of the ledger: an entry that expects success and
+-- only ever got the same error is not a pass; entries that expect a failure
+-- are exempt.
+--
+hollowEntries :: Assertion
+hollowEntries = do
+    let success = "{\"result\":{\"status\":\"success\",\"data\":1},\"metaData\":null}"
+        failure = "{\"result\":{\"status\":\"failure\",\"error\":{}},\"metaData\":null}"
+        preSuccess = "{\"preflightResult\":{\"result\":{\"status\":\"success\"}},\"preflightWarnings\":[]}"
+        withEntry e o = o { _outRequest = (_outRequest o) { _reqEntry = Just e } }
+        body c = if c == ClsPoll then "{\"rk\":{}}" else "{}"
+        others = [ outcomeWith i c 200 (body c) | (i, c) <- zip [0 ..] allRequestClasses, not (isPinnedClass c) ]
+        pact =
+            [ withEntry "coin-details" (outcomeWith 10 ClsLocal 200 failure)
+            , withEntry "coin-details" (outcomeWith 11 ClsLocal 200 failure)
+            , withEntry "defpact-state" (outcomeWith 12 ClsLocal 200 failure)
+            , withEntry "txlog" (outcomeWith 13 ClsHistory 200 success)
+            , withEntry "coin-details" (outcomeWith 14 ClsPreflight 200 preSuccess)
+            ]
+        expected = [(ClsLocal, "coin-details"), (ClsHistory, "txlog"), (ClsPreflight, "coin-details")]
+        rep = reportExpectEntries expected $ reportExpectClasses allRequestClasses $
+            foldl addOutcome emptyReport (others <> pact)
+    reportVerdict rep @?= PartialPass
+    reportHollowEntries rep @?= [(ClsLocal, "coin-details")]
+    reportEntrySuccess rep ClsPreflight "coin-details" @?= 1
+    assertBool "the summary names the entry" ("local:coin-details" `isInfixOf` T.unpack (reportSummary rep))
+    field ["hollowEntries"] (toJSON rep) @?= Just (toJSON ["local:coin-details" :: T.Text])
+    field ["entrySameSuccess", "history:txlog"] (toJSON rep) @?= Just (Number 1)
+    reportVerdict (rep `addOutcome` withEntry "coin-details" (outcomeWith 15 ClsLocal 200 success)) @?= Pass
+    -- a success that differs is no evidence (and fails the run)
+    let differ = (withEntry "coin-details" (outcomeWith 15 ClsLocal 200 success)) { _outVerdict = Differ "d" }
+    reportHollowEntries (rep `addOutcome` differ) @?= [(ClsLocal, "coin-details")]
+    -- the built-in set: the entries that expect no success
+    sort [ _peName e | e <- _pactEntries defaultPactSet, not (expectsSuccess e) ]
+        @?= ["defpact-state", "keys-large-table", "namespace-before-creation", "table-before-creation"]
+    -- generated /local requests carry their entry, which a request file keeps
+    withOracle $ \_ _ api _ -> do
+        r <- gen api 1 ClsLocal 300
+        assertBool ("an entry of the set: " <> show (_reqEntry r)) $
+            maybe False (`elem` map _peName (_pactEntries defaultPactSet)) (_reqEntry r)
+        decode (encode r) @?= Just r
+        p <- gen api 1 ClsPayload 300
+        _reqEntry p @?= Nothing

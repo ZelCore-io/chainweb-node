@@ -14,6 +14,8 @@
 --
 module Chainweb.StorageTools.Compare.PactSet
 ( PactKind(..)
+, PactExpect(..)
+, expectsSuccess
 , PactEntry(..)
 , PactSet(..)
 , defaultPactSet
@@ -42,6 +44,21 @@ import Chainweb.StorageTools.Compare.Types
 data PactKind = PactExec | PactCont
     deriving (Show, Eq)
 
+-- | The Pact result an entry expects on both sides, from its @why@.
+--
+data PactExpect
+    = ExpectSuccess
+        -- ^ a run that passes needs at least one 'Same' answer of the entry
+        -- with Pact result status success, per class
+    | ExpectFailure
+        -- ^ the entry tests an error both sides must give alike
+    | ExpectEither
+        -- ^ success or failure, depending on the target height
+    deriving (Show, Eq)
+
+expectsSuccess :: PactEntry -> Bool
+expectsSuccess = (== ExpectSuccess) . _peExpect
+
 data PactEntry = PactEntry
     { _peName :: !T.Text
     , _peClasses :: ![RequestClass]
@@ -60,6 +77,8 @@ data PactEntry = PactEntry
         -- ^ the entry is generated only with @--same-snapshot@ (both sides
         -- copied from one snapshot, never a production node): its cost has
         -- no known bound on a live node, or its answer depends on the tip
+    , _peExpect :: !PactExpect
+        -- ^ @expect: success | failure | either@, default success
     }
     deriving (Show, Eq)
 
@@ -88,6 +107,11 @@ instance FromJSON PactEntry where
             <*> pure step
             <*> o .:? "why" .!= ""
             <*> o .:? "sameSnapshotOnly" .!= False
+            <*> (o .:? "expect" .!= ("success" :: T.Text) >>= \case
+                "success" -> return ExpectSuccess
+                "failure" -> return ExpectFailure
+                "either" -> return ExpectEither
+                e -> fail $ "entry " <> T.unpack name <> ": expect is success, failure or either, not " <> T.unpack e)
 
 instance FromJSON PactSet where
     parseJSON = withObject "PactSet" $ \o -> PactSet <$> o .: "entries"

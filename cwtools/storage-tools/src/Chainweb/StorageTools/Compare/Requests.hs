@@ -607,12 +607,12 @@ requestsForWith opts api pset seed (cls, cid, BlockHeight t) = case cls of
                     )
                 | cls == ClsHistory = (defaultLocalMeta { _lmGasLimit = historyGasLimit }, "?rewindDepth=")
                 | otherwise = (defaultLocalMeta, "?rewindDepth=")
-        return $ request (BlockHeight t) methodPost ("/pact/api/v1/local" <> query <> depthPlaceholder)
-            (Just (localCommandWith v cid meta payload seed))
+        return $ (request (BlockHeight t) methodPost ("/pact/api/v1/local" <> query <> depthPlaceholder)
+            (Just (localCommandWith v cid meta payload seed))) { _reqEntry = Just (_peName entry) }
   where
     v = _saVersion api
     g0 = targetGen seed cls cid t
-    request h m path = Request cls cid (Just h) m (chainPrefix api cid <> path)
+    request h m path body = Request cls cid (Just h) m (chainPrefix api cid <> path) body Nothing
     unfold g = let (k, g') = unknownKey g in k : unfold g'
 
 -- | The number of targets whose lookups run at the same time in

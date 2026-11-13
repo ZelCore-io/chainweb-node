@@ -36,6 +36,13 @@
 # --same-snapshot (two copies of one snapshot), never against a production
 # node. Gas does not bound reads: Pact charges keys a flat 40,000 and the
 # history functions after the reads.
+#
+# "expect" is the Pact result the entry gives on both sides: success (the
+# default), failure, or either (it depends on the target height). A run
+# passes only if every entry that expects success, in each class of the run,
+# has at least one Same answer with Pact result status success; an entry
+# whose answers are all the same error proves nothing about the data. Below
+# that, the run is at best a partial pass.
 
 entries:
 
@@ -85,6 +92,7 @@ entries:
     classes: [local]
     code: '(length (keys marmalade-v2.ledger.ledger))'
     sameSnapshotOnly: true
+    expect: either
     why: >-
       keys on a large table; length keeps the answer small, but every key is
       read. No bound on a live node: gas does not bound keys (a flat 40,000), the
@@ -112,6 +120,7 @@ entries:
   - name: table-before-creation
     classes: [local]
     code: '(read marmalade-v2.ledger.ledger "{account}")'
+    expect: failure
     why: >-
       a table created late in the chain's history: below its creation height
       both sides must give the same table-missing error, above it the same
@@ -123,6 +132,7 @@ entries:
   - name: namespace-before-creation
     classes: [local]
     code: '(describe-namespace "marmalade-v2")'
+    expect: either
     why: >-
       a row created late: the marmalade-v2 namespace in SYS:Namespaces. Below
       its creation height both sides give the same not-found error, above it the
@@ -141,6 +151,7 @@ entries:
     kind: cont
     code: '{pactId}'
     step: 0
+    expect: failure
     why: >-
       the defpact state of a continuation (SYS:Pacts). Step 0 never matches a
       stored pact (a continuation runs step + 1), so both sides answer with the
