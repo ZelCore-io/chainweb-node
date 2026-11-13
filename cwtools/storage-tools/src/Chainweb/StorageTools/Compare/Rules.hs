@@ -78,10 +78,28 @@ sshow = T.pack . show
 preJudge :: Coverage -> Request -> Maybe Verdict
 preJudge cov r
     | not (isCovered cov (_reqChain r) (_reqTarget r)) = Just (Skipped NotCovered)
+    | _reqClass r == ClsSpv
+    , Just trg <- spvTargetChain r
+    , not (isCovered cov trg ((+ spvTargetReach) <$> _reqTarget r)) = Just (Skipped NotCovered)
     | isPinnedClass (_reqClass r)
     , not (hasDepthPlaceholder r) || isNothing (_reqTarget r) || isNothing (apiPrefixOfPath (_reqPath r))
         = Just (Skipped Unpinned)
     | otherwise = Nothing
+
+-- | An SPV proof to another chain ends in a header of the target chain at most
+-- this many blocks above the source block: the diameter of the chain graphs of
+-- mainnet and testnet (3). The test side must hold the target chain up to
+-- there, or its proof cannot be the oracle's (Minor 5 of the Task 6 review).
+--
+spvTargetReach :: BlockHeight
+spvTargetReach = 3
+
+-- | The @targetChainId@ of an @/spv@ request body.
+--
+spvTargetChain :: Request -> Maybe ChainId
+spvTargetChain r = _reqBody r >>= decodeStrict
+    >>= parseMaybe (withObject "spv" (.: "targetChainId"))
+    >>= \t -> fromText (t :: T.Text)
 
 -- | Judges the answers of the oracle (first) and of the test side (second).
 --
