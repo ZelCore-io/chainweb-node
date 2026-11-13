@@ -32,6 +32,10 @@ module Chainweb.StorageTools.Compare.Rules
 , preJudge
 , compareBytes
 
+  -- * Request files
+, allowedRequest
+, parseRequestFile
+
   -- * Pins
 , answerPin
 
@@ -51,6 +55,8 @@ import Control.Monad ((>=>))
 import Data.Aeson
 import Data.Aeson.Types (Parser, parseEither, parseMaybe)
 import qualified Data.ByteString as B
+import qualified Data.ByteString.Char8 as B8
+import Data.Char (isAsciiLower, isAsciiUpper, isDigit)
 import Data.Maybe (isJust, isNothing)
 import qualified Data.Text as T
 import Data.MerkleLog (MerkleProof(..))
@@ -85,6 +91,119 @@ preJudge cov r
     , not (hasDepthPlaceholder r) || isNothing (_reqTarget r) || isNothing (apiPrefixOfPath (_reqPath r))
         = Just (Skipped Unpinned)
     | otherwise = Nothing
+
+-- -------------------------------------------------------------------------- --
+-- Request files
+
+-- | Whether a request of a request file (@--requests FILE@) may be sent: the
+-- harness is read-only towards production, so a request file holds only the
+-- read requests of the 7 classes, as the generator makes them. Takes the API
+-- prefix @\/chainweb\/0.0\/{version}@ of the run.
+--
+-- * header: @GET \/cut@, @GET \/chain\/{c}\/header@ (a height range),
+--   @GET \/chain\/{c}\/header\/{hash}@, and the branch query
+--   @POST \/chain\/{c}\/header\/branch@ (a read; the chainweb API takes
+--   its bounds in a body);
+-- * payload: @GET \/chain\/{c}\/payload\/{hash}@ and its @\/outputs@, the
+--   read-only batches @POST \/chain\/{c}\/payload\/batch@ and
+--   @POST \/chain\/{c}\/payload\/outputs\/batch@;
+-- * local, history, preflight: @POST \/chain\/{c}\/pact\/api\/v1\/local@,
+--   which never commits; @preflight=true@ for preflight only, and the rewind
+--   depth always the placeholder @{rewindDepth}@ with a target height, so
+--   that the request is pinned (Minor 5 of the P0 review);
+-- * poll: @POST \/chain\/{c}\/pact\/api\/v1\/poll@;
+-- * spv: @POST \/chain\/{c}\/pact\/spv@.
+--
+-- Nothing else is allowed: no @\/send@, no @\/listen@ (it blocks), no
+-- @PUT \/cut@, no other method. The chain in the path is the chain of the
+-- request, every query parameter is known, a GET has no body and a POST has
+-- one.
+--
+allowedRequest :: T.Text -> Request -> Either T.Text ()
+allowedRequest prefix r = do
+    rest <- maybe (Left ("the path does not start with " <> prefix <> "/")) Right
+        (T.stripPrefix (prefix <> "/") path)
+    let segs = T.splitOn "/" rest
+    unless' (all goodSegment segs) "a path segment is empty, a dot segment, or has a character other than A-Z a-z 0-9 - _"
+    params <- mapM param (if T.null query then [] else T.splitOn "&" query)
+    (method, classes, keys) <- endpoint segs
+    unless' (_reqMethod r == method) ("the method of this path is " <> T.pack (B8.unpack method))
+    unless' (cls `elem` classes) ("this path is not of the class " <> requestClassText cls)
+    unless' (all ((`elem` keys) . fst) params) ("query parameters other than " <> T.intercalate ", " keys)
+    unless' (length params == length (dedup (map fst params))) "a query parameter twice"
+    case method of
+        "GET" -> unless' (isNothing (_reqBody r)) "a GET with a body"
+        _ -> unless' (isJust (_reqBody r)) "a POST without a body"
+    mapM_ (checkValue params) keys
+  where
+    cls = _reqClass r
+    (path, query) = T.drop 1 <$> T.breakOn "?" (_reqPath r)
+    chain = toText (_reqChain r)
+
+    unless' ok e = if ok then Right () else Left e
+    dedup = foldr (\x xs -> if x `elem` xs then xs else x : xs) []
+
+    goodSegment t = not (T.null t) && t /= "." && t /= ".."
+        && T.all (\c -> isAsciiLower c || isAsciiUpper c || isDigit c || c == '-' || c == '_') t
+
+    param t = case T.splitOn "=" t of
+        [k, v] -> Right (k, v)
+        _ -> Left ("a query parameter that is not key=value: " <> t)
+
+    pinned = [ClsLocal, ClsHistory, ClsPreflight]
+    heights = ["minheight", "maxheight", "limit"]
+
+    endpoint = \case
+        ["cut"] -> Right ("GET", [ClsHeader], ["maxheight"])
+        ("chain" : c : xs)
+            | c /= chain -> Left ("the chain in the path is not the chain " <> chain <> " of the request")
+            | otherwise -> chainEndpoint xs
+        _ -> Left "not a read endpoint of the 7 classes"
+
+    chainEndpoint = \case
+        ["header"] -> Right ("GET", [ClsHeader], heights)
+        ["header", "branch"] -> Right ("POST", [ClsHeader], heights)
+        ["header", _] -> Right ("GET", [ClsHeader], [])
+        ["payload", "batch"] -> Right ("POST", [ClsPayload], [])
+        ["payload", "outputs", "batch"] -> Right ("POST", [ClsPayload], [])
+        ["payload", h] | h /= "outputs" -> Right ("GET", [ClsPayload], ["height"])
+        ["payload", h, "outputs"] | h /= "batch" -> Right ("GET", [ClsPayload], ["height"])
+        ["pact", "api", "v1", "local"] -> Right ("POST", pinned, ["rewindDepth", "preflight", "signatureVerification"])
+        ["pact", "api", "v1", "poll"] -> Right ("POST", [ClsPoll], [])
+        ["pact", "spv"] -> Right ("POST", [ClsSpv], [])
+        _ -> Left "not a read endpoint of the 7 classes"
+
+    checkValue params k = case (k, lookup k params) of
+        ("rewindDepth", v)
+            | cls `elem` pinned && v /= Just depthPlaceholder ->
+                Left ("a pinned request needs rewindDepth=" <> depthPlaceholder)
+        ("preflight", v)
+            | cls == ClsPreflight && v /= Just "true" -> Left "a preflight request needs preflight=true"
+            | cls /= ClsPreflight && isJust v -> Left "preflight=... in a request that is not of the class preflight"
+        ("signatureVerification", Just v)
+            | v `notElem` ["true", "false"] -> Left "signatureVerification is true or false"
+        (_, Just v)
+            | k `elem` ("height" : heights), T.null v || not (T.all isDigit v) -> Left (k <> " is not a number")
+        _
+            | k == "rewindDepth", cls `elem` pinned, isNothing (_reqTarget r) ->
+                Left "a pinned request needs a target height"
+            | otherwise -> Right ()
+
+-- | The requests of a request file: one JSON request per line, blank lines
+-- skipped. Fails at the first line that does not decode, or whose request
+-- 'allowedRequest' refuses, with its line number. Takes the API prefix of the
+-- run.
+--
+parseRequestFile :: T.Text -> B.ByteString -> Either String [Request]
+parseRequestFile prefix bs = fmap concat $ mapM line $ zip [1 :: Int ..] (B8.lines bs)
+  where
+    line (i, l)
+        | B8.all (`elem` (" \t\r" :: String)) l = Right []
+        | otherwise = case eitherDecodeStrict' l of
+            Left e -> Left (show i <> ": " <> e)
+            Right r -> case allowedRequest prefix r of
+                Left e -> Left (show i <> ": not allowed: " <> T.unpack e <> ": " <> B8.unpack (_reqMethod r) <> " " <> T.unpack (_reqPath r))
+                Right () -> Right [r]
 
 -- | An SPV proof to another chain ends in a header of the target chain at most
 -- this many blocks above the source block: the diameter of the chain graphs of

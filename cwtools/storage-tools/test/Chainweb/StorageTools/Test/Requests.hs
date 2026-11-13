@@ -27,7 +27,7 @@ import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as B8
 import qualified Data.ByteString.Lazy as BL
 import Data.IORef
-import Data.List (isInfixOf, nub)
+import Data.List (isInfixOf, isPrefixOf, nub)
 import qualified Data.List.NonEmpty as NE
 import qualified Data.Map.Strict as M
 import Data.Maybe (fromMaybe, mapMaybe)
@@ -95,6 +95,7 @@ tests = testGroup "Requests"
     , testCase "--allow-reads-in-local takes a required true|false" allowReadsOption
     , testCase "an oracle lookup whose connection closes without an answer is sent once, never again" lookupNotResent
     , testCase "a custom Pact set fails closed: a cont entry needs a step; a live entry needs a bound, step 0, no scan" customPactSet
+    , testCase "a request file holds only the read requests of the 7 classes, pinned ones with {rewindDepth} and a target" requestFileAllowlist
     ]
 
 cid0, cid3, cid10 :: ChainId
@@ -716,3 +717,45 @@ customPactSet = do
     either (assertFailure . show) (\s -> map _peName (_pactEntries s) @?= ["custom"]) ok1
     ok2 <- loadText $ entry ["code: '(keys coin.coin-table)'", "sameSnapshotOnly: true", "why: 'no bound'"]
     either (assertFailure . show) (\s -> map _peSameSnapshotOnly (_pactEntries s) @?= [True]) ok2
+
+-- | Every generated request passes 'allowedRequest'; a request file line
+-- that is not a read of the 7 classes, or a pinned one without the depth
+-- placeholder or a target, stops the file with its line number.
+--
+requestFileAllowlist :: Assertion
+requestFileAllowlist = do
+    let v = apiPrefix mainnet
+    withOracle $ \_ _ api _ -> forM_ [1 .. 40] $ \s -> forM_ allRequestClasses $ \c -> do
+        let h = if c == ClsHistory then 300 else 1 + (s * 37) `mod` 900
+        rs <- sequence [gen api s c h, genSnap api s c h]
+        forM_ rs $ \r -> allowedRequest v r @?= Right ()
+    let local = Request ClsLocal cid0 (Just 300) methodPost
+            (prefix <> "/pact/api/v1/local?rewindDepth=" <> depthPlaceholder) (Just "{}")
+        payload = Request ClsPayload cid0 (Just 300) methodGet (prefix <> "/payload/P300") Nothing
+        file r = BL.toStrict (encode local) <> "\n\n" <> BL.toStrict (encode r) <> "\n"
+        refused what r = case parseRequestFile v (file r) of
+            Left e -> assertBool (what <> ": " <> e) ("3: not allowed: " `isInfixOf` e)
+            Right _ -> assertFailure (what <> ": allowed")
+    parseRequestFile v (file payload) @?= Right [local, payload]
+    refused "PUT /cut" $ payload { _reqMethod = "PUT", _reqPath = "/chainweb/0.0/mainnet01/cut", _reqClass = ClsHeader }
+    refused "/send" $ local { _reqPath = prefix <> "/pact/api/v1/send" }
+    refused "/listen" $ local { _reqClass = ClsPoll, _reqPath = prefix <> "/pact/api/v1/listen" }
+    refused "a dot segment" $ payload { _reqPath = prefix <> "/payload/../../cut" }
+    refused "an encoded character" $ payload { _reqPath = prefix <> "/payload/P%2F300" }
+    refused "another version" $ payload { _reqPath = "/chainweb/0.0/testnet04/chain/0/payload/P300" }
+    refused "another chain in the path" $ payload { _reqPath = "/chainweb/0.0/mainnet01/chain/1/payload/P300" }
+    refused "a payload path in the class local" $ payload { _reqClass = ClsLocal }
+    refused "a GET with a body" $ payload { _reqBody = Just "{}" }
+    refused "a POST /local without a body" $ local { _reqBody = Nothing }
+    refused "an unknown query parameter" $ payload { _reqPath = prefix <> "/payload/P300?foo=1" }
+    refused "a height that is not a number" $ payload { _reqPath = prefix <> "/payload/P300?height=1;2" }
+    refused "preflight=true in the class local" $
+        local { _reqPath = prefix <> "/pact/api/v1/local?preflight=true&rewindDepth=" <> depthPlaceholder }
+    refused "a preflight without preflight=true" $ local { _reqClass = ClsPreflight }
+    -- Minor 5: a pinned request is pinned, or it is not in the file
+    refused "a pinned request at a fixed depth" $ local { _reqPath = prefix <> "/pact/api/v1/local?rewindDepth=0" }
+    refused "a pinned request without a depth" $ local { _reqPath = prefix <> "/pact/api/v1/local" }
+    refused "a pinned request without a target" $ local { _reqTarget = Nothing }
+    case parseRequestFile v "{\"class\":\"payload\"}\n" of
+        Left e -> assertBool e ("1: " `isPrefixOf` e)
+        Right x -> assertFailure (show x)

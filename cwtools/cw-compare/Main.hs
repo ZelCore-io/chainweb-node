@@ -44,7 +44,6 @@
 module Main (main) where
 
 import Control.Monad
-import Data.Aeson (eitherDecodeStrict')
 import qualified Data.ByteString.Char8 as B8
 import qualified Data.Text as T
 import qualified Data.Text.IO as T
@@ -66,6 +65,7 @@ import Chainweb.StorageTools.Compare.InProcess
 import Chainweb.StorageTools.Compare.PactSet
 import Chainweb.StorageTools.Compare.Report
 import Chainweb.StorageTools.Compare.Requests
+import Chainweb.StorageTools.Compare.Rules (parseRequestFile)
 import Chainweb.StorageTools.Compare.Run
 import Chainweb.StorageTools.Compare.Sample
 import Chainweb.StorageTools.Compare.Types
@@ -219,7 +219,7 @@ sourceOptions :: Parser Source
 sourceOptions = RequestFile <$> strOption
         ( long "requests"
         <> metavar "FILE"
-        <> help "compare the requests of this file, one JSON object per line, instead of generating them"
+        <> help "compare the requests of this file, one JSON object per line, instead of generating them. Only the read requests of the 7 classes are allowed (GET header, payload and cut reads; POST header branch, payload batches, /local with rewindDepth={rewindDepth} and a target, /poll, /spv); any other line stops the run before anything is sent"
         )
     <|> Generated <$> generateOptions
 
@@ -271,15 +271,12 @@ options = Options
 -- -------------------------------------------------------------------------- --
 -- Main
 
-readRequests :: FilePath -> IO [Request]
-readRequests f = do
-    ls <- B8.lines <$> B8.readFile f
-    fmap concat $ forM (zip [1 :: Int ..] ls) $ \(i, l) ->
-        if B8.all (`elem` (" \t\r" :: String)) l
-        then return []
-        else case eitherDecodeStrict' l of
-            Right r -> return [r]
-            Left e -> die $ f <> ":" <> show i <> ": " <> e
+-- | The requests of @--requests FILE@. Only the read requests of the 7
+-- classes are allowed ('allowedRequest'); the first line that does not decode
+-- or is not allowed stops the run before anything is sent.
+--
+readRequests :: ChainwebVersion -> FilePath -> IO [Request]
+readRequests v f = B8.readFile f >>= either (\e -> die (f <> ":" <> e)) return . parseRequestFile (apiPrefix v)
 
 main :: IO ()
 main = do
@@ -305,7 +302,7 @@ main = do
     hl <- newHostLimiters (_optRate o) (_optPauseFile o)
     oracle <- Side "oracle" (_optOracle o) <$> limiterFor hl (_optOracle o)
     (reqs, classes, gen) <- case _optSource o of
-        RequestFile f -> (\rs -> (rs, [], id)) <$> readRequests f
+        RequestFile f -> (\rs -> (rs, [], id)) <$> readRequests v f
         Generated g -> do
             pset <- maybe (return defaultPactSet) loadPactSet (_genPactSet g)
             forM_ (_genPactSet g) $ \f -> logCustomSet logger f pset
