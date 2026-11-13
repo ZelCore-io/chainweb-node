@@ -19,7 +19,7 @@ import Chainweb.Storage.Table.RocksDB.Tuning
 import Chainweb.Storage.Table (tableInsertBatch)
 
 import Control.Concurrent.Async (mapConcurrently_)
-import Control.Exception (Exception, bracket, throwIO)
+import Control.Exception (Exception, bracket, finally, throwIO)
 import Control.Monad (forM_, unless, when)
 import Control.Monad.Catch (throwM)
 
@@ -60,6 +60,7 @@ assertBool msg ok = unless ok $
     throwIO $ TuningTestFailure $ unlines [msg, prettyCallStack callStack]
 
 -- | Runs an action that takes a @char** errptr@ and fails if it set an error.
+-- The error string is freed.
 --
 noErr :: HasCallStack => String -> (Ptr CString -> IO a) -> IO a
 noErr what act = alloca $ \errPtr -> do
@@ -67,7 +68,7 @@ noErr what act = alloca $ \errPtr -> do
     r <- act errPtr
     err <- peek errPtr
     unless (err == nullPtr) $ do
-        msg <- peekCString err
+        msg <- peekCString err `finally` C.c_rocksdb_free err
         assertBool (what <> ": " <> msg) False
     return r
 
@@ -401,6 +402,10 @@ compactRangeForcedTest = withTestDir "tuning-range" $ \dir -> do
     assertBool ("other SSTs changed: " <> show after) $
         M.size kept == 2 && byCompression "Snappy" == M.keys kept
 
+-- | A read-only open replays the write ahead log and applies the tuning: the
+-- database uses the tuning's block cache, whose capacity differs from the
+-- binding's default.
+--
 readOnlyTunedTest :: IO ()
 readOnlyTunedTest = withTestDir "tuning-ro" $ \dir -> do
     withRocksDbTuned dir modernDefaultOptions payloadZstdTuning $ \db -> do
@@ -408,8 +413,13 @@ readOnlyTunedTest = withTestDir "tuning-ro" $ \dir -> do
         flushRocksDb db
         -- left in the WAL; the read-only open replays it
         writeEntries (bytesTable db "t") [10000 .. 10999]
-    withReadOnlyRocksDbTuned dir modernDefaultOptions payloadZstdTuning $ \db ->
+    let cacheBytes = 12582912
+        tuning = payloadZstdTuning { _tuningBlockCacheBytes = Just cacheBytes }
+    withReadOnlyRocksDbTuned dir modernDefaultOptions tuning $ \db -> do
         checkEntries (bytesTable db "t") [0 .. 10999]
+        capacity <- rocksDbProperty db "rocksdb.block-cache-capacity"
+        assertBool ("read-only block cache capacity " <> show capacity <> ", expected " <> show cacheBytes) $
+            (readMaybe . B8.unpack =<< capacity) == Just cacheBytes
 
 -- | The bloom filter of 'coldStoreTuning' is written into every SST file;
 -- 'payloadZstdTuning' writes no filter.

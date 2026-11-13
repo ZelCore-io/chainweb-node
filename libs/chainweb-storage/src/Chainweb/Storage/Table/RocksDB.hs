@@ -752,6 +752,13 @@ compactRangeRocksDb table range =
 -- (@BottommostLevelCompaction::kForce@). All files in the range are rewritten
 -- with the current options, for instance with a new compression.
 --
+-- A failure is not reported: the C function @rocksdb_compact_range_opt@
+-- returns @void@, and in RocksDB 8.3.2 it drops the status of the compaction.
+-- To detect a failure, compare the property @rocksdb.background-errors@
+-- ('rocksDbProperty'), a count of failed background jobs, before and after
+-- the call, or check the files afterwards (for instance with
+-- 'sstCompressionInfo').
+--
 compactRangeForced :: HasCallStack => RocksDbTable k v -> (Maybe k, Maybe k) -> IO ()
 compactRangeForced table range =
     withForcedCompactOptions $ \copts ->
@@ -767,6 +774,9 @@ compactRangeForced table range =
 -- | Compacts the whole database and rewrites the bottommost level
 -- (@BottommostLevelCompaction::kForce@), so that every SST file is written
 -- with the current options.
+--
+-- Like 'compactRangeForced', it cannot report a failure; compare
+-- @rocksdb.background-errors@ before and after the call to detect one.
 --
 compactAllForced :: RocksDb -> IO ()
 compactAllForced db =
