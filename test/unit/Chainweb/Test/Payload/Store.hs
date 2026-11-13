@@ -1,3 +1,4 @@
+{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TypeApplications #-}
@@ -15,7 +16,7 @@ module Chainweb.Test.Payload.Store
 ) where
 
 import Control.Exception (SomeException, try)
-import Control.Monad (forM_)
+import Control.Monad (forM, forM_, void)
 
 import Data.Aeson (Value(..), eitherDecode, encode, toJSON)
 import qualified Data.Aeson.KeyMap as KM
@@ -24,6 +25,7 @@ import qualified Data.ByteString as B
 import qualified Data.ByteString.Base16 as B16
 import qualified Data.ByteString.Char8 as B8
 import qualified Data.ByteString.Lazy as BL
+import Data.Foldable (toList)
 import qualified Data.List as L
 import qualified Data.Map.Strict as M
 import qualified Data.Vector as V
@@ -37,14 +39,19 @@ import Options.Applicative
 import System.Directory (listDirectory)
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
+import qualified System.LogLevel as LL
 
 import Test.Tasty
 import Test.Tasty.HUnit
 
 -- internal modules
 
+import Chainweb.BlockHeader (Nonce(..))
 import Chainweb.BlockHeight
 import Chainweb.Chainweb.Configuration
+import Chainweb.Graph (pairChainGraph)
+import Chainweb.Logger (GenericLogger, genericLogger)
+import qualified Chainweb.Pact.Backend.Compaction as Compact
 import Chainweb.MerkleUniverse
 import Chainweb.Payload
 import Chainweb.Payload.PayloadStore
@@ -52,7 +59,13 @@ import Chainweb.Payload.PayloadStore.RocksDB
 import Chainweb.Storage.Table.RocksDB
 import Chainweb.Storage.Table.RocksDB.Tuning
 import Chainweb.Storage.Table
+import Chainweb.Test.Cut (offsetBlockTime)
+import Chainweb.Test.Cut.TestBlockDb
+import Chainweb.Test.TestVersions (barebonesTestVersion)
 import Chainweb.Test.Utils (golden)
+import Chainweb.Time (second)
+import Chainweb.Utils (T2(..), int)
+import Chainweb.Version
 import Chainweb.Version.Mainnet
 
 -- -------------------------------------------------------------------------- --
@@ -72,6 +85,7 @@ tests = testGroup "Payload store"
         mixedFilesTest
     , testCase "--payload-compression parses snappy and zstd-dict; any other value fails naming both"
         payloadCompressionOptionTest
+    , testCase "compact with --store-merkle-trees false leaves no tree entries" compactNoTreesTest
     ]
 
 -- -------------------------------------------------------------------------- --
@@ -304,3 +318,60 @@ payloadCompressionOptionTest = do
     forM_ [minBound .. maxBound] $ \c -> do
         let cfg = def { _configPayloadCompression = c }
         (_configPayloadCompression <$> eitherDecode (encode cfg)) @?= Right c
+
+-- -------------------------------------------------------------------------- --
+-- Merkle trees in a RocksDB that the compact tool wrote
+
+compactTreeNamespaces :: [B.ByteString]
+compactTreeNamespaces = ["TransactionTree", "TransactionTree2", "OutputTree", "OutputTree2"]
+
+compactNamespaceSize :: RocksDb -> B.ByteString -> IO Int
+compactNamespaceSize db ns = withTableIterator tbl $ \it ->
+    let go !n = iterEntry it >>= \case
+            Nothing -> return n
+            Just _ -> iterNext it >> go (n + 1)
+    in go 0
+  where
+    tbl :: RocksDbTable B.ByteString B.ByteString
+    tbl = newTable db (Codec id return) (Codec id return) [ns]
+
+compactNoTreesTest :: Assertion
+compactNoTreesTest = do
+    -- the flag of the compact tool
+    let parse args = getParseResult $ execParserPure defaultPrefs Compact.configParserInfo
+            (["--from", "src", "--to", "dst", "--log-dir", "logs"] <> args)
+        storeTrees = fmap (_payloadDbConfigStoreTrees . Compact.compactPayloadDbConfig) . parse
+    storeTrees [] @?= Just StoreMerkleTrees
+    storeTrees ["--store-merkle-trees", "true"] @?= Just StoreMerkleTrees
+    storeTrees ["--store-merkle-trees", "false"] @?= Just DoNotStoreMerkleTrees
+    forM_ [["--store-merkle-trees"], ["--store-merkle-trees", "no"]] $ \args ->
+        assertBool ("rejects " <> show args) (null (parse args))
+
+    -- the copy of the payloads
+    withTempRocksDb "compact-trees-src" $ \srcBase -> do
+        T2 tdb src <- mkTestBlockDbIO v srcBase
+        forM_ [1 .. maxH] $ \h -> forM_ (chainIds v) $ \cid ->
+            void $ addTestBlockDb tdb h (Nonce (int h)) (offsetBlockTime second) cid (payloadAt cid h)
+        forM_ [StoreMerkleTrees, DoNotStoreMerkleTrees] $ \st ->
+            withTempRocksDb "compact-trees-target" $ \tgt -> do
+                Compact.doCompactRocksDbWith (PayloadDbConfig st) silent v (toList (chainIds v)) 0 src tgt
+                payloads <- compactNamespaceSize tgt "BlockPayload2"
+                -- maxH blocks on each chain, and the genesis payload that both chains share
+                assertEqual (show st <> ": payloads") (2 * int maxH + 1) payloads
+                trees <- forM compactTreeNamespaces $ \ns -> (,) ns <$> compactNamespaceSize tgt ns
+                case st of
+                    StoreMerkleTrees -> forM_ ["TransactionTree2", "OutputTree2"] $ \ns ->
+                        assertEqual (show st <> ": " <> B8.unpack ns) (Just payloads) (lookup ns trees)
+                    DoNotStoreMerkleTrees ->
+                        assertEqual (show st <> ": tree entries") [(ns, 0) | ns <- compactTreeNamespaces] trees
+  where
+    v = barebonesTestVersion pairChainGraph
+    maxH = 4 :: BlockHeight
+    silent :: GenericLogger
+    silent = genericLogger LL.Error (\_ -> return ())
+    payloadAt cid h = newPayloadWithOutputs
+        (MinerData $ "miner-" <> tag)
+        (CoinbaseOutput $ "coinbase-" <> tag)
+        (V.fromList [(Transaction ("tx-" <> tag), TransactionOutput ("out-" <> tag))])
+      where
+        tag = B8.pack (show cid <> "-" <> show h)
