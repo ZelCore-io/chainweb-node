@@ -25,6 +25,9 @@ module Chainweb.Pact.Backend.Store.Types
     ( PactStore(..)
     , KeysQuery(..)
     , BlockCommit(..)
+    , CommitError(..)
+    , CommitStatement(..)
+    , CommitPhase(..)
     , Historical(..)
     , _Historical
     , _NoHistory
@@ -88,6 +91,45 @@ data BlockCommit = BlockCommit
     }
     deriving stock (Eq, Show)
 
+-- | The statement of a block commit that failed.
+data CommitStatement
+    = CommitCreateTable
+    -- ^ the @CREATE TABLE@ of a new table
+    | CommitCreateIndex
+    -- ^ the @CREATE INDEX@ of a new table
+    | CommitTableCreation
+    -- ^ a new table's @VersionedTableCreation@ row
+    | CommitRows
+    -- ^ a table's batched @INSERT OR REPLACE@ of rows
+    | CommitTableMutation
+    -- ^ a table's @VersionedTableMutation@ row
+    | CommitTxIndex
+    -- ^ the batched @TransactionIndex@ insert
+    | CommitBlockHistory
+    -- ^ the @BlockHistory@ row
+    deriving stock (Eq, Show)
+
+-- | The SQLite call that failed.
+data CommitPhase
+    = CommitExec !SQ3.Utf8
+    -- ^ @sqlite3_exec@ of a statement without parameters, with SQLite's
+    -- error message
+    | CommitPrepare
+    | CommitBind
+    | CommitReset
+    | CommitStep
+    | CommitFinalize
+    deriving stock (Eq, Show)
+
+-- | A failed block commit: which statement, which call, and SQLite's error.
+-- Callers turn this into their own 3.2.1 error text.
+data CommitError = CommitError
+    { _ceStatement :: !CommitStatement
+    , _cePhase :: !CommitPhase
+    , _ceError :: !SQ3.Error
+    }
+    deriving stock (Eq, Show)
+
 -- | The storage operations of the Pact checkpointer.
 --
 -- Fields that replace a 3.2.1 function taking an 'SQLiteEnv' have that
@@ -135,9 +177,10 @@ data PactStore = PactStore
     , _psTableInCatalog :: !(Bool -> Text -> IO (Either SQ3.Error Bool))
         -- ^ whether @sqlite_master@ has exactly one table of that name;
         -- compared lower case when the flag is set
-    , _psCommitBlock :: !(BlockCommit -> IO (Either SQ3.Error ()))
+    , _psCommitBlock :: !(BlockCommit -> IO (Either CommitError ()))
         -- ^ write a block: new tables, rows, transaction index, block
-        -- history, stopping at the first error
+        -- history, stopping at the first error, which names the failing
+        -- statement and call
     , _psWithBatch :: forall a. IO a -> IO a
         -- ^ run in the @batch@ savepoint: released on success, rolled back
         -- on any exception

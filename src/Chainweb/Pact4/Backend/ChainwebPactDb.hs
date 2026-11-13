@@ -755,14 +755,11 @@ indexPactTransaction h = modify' $
 -- new tables, then each table's rows followed by its mutation row, then the
 -- transaction index, then the block history row.
 --
--- A 'Left' is rethrown through Pact 4's 'liftEither', as 3.2.1's 'exec'' and
--- every prepare and bind failure raised it: @user error (Database error:
--- <error>)@. 3.2.1's own @execMulti@ said @error during batch insert:
--- <error>@ for a failed step of the batched row and transaction-index
--- inserts; the store's result does not say which statement failed.
+-- A 'Left' names the failing statement and call, and is rethrown as the
+-- 'userError' 3.2.1 raised there (see @commitErrorText@).
 commitBlockStateToDatabase :: PactStore -> BlockHash -> BlockHeight -> BlockHandle Pact4 -> IO ()
 commitBlockStateToDatabase store hsh bh blockHandle =
-    liftEither $ _psCommitBlock store BlockCommit
+    _psCommitBlock store BlockCommit
         { _bcHeight = bh
         , _bcHash = hsh
         , _bcEndTxId = _blockHandleTxId blockHandle
@@ -770,8 +767,21 @@ commitBlockStateToDatabase store hsh bh blockHandle =
         , _bcRows = toChunks (_pendingWrites pending)
         , _bcTxHashes = toList (_pendingSuccessfulTxs pending)
         }
+    >>= either (throwM . userError . commitErrorText) return
   where
     pending = _blockHandlePending blockHandle
+
+    -- 3.2.1's text for each failure, all raised as 'userError': Pact's
+    -- @exec_@ (CREATE TABLE and INDEX) showed SQLite's error with its
+    -- message; @exec'@ and every prepare and bind showed the error; the local
+    -- @execMulti@ (rows, TransactionIndex) failed its reset, step or finalize
+    -- with "error during batch insert".
+    commitErrorText (CommitError s phase e) = case phase of
+        CommitExec msg -> "Database error: " ++ show (e, msg)
+        CommitPrepare -> "Database error: " ++ show e
+        CommitBind -> "Database error: " ++ show e
+        _ | s == CommitRows || s == CommitTxIndex -> "error during batch insert: " ++ show e
+          | otherwise -> "Database error: " ++ show e
 
     -- per table in 'HashMap.toList' order, every delta of every rowkey
     toChunks writes =

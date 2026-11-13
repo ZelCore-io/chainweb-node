@@ -1,3 +1,4 @@
+{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
@@ -10,7 +11,7 @@
 --
 module Chainweb.Test.Pact.Store.SQLite (tests) where
 
-import Control.Exception (ErrorCall(..), SomeException, throwIO, try)
+import Control.Exception (ErrorCall(..), IOException, SomeException, throwIO, try)
 import Control.Lens (view)
 import Control.Monad
 import Data.ByteString (ByteString)
@@ -19,7 +20,8 @@ import qualified Data.ByteString.Char8 as B8
 import qualified Data.ByteString.Short as SB
 import qualified Data.HashMap.Strict as HM
 import qualified Data.Map.Strict as M
-import Data.List (intersperse, sort)
+import qualified Data.HashSet as HashSet
+import Data.List (intersperse, isPrefixOf, sort)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
@@ -43,15 +45,18 @@ import Chainweb.Logger (GenericLogger)
 import Chainweb.Pact.Types (BlockTxHistory(..))
 import Chainweb.Pact.Backend.Store.SQLite
 import Chainweb.Pact.Backend.Store.Types
-import Chainweb.Pact.Backend.Types (SQLiteEnv)
+import qualified Chainweb.Pact.Backend.InMemDb as InMemDb
+import Chainweb.Pact.Backend.Types
+    ( BlockHandle(..), SQLiteEnv, SQLitePendingData(..), emptySQLitePendingData )
 import Chainweb.Pact.Backend.Utils
     ( chainwebPragmas, withSQLiteConnection, withTempSQLiteConnection )
 import qualified Chainweb.Pact.PactService.Checkpointer.Internal as Cp
 import qualified Chainweb.Pact4.Backend.ChainwebPactDb as Pact4
+import qualified Chainweb.Pact5.Backend.ChainwebPactDb as Pact5
 import qualified Chainweb.Test.Pact.Store.Characterization as C
 import qualified Chainweb.Test.Pact.Store.Reference as Ref
 import Chainweb.Test.Utils (withTempDir)
-import Chainweb.Version (PactVersionT(..))
+import Chainweb.Version (PactVersion(..), PactVersionT(..))
 import Chainweb.Utils.Serialization (runGetEitherS)
 
 tests :: TestTree
@@ -116,9 +121,49 @@ tests = testGroup "PactStore SQLite"
         commit ps 1 [] [] ["h"]
         r <- try @SomeException $ _psCommitBlock ps (blockCommit 2 [] [] ["h"])
         case r of
-            Right (Left SQ3.ErrorConstraint) -> return ()
-            Right other -> assertFailure $ "expected Left ErrorConstraint, got " <> show other
+            Right (Left (CommitError CommitTxIndex CommitStep SQ3.ErrorConstraint)) -> return ()
+            Right other -> assertFailure $ "expected Left ErrorConstraint at the TransactionIndex step, got " <> show other
             Left e -> assertFailure $ "threw " <> show e
+        -- exec': the finalize's error wins over the step's, as in Pact 5's exec'
+        _psCommitBlock ps (blockCommit 1 [] [] []) >>= (@?= Left (CommitError CommitBlockHistory CommitFinalize SQ3.ErrorConstraint))
+
+    , testGroup "commit error text: each caller's 3.2.1 message" $
+        let failures =
+                -- (what fails, setup, new tables, tx hashes, Pact 4 text, Pact 5 first line)
+                [ ( "TransactionIndex step (duplicate hash)", \_ ps -> commit ps 1 [] [] ["h"], [], ["h"]
+                  , "user error (error during batch insert: ErrorConstraint)", "ErrorConstraint" )
+                , ( "TransactionIndex prepare (missing table)", \sql _ -> P4SQL.exec_ sql "DROP TABLE TransactionIndex", [], ["h"]
+                  , "user error (Database error: ErrorError)", "ErrorError" )
+                , ( "BlockHistory step (height taken)", \_ ps -> commit ps 2 [] [] [], [], []
+                  , "user error (Database error: ErrorConstraint)", "ErrorConstraint" )
+                , ( "BlockHistory prepare (missing table)", \sql _ -> P4SQL.exec_ sql "DROP TABLE BlockHistory", [], []
+                  , "user error (Database error: ErrorError)", "ErrorError" )
+                , ( "CREATE TABLE (an index has the name)", \sql _ -> P4SQL.exec_ sql "CREATE INDEX [boom] ON BlockHistory(blockheight)", ["boom"], []
+                  , "user error (Database error: (ErrorError,\"there is already an index named boom\"))", "ErrorError" )
+                ]
+        in
+        [ testCase "Pact 4: Database error, or error during batch insert for a batched step" $
+            forM_ failures $ \(lbl, setup, tables, txs, p4Text, _) -> withStore $ \sql ps -> do
+                setup sql ps
+                let pending = (emptySQLitePendingData mempty)
+                        { _pendingTableCreation = HashSet.fromList tables
+                        , _pendingSuccessfulTxs = HashSet.fromList txs }
+                r <- try @IOException $ Pact4.commitBlockStateToDatabase ps (mkHash 2) 2 (BlockHandle 20 pending)
+                assertEqual lbl p4Text (either show (const "no error") r)
+        , testCase "Pact 5: the SQLite error, through throwOnDbError" $
+            forM_ failures $ \(lbl, setup, tables, txs, _, p5Text) -> withStore $ \sql ps -> do
+                setup sql ps
+                let pending = (emptySQLitePendingData InMemDb.empty)
+                        { _pendingTableCreation = HashSet.fromList tables
+                        , _pendingSuccessfulTxs = HashSet.fromList txs }
+                r <- try @SomeException $ pact5Commit sql ps (mkHash 2) 2 (BlockHandle 20 pending)
+                case r of
+                    Right () -> assertFailure (lbl <> ": no error")
+                    Left e -> do
+                        let (firstLine, rest) = break (== '\n') (show e)
+                        assertEqual lbl p5Text firstLine
+                        assertBool (lbl <> ": call stack") ("\n\nCallStack (from HasCallStack):" `isPrefixOf` rest)
+        ]
 
     , testCase "rowsAtTxId returns rows in rowid order" $ withStore $ \_ ps -> do
         commit ps 1 ["t"] [("t", [("b", 7, "x"), ("a", 7, "y"), ("c", 8, "z"), ("d", 7, "w")])] []
@@ -333,6 +378,10 @@ commit
     -> IO ()
 commit ps h newTables rows txs =
     _psCommitBlock ps (blockCommit h newTables rows txs) >>= either (fail . show) return
+
+-- | Pact 5's @commitBlockStateToDatabase@.
+pact5Commit :: SQLiteEnv -> PactStore -> BlockHash -> BlockHeight -> BlockHandle Pact5 -> IO ()
+pact5Commit sql _ = Pact5.commitBlockStateToDatabase sql
 
 -- | Run both actions and compare their results.
 same :: (Eq a, Show a) => String -> IO a -> IO a -> Assertion

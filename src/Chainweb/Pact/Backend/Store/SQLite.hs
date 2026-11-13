@@ -100,14 +100,6 @@ prepStmt c q = do
         Nothing -> internalError "No SQL statements in prepared statement"
         Just s -> return s
 
-execMulti :: Traversable t => SQ3.Database -> SQ3.Utf8 -> t [Pact4.SType] -> ExceptT SQ3.Error IO ()
-execMulti c q rows = bracket (prepStmt c q) (lift . SQ3.finalize) $ \stmt -> do
-    forM_ rows $ \row -> do
-        ExceptT $ SQ3.reset stmt
-        lift $ SQ3.clearBindings stmt
-        bindParams stmt row
-        ExceptT $ SQ3.step stmt
-
 qry :: SQ3.Database -> SQ3.Utf8 -> [Pact4.SType] -> [Pact4.RType] -> ExceptT SQ3.Error IO [[Pact4.SType]]
 qry e q as rts = bracket (prepStmt e q) (ExceptT . SQ3.finalize) $ \stmt -> do
     bindParams stmt as
@@ -130,11 +122,6 @@ stepStmt stmt rts = do
 
 exec_ :: SQ3.Database -> SQ3.Utf8 -> ExceptT SQ3.Error IO ()
 exec_ e q = ExceptT $ over _Left fst <$> SQ3.exec e q
-
-exec' :: SQ3.Database -> SQ3.Utf8 -> [Pact4.SType] -> ExceptT SQ3.Error IO ()
-exec' e q as = bracket (prepStmt e q) (ExceptT . SQ3.finalize) $ \stmt -> do
-    bindParams stmt as
-    void $ ExceptT (SQ3.step stmt)
 
 txIdParam :: TxId -> Pact4.SType
 txIdParam (Pact4.TxId t) = Pact4.SInt (fromIntegral t)
@@ -264,10 +251,43 @@ tableInCatalog db lcTables t = runExceptT $ do
     tableLookupStmt True =
       "SELECT name FROM sqlite_master WHERE type='table' and lower(name)=lower(?);"
 
+-- -------------------------------------------------------------------------- --
+-- Statement helpers of 'commitBlock': Pact 5's @exec_@, @exec'@ and
+-- @execMulti@ (the same SQLite calls in the same order, so the same
+-- 'SQ3.Error'), with the error tagged by the statement and the failing call
+
+commitExec_ :: SQ3.Database -> CommitStatement -> SQ3.Utf8 -> ExceptT CommitError IO ()
+commitExec_ e s q = ExceptT $ over _Left (\(err, msg) -> CommitError s (CommitExec msg) err) <$> SQ3.exec e q
+
+commitPrep :: SQ3.Database -> CommitStatement -> SQ3.Utf8 -> ExceptT CommitError IO SQ3.Statement
+commitPrep e s q = withExceptT (CommitError s CommitPrepare) (prepStmt e q)
+
+commitBind :: CommitStatement -> SQ3.Statement -> [Pact4.SType] -> ExceptT CommitError IO ()
+commitBind s stmt as = withExceptT (CommitError s CommitBind) (bindParams stmt as)
+
+commitCall :: CommitStatement -> CommitPhase -> IO (Either SQ3.Error a) -> ExceptT CommitError IO a
+commitCall s p act = ExceptT $ over _Left (CommitError s p) <$> act
+
+-- | Pact 5's @exec'@: an error of the finalize wins over the step's, as there.
+commitExec' :: SQ3.Database -> CommitStatement -> SQ3.Utf8 -> [Pact4.SType] -> ExceptT CommitError IO ()
+commitExec' e s q as =
+    bracket (commitPrep e s q) (commitCall s CommitFinalize . SQ3.finalize) $ \stmt -> do
+        commitBind s stmt as
+        void $ commitCall s CommitStep (SQ3.step stmt)
+
+-- | Pact 5's @execMulti@: the result of the finalize is ignored, as there.
+commitExecMulti :: SQ3.Database -> CommitStatement -> SQ3.Utf8 -> [[Pact4.SType]] -> ExceptT CommitError IO ()
+commitExecMulti c s q rows = bracket (commitPrep c s q) (lift . SQ3.finalize) $ \stmt -> do
+    forM_ rows $ \row -> do
+        commitCall s CommitReset (SQ3.reset stmt)
+        lift $ SQ3.clearBindings stmt
+        commitBind s stmt row
+        commitCall s CommitStep (SQ3.step stmt)
+
 -- | @commitBlockStateToDatabase@ of Pact 4 and Pact 5, which run the same
 -- statements in the same order. The two @TransactionIndex@ texts differ only
 -- in whitespace; this is Pact 5's.
-commitBlock :: SQLiteEnv -> BlockCommit -> IO (Either SQ3.Error ())
+commitBlock :: SQLiteEnv -> BlockCommit -> IO (Either CommitError ())
 commitBlock db bc = runExceptT $ do
     mapM_ (createUserTable . toUtf8) (_bcNewTables bc)
     mapM_ (\(t, rows) -> writeTable (toUtf8 t) (prepRow <$> rows)) (_bcRows bc)
@@ -284,7 +304,7 @@ commitBlock db bc = runExceptT $ do
         ]
 
     writeTable tableName writes = do
-        execMulti db q writes
+        commitExecMulti db CommitRows q writes
         markTableMutation tableName bh
       where
         q = "INSERT OR REPLACE INTO " <> tbl tableName <> "(rowkey,txid,rowdata) VALUES(?,?,?)"
@@ -292,13 +312,13 @@ commitBlock db bc = runExceptT $ do
     -- Mark the table as being mutated during this block, so that we know
     -- to delete from it if we rewind past this block.
     markTableMutation tablename blockheight =
-        exec' db mutq [Pact4.SText tablename, Pact4.SInt (fromIntegral blockheight)]
+        commitExec' db CommitTableMutation mutq [Pact4.SText tablename, Pact4.SInt (fromIntegral blockheight)]
       where
         mutq = "INSERT OR IGNORE INTO VersionedTableMutation VALUES (?,?);"
 
     -- Record a block as being in the history of the checkpointer.
     blockHistoryInsert t =
-        exec' db stmt
+        commitExec' db CommitBlockHistory stmt
             [ Pact4.SInt (fromIntegral bh)
             , Pact4.SBlob (runPutS (encodeBlockHash hsh))
             , txIdParam t
@@ -307,13 +327,15 @@ commitBlock db bc = runExceptT $ do
         stmt = "INSERT INTO BlockHistory ('blockheight','hash','endingtxid') VALUES (?,?,?);"
 
     createUserTable tablename = do
-        createVersionedTable db tablename
+        let (createtablestmt, indexcreationstmt) = versionedTableStmts tablename
+        commitExec_ db CommitCreateTable createtablestmt
+        commitExec_ db CommitCreateIndex indexcreationstmt
         markTableCreation tablename
 
     -- Mark the table as being created during this block, so that we know
     -- to drop it if we rewind past this block.
     markTableCreation tablename =
-        exec' db insertstmt insertargs
+        commitExec' db CommitTableCreation insertstmt insertargs
       where
         insertstmt = "INSERT OR IGNORE INTO VersionedTableCreation VALUES (?,?)"
         insertargs = [Pact4.SText tablename, Pact4.SInt (fromIntegral bh)]
@@ -322,7 +344,7 @@ commitBlock db bc = runExceptT $ do
     indexPendingPactTransactions = do
         let rows = map toRow (_bcTxHashes bc)
         let q = "INSERT INTO TransactionIndex (txhash, blockheight) VALUES (?, ?)"
-        execMulti db q rows
+        commitExecMulti db CommitTxIndex q rows
       where
         toRow b = [Pact4.SBlob b, Pact4.SInt (fromIntegral bh)]
 
@@ -330,6 +352,12 @@ createVersionedTable :: SQLiteEnv -> SQ3.Utf8 -> ExceptT SQ3.Error IO ()
 createVersionedTable db tablename = do
     exec_ db createtablestmt
     exec_ db indexcreationstmt
+  where
+    (createtablestmt, indexcreationstmt) = versionedTableStmts tablename
+
+-- | The @CREATE TABLE@ and @CREATE INDEX@ statements of a versioned table.
+versionedTableStmts :: SQ3.Utf8 -> (SQ3.Utf8, SQ3.Utf8)
+versionedTableStmts tablename = (createtablestmt, indexcreationstmt)
   where
     ixName = tablename <> "_ix"
     createtablestmt =
