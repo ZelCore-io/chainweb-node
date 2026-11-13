@@ -668,6 +668,16 @@ instance Exception StoreDbException where
         T.unpack text <> "\n\n" <>
         prettyCallStack stack
 
+-- | Pact 5's @internalDbError@ of 3.2.1, throwing 'StoreDbException'.
+internalDbError :: HasCallStack => MonadThrow m => Text -> m a
+internalDbError = throwM . StoreDbException callStack
+
+-- | Pact 5's @throwOnDbError@ of 3.2.1. Top level with 'HasCallStack', like
+-- 3.2.1's pair, so that a failure shows the @internalDbError@ and
+-- @throwOnDbError@ frames that 3.2.1 showed.
+throwOnDbError :: (HasCallStack, MonadThrow m) => ExceptT SQ3.Error m a -> m a
+throwOnDbError act = runExceptT act >>= either (internalDbError . sshow) return
+
 -- | Pact 5 @initSchema@: create all tables that exist pre-genesis.
 initSchema :: SQLiteEnv -> IO ()
 initSchema sql =
@@ -682,8 +692,6 @@ initSchema sql =
         create "SYS:Pacts"
         create "SYS:ModuleSources"
   where
-    throwOnDbError act = runExceptT act >>= either (throwM . StoreDbException callStack . sshow) return
-
     create tablename = do
       createVersionedTable sql tablename
 

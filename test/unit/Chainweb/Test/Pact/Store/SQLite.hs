@@ -165,6 +165,23 @@ tests = testGroup "PactStore SQLite"
                         assertBool (lbl <> ": call stack") ("\n\nCallStack (from HasCallStack):" `isPrefixOf` rest)
         ]
 
+    , testCase "initSchema failure: 3.2.1's text, with the internalDbError and throwOnDbError frames" $
+        withTempSQLiteConnection chainwebPragmas $ \sql -> do
+            -- CREATE TABLE IF NOT EXISTS BlockHistory fails: an index has the name
+            P4SQL.exec_ sql "CREATE TABLE x (a INTEGER)"
+            P4SQL.exec_ sql "CREATE INDEX [BlockHistory] ON x(a)"
+            r <- try @SomeException $ _psInitSchema (sqlitePactStore sql)
+            case r of
+                Right () -> assertFailure "no error"
+                Left e -> do
+                    -- PactInternalError shows as JSON, so the newlines of the
+                    -- inner exception's text appear as \n
+                    let (text, stack) = T.breakOn "CallStack (from HasCallStack):" (T.pack (show e))
+                        frames = [ T.takeWhile (/= ',') (T.stripStart l) | l <- drop 1 (T.splitOn "\\n" stack) ]
+                    text @?= "{\"tag\":\"PactInternalError\",\"contents\":\"withSavepoint (db-transaction): non-pact exception: ErrorError\\n\\n"
+                    -- the line numbers differ from 3.2.1's, the frame names do not
+                    frames @?= ["internalDbError", "throwOnDbError"]
+
     , testCase "rowsAtTxId returns rows in rowid order" $ withStore $ \_ ps -> do
         commit ps 1 ["t"] [("t", [("b", 7, "x"), ("a", 7, "y"), ("c", 8, "z"), ("d", 7, "w")])] []
         _psRowsAtTxId ps "t" 7 >>= (@?= Right [("b", "x"), ("a", "y"), ("d", "w")])
