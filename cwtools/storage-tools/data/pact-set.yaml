@@ -1,0 +1,96 @@
+# The Pact code that cw-compare sends with /local (classes local and
+# preflight) and, at Pact 4 heights only, with the history functions (class
+# history). It is embedded into cw-compare at build time; --pact-set FILE
+# replaces it for a run.
+#
+# Each request picks one entry of its class with the seeded random generator
+# and fills the placeholders from the oracle's canonical block at the target
+# height:
+#
+#   {account}  the miner account of the block, or the sender of one of its
+#              transactions (accounts with characters other than letters,
+#              digits and - _ : . are not used)
+#   {txid}     the coinbase txid of the block, or the txid of one of its
+#              transactions
+#   {pactId}   the pact id of a continuation in the block; without one, the
+#              request key of a transaction or the coinbase
+#
+# An entry of kind "cont" sends a continuation of {pactId} at the given step
+# (rollback false, no proof) instead of code; it reads the defpact state.
+#
+# All entries are reads. /local never commits, and every read is allowed in
+# /local (Pact's AllowReadInLocal), so tables can be read directly.
+
+entries:
+
+  - name: coin-details
+    classes: [local, preflight]
+    code: '(coin.details "{account}")'
+    why: coin details for a sampled account; the read every wallet makes
+
+  - name: coin-table-read
+    classes: [local, preflight]
+    code: '(read coin.coin-table "{account}")'
+    why: a direct row read of coin.coin-table, the largest table on every chain
+
+  - name: coin-get-balance
+    classes: [local]
+    code: '(coin.get-balance "{account}")'
+    why: the same row through module code (a different read path and gas)
+
+  - name: keys-small-table
+    classes: [local]
+    code: '(keys coin.allocation-table)'
+    why: keys on a small table (the genesis allocations); the whole answer is compared, so key order counts
+
+  - name: keys-large-table
+    classes: [local]
+    code: '(length (keys coin.coin-table))'
+    why: keys on the largest table; length keeps the answer small, but every key is read (or the gas limit is hit, identically on both sides)
+
+  - name: describe-module
+    classes: [local, preflight]
+    code: '(describe-module "coin")'
+    why: module code, hash and governance from SYS:Modules at the target height (the coin module was upgraded several times)
+
+  - name: describe-table
+    classes: [local]
+    code: '(describe-table coin.coin-table)'
+    why: table metadata through the module cache
+
+  - name: read-before-creation
+    classes: [local]
+    code: '(read marmalade-v2.ledger.ledger "{account}")'
+    why: a table created late in the chain's history; below its creation height both sides must give the same not-found error, above it the same row or row-not-found
+
+  - name: ns-registry-read
+    classes: [local]
+    code: '(read ns.registry "free")'
+    why: a row of a small, rarely written table of another module
+
+  - name: defpact-state
+    classes: [local]
+    kind: cont
+    code: '{pactId}'
+    step: 1
+    why: the defpact state of a continuation (SYS:Pacts); a missing pact gives the same error on both sides
+
+  - name: txids
+    classes: [history]
+    code: '(txids coin.coin-table {txid})'
+    why: txids of the largest table from a txid of the target block on (Pact 4 history)
+
+  - name: txlog
+    classes: [history]
+    code: '(txlog coin.coin-table {txid})'
+    why: the write log of the largest table at a txid of the target block (Pact 4 history)
+
+  - name: keylog
+    classes: [history]
+    code: '(keylog coin.coin-table "{account}" {txid})'
+    why: the write log of one key from a txid of the target block on (Pact 4 history)
+
+  - name: txlog-small-table
+    classes: [history]
+    code: '(txids coin.allocation-table 0)'
+    why: history of a small table from the start; the answer is short and covers the whole table

@@ -21,6 +21,7 @@ tested-with:
 extra-source-files:
    README.md
    LICENSE
+   storage-tools/data/pact-set.yaml
 
 source-repository head
     type: git
@@ -327,7 +328,9 @@ library storage-tools
     default-language: Haskell2010
     hs-source-dirs: storage-tools/src
     exposed-modules:
+        Chainweb.StorageTools.Compare.PactSet
         Chainweb.StorageTools.Compare.Report
+        Chainweb.StorageTools.Compare.Requests
         Chainweb.StorageTools.Compare.Rules
         Chainweb.StorageTools.Compare.Run
         Chainweb.StorageTools.Compare.Sample
@@ -352,6 +355,7 @@ library storage-tools
         , direct-sqlite
         , directory
         , exceptions
+        , file-embed
         , filepath
         , http-client
         , http-client-tls
@@ -367,6 +371,7 @@ library storage-tools
         , text
         , unordered-containers
         , vector
+        , yaml
 
 executable cw-range-db
     import: warning-flags, debugging-flags
@@ -455,6 +460,7 @@ test-suite storage-tools-tests
         Chainweb.StorageTools.Test.Compare
         Chainweb.StorageTools.Test.Http
         Chainweb.StorageTools.Test.RangeDb
+        Chainweb.StorageTools.Test.Requests
     build-depends:
         -- internal
         , chainweb
@@ -475,6 +481,7 @@ test-suite storage-tools-tests
         , http-types
         , lens
         , loglevel
+        , merkle-log
         , pact
         , resourcet
         , rocksdb-haskell-kadena
