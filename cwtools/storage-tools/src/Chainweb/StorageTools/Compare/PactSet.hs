@@ -1,5 +1,6 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TemplateHaskell #-}
 
 -- |
@@ -18,9 +19,13 @@ module Chainweb.StorageTools.Compare.PactSet
 , defaultPactSet
 , decodePactSet
 , loadPactSet
+, pactSetProblems
+, liveEntries
 , entriesFor
 , generatedEntries
 ) where
+
+import Control.Monad ((>=>))
 
 import Data.Aeson
 import qualified Data.ByteString as B
@@ -46,7 +51,8 @@ data PactEntry = PactEntry
         -- ^ the code, or for 'PactCont' the pact id; with the placeholders
         -- @{account}@, @{txid}@ and @{pactId}@
     , _peStep :: !Int
-        -- ^ the step of a continuation
+        -- ^ the step of a continuation, required for 'PactCont' (0 for
+        -- 'PactExec')
     , _peWhy :: !T.Text
         -- ^ why the entry is in the set, and the bound of its cost on a live
         -- node
@@ -70,9 +76,16 @@ instance FromJSON PactEntry where
             "exec" -> return PactExec
             "cont" -> return PactCont
             k -> fail $ "entry " <> T.unpack name <> ": unknown kind " <> T.unpack k
+        step <- case kind of
+            PactCont -> o .:? "step" >>= maybe
+                (fail $ "entry " <> T.unpack name <> ": kind cont needs a step")
+                return
+            PactExec -> o .:? "step" >>= \case
+                Nothing -> return 0
+                Just (_ :: Int) -> fail $ "entry " <> T.unpack name <> ": a step only with kind cont"
         PactEntry name classes kind
             <$> o .: "code"
-            <*> o .:? "step" .!= 1
+            <*> pure step
             <*> o .:? "why" .!= ""
             <*> o .:? "sameSnapshotOnly" .!= False
 
@@ -84,14 +97,67 @@ decodePactSet bs = case Yaml.decodeEither' bs of
     Left e -> Left (Yaml.prettyPrintParseException e)
     Right s -> Right s
 
--- | The Pact set of @storage-tools/data/pact-set.yaml@.
+-- | The Pact set of @storage-tools/data/pact-set.yaml@. It is held to
+-- 'pactSetProblems' like any other set.
 --
 defaultPactSet :: PactSet
 defaultPactSet = either (error . ("Chainweb.StorageTools.Compare.PactSet: data/pact-set.yaml: " <>)) id
-    $ decodePactSet $(embedFile "storage-tools/data/pact-set.yaml")
+    $ decodePactSet $(embedFile "storage-tools/data/pact-set.yaml") >>= checked
 
+-- | Reads a Pact set (@--pact-set FILE@). Fails on a set that does not
+-- decode, and on one with any of 'pactSetProblems'.
+--
 loadPactSet :: FilePath -> IO PactSet
-loadPactSet f = B.readFile f >>= either (ioError . userError . ((f <> ": ") <>)) return . decodePactSet
+loadPactSet f = B.readFile f
+    >>= either (ioError . userError . ((f <> ": ") <>)) return . (decodePactSet >=> checked)
+
+checked :: PactSet -> Either String PactSet
+checked s = case pactSetProblems s of
+    [] -> Right s
+    ps -> Left (T.unpack (T.intercalate "; " ps))
+
+-- | Why a Pact set must not be used, one text per problem; empty if it may.
+-- An entry that is not 'sameSnapshotOnly' is sent to a live production
+-- oracle, so it fails closed:
+--
+-- * its @why@ records the bound of its cost after @Bound:@;
+-- * its code holds no table scan: no @txids@ or @keylog@ (no upper bound
+--   below the live tip), no @select@ or @fold-db@, and @keys@ only on the
+--   small @coin.allocation-table@.
+--
+-- Every continuation, same-snapshot or not, is at step 0: the step check
+-- fails before any code of the defpact runs, while step 1 runs user code.
+--
+pactSetProblems :: PactSet -> [T.Text]
+pactSetProblems s = concatMap problems (_pactEntries s)
+  where
+    problems e = map (\p -> "entry " <> _peName e <> ": " <> p) $ concat
+        [ [ "kind cont at step " <> T.pack (show (_peStep e)) <> ", only step 0 is allowed"
+          | _peKind e == PactCont, _peStep e /= 0
+          ]
+        , [ "no \"Bound:\" in its why; an entry without a known bound needs sameSnapshotOnly: true"
+          | live e, not ("Bound:" `T.isInfixOf` _peWhy e)
+          ]
+        , [ "the code calls " <> f <> ", a table scan; it needs sameSnapshotOnly: true"
+          | live e, f <- ["txids", "keylog", "select", "fold-db"], calls f (_peCode e)
+          ]
+        , [ "the code calls keys on a table other than coin.allocation-table; it needs sameSnapshotOnly: true"
+          | live e
+          , any (not . ("coin.allocation-table)" `T.isPrefixOf`)) (drop 1 (T.splitOn "(keys " (normal (_peCode e))))
+          ]
+        ]
+    live = not . _peSameSnapshotOnly
+    calls f code = ("(" <> f <> " ") `T.isInfixOf` normal code
+
+    -- whitespace collapsed to single spaces, none right after an opening
+    -- parenthesis
+    normal = T.replace "( " "(" . T.unwords . T.words
+
+-- | The entries of a set that may be sent to a live production oracle: those
+-- not marked 'sameSnapshotOnly'.
+--
+liveEntries :: PactSet -> [PactEntry]
+liveEntries = filter (not . _peSameSnapshotOnly) . _pactEntries
 
 -- | The entries that serve a request class, in the order of the set.
 --

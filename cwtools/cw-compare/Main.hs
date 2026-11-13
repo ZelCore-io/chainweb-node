@@ -308,6 +308,7 @@ main = do
         RequestFile f -> (\rs -> (rs, [], id)) <$> readRequests f
         Generated g -> do
             pset <- maybe (return defaultPactSet) loadPactSet (_genPactSet g)
+            forM_ (_genPactSet g) $ \f -> logCustomSet logger f pset
             api <- oracleServiceApi hl v (_optOracle o)
             let spec = SampleSpec
                     { _ssSeed = _genSeed g
@@ -335,6 +336,23 @@ main = do
     writeReport (_optReport o) rep
     T.putStr (reportSummary rep)
     exitWith (gateExitCode (reportVerdict rep))
+
+-- | Logs the entries of a custom Pact set (@--pact-set@) that may go to a
+-- production oracle: those not marked sameSnapshotOnly, sent without
+-- @--same-snapshot@ too.
+--
+logCustomSet :: GenericLogger -> FilePath -> PactSet -> IO ()
+logCustomSet logger f pset = do
+    let live = liveEntries pset
+        logg = logFunctionText logger Info
+    logg $ "Pact set " <> T.pack f <> ": " <> T.pack (show (length live)) <> " of "
+        <> T.pack (show (length (_pactEntries pset)))
+        <> " entries may be sent to a production oracle (not sameSnapshotOnly):"
+    forM_ live $ \e -> logg $ "  " <> _peName e
+        <> " [" <> T.intercalate "," (map requestClassText (_peClasses e)) <> "] "
+        <> (case _peKind e of
+                PactExec -> "exec " <> _peCode e
+                PactCont -> "cont " <> _peCode e <> " step " <> T.pack (show (_peStep e)))
 
 -- | The in-process test side of @--test-db@.
 --

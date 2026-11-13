@@ -38,6 +38,8 @@ import Data.Word (Word64)
 import Network.HTTP.Types
 import Network.Wai (Application, pathInfo, queryString, responseLBS, responseRaw, strictRequestBody)
 import Network.Wai.Handler.Warp (testWithApplication)
+import System.Directory (getTemporaryDirectory, removeFile)
+import System.IO (hClose, openTempFile)
 import Test.Tasty
 import Test.Tasty.HUnit
 import qualified Options.Applicative as O
@@ -92,6 +94,7 @@ tests = testGroup "Requests"
     , testCase "spv: a target chain outside the coverage at the target height + 3 is NotCovered" spvTargetCoverage
     , testCase "--allow-reads-in-local takes a required true|false" allowReadsOption
     , testCase "an oracle lookup whose connection closes without an answer is sent once, never again" lookupNotResent
+    , testCase "a custom Pact set fails closed: a cont entry needs a step; a live entry needs a bound, step 0, no scan" customPactSet
     ]
 
 cid0, cid3, cid10 :: ChainId
@@ -542,22 +545,29 @@ liveKeys = withOracle $ \_ _ api _ -> do
     assertBool "keys on a large table with --same-snapshot"
         (any (maybe False (\c -> "(keys " `T.isInfixOf` c && not ("allocation-table" `T.isInfixOf` c))) snap)
 
+-- | The checks of 'pactSetProblems', which 'loadPactSet' applies to a custom
+-- set too: a bound in every live entry's why, no table scan in a live entry,
+-- every continuation at step 0.
+--
 pactSetBounds :: Assertion
 pactSetBounds = do
     let es = _pactEntries defaultPactSet
-        live = filter (not . _peSameSnapshotOnly) es
         byName n = filter ((== n) . _peName) es
-    forM_ live $ \e -> assertBool (T.unpack (_peName e) <> ": the why records a bound") ("Bound:" `T.isInfixOf` _peWhy e)
+    pactSetProblems defaultPactSet @?= []
     forM_ ["txids", "keylog", "txids-small-table", "keys-large-table"] $ \n -> case byName n of
         [e] -> assertBool (T.unpack n <> " is same-snapshot only") (_peSameSnapshotOnly e)
         x -> assertFailure (T.unpack n <> ": " <> show x)
-    forM_ live $ \e -> do
-        when ("(keys " `T.isInfixOf` _peCode e) $ _peCode e @?= "(keys coin.allocation-table)"
-        assertBool (T.unpack (_peName e) <> ": no txids or keylog") $
-            not (any (`T.isInfixOf` _peCode e) ["(txids ", "(keylog "])
-    forM_ [ e | e <- es, _peKind e == PactCont ] $ \e -> _peStep e @?= 0
+    assertBool "a defpact state entry" (any ((== PactCont) . _peKind) es)
     assertBool "a row created late that is found above its creation height"
         (any (not . _peSameSnapshotOnly) (byName "namespace-before-creation"))
+    -- the function finds what the checks look for
+    let bad = PactSet
+            [ PactEntry "unbounded" [ClsLocal] PactExec "(coin.details \"{account}\")" 0 "no bound" False
+            , PactEntry "scan" [ClsLocal] PactExec "(keys  coin.coin-table)" 0 "Bound: none" False
+            , PactEntry "history" [ClsHistory] PactExec "( txids coin.coin-table 0)" 0 "Bound: none" False
+            , PactEntry "step1" [ClsLocal] PactCont "{pactId}" 1 "state" True
+            ]
+    map (T.takeWhile (/= ':')) (pactSetProblems bad) @?= ["entry unbounded", "entry scan", "entry history", "entry step1"]
 
 sparseTxs :: Assertion
 sparseTxs = withOracleTxs (== 700) $ \_ _ api _ -> do
@@ -670,3 +680,39 @@ lookupNotResent = do
         assertBool "the lookup fails" (either (const True) (const False) r)
         n <- readIORef arrivals
         n @?= 1
+
+-- | Loads a Pact set from YAML text through a file, as @--pact-set@ does.
+--
+loadText :: B.ByteString -> IO (Either SomeException PactSet)
+loadText yaml = do
+    tmp <- getTemporaryDirectory
+    (f, h) <- openTempFile tmp "pact-set.yaml"
+    B.hPut h yaml >> hClose h
+    r <- try (loadPactSet f)
+    removeFile f
+    return r
+
+customPactSet :: Assertion
+customPactSet = do
+    let entry extra = B8.unlines $
+            [ "entries:"
+            , "  - name: custom"
+            , "    classes: [local]"
+            ] <> map ("    " <>) extra
+        rejected what yaml = loadText yaml >>= \case
+            Left e -> assertBool (what <> ": the error names the entry: " <> show e) ("custom" `isInfixOf` show e)
+            Right s -> assertFailure (what <> ": loaded " <> show s)
+    case decodePactSet (entry ["kind: cont", "code: '{pactId}'", "why: 'Bound: one read'"]) of
+        Left e -> assertBool ("names the step: " <> e) ("step" `isInfixOf` e)
+        Right s -> assertFailure ("a cont entry without a step decodes: " <> show s)
+    rejected "a live entry without a bound" $ entry ["code: '(coin.details \"{account}\")'", "why: 'coin details'"]
+    rejected "a live cont entry at step 1" $ entry ["kind: cont", "code: '{pactId}'", "step: 1", "why: 'Bound: one read'"]
+    rejected "a same-snapshot cont entry at step 1" $
+        entry ["kind: cont", "code: '{pactId}'", "step: 1", "sameSnapshotOnly: true", "why: 'state'"]
+    rejected "live keys on a large table" $ entry ["code: '(keys coin.coin-table)'", "why: 'Bound: none really'"]
+    rejected "live txids" $ entry ["code: '(txids coin.coin-table 0)'", "why: 'Bound: none really'"]
+    rejected "live select" $ entry ["code: '(select coin.coin-table (constantly true))'", "why: 'Bound: none really'"]
+    ok1 <- loadText $ entry ["code: '(coin.details \"{account}\")'", "why: 'Bound: one indexed read'"]
+    either (assertFailure . show) (\s -> map _peName (_pactEntries s) @?= ["custom"]) ok1
+    ok2 <- loadText $ entry ["code: '(keys coin.coin-table)'", "sameSnapshotOnly: true", "why: 'no bound'"]
+    either (assertFailure . show) (\s -> map _peSameSnapshotOnly (_pactEntries s) @?= [True]) ok2
