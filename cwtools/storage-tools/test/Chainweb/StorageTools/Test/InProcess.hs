@@ -58,6 +58,7 @@ import Pact.Core.Capabilities (CapToken(..))
 import Pact.Core.Hash (hash, hashToText)
 import Pact.Core.Names (ModuleName(..), QualifiedName(..))
 import Pact.Core.PactValue
+import qualified Pact.Types.KeySet as Pact4
 
 -- internal modules
 
@@ -71,7 +72,7 @@ import Chainweb.Graph (pairChainGraph)
 import Chainweb.Logger
 import Chainweb.Mempool.Consensus (mkMempoolConsensus)
 import Chainweb.Mempool.Mempool (InsertType(..), mempoolInsert)
-import Chainweb.Miner.Pact (noMiner)
+import Chainweb.Miner.Pact (Miner(..), MinerId(..), MinerKeys(..))
 import Chainweb.Pact.Backend.Types (IntraBlockPersistence(..))
 import Chainweb.Pact.Backend.Utils (chainDbFileName, startSqliteDb, stopSqliteDb)
 import Chainweb.Pact.PactService (runPactService)
@@ -273,6 +274,13 @@ transferCmd cid h = (defaultCmd cid)
     , _cbNonce = Just ("inprocess fixture " <> toText cid <> " " <> T.pack (show h))
     }
 
+-- | The miner of the fixture: the k: account of sender00's key, so that a
+-- preflight has a k: sender in every block (preflight senders are k:
+-- accounts only).
+--
+fxMiner :: Miner
+fxMiner = Miner (MinerId ("k:" <> fst sender00)) $ MinerKeys $ Pact4.mkKeySet [Pact4.PublicKeyText (fst sender00)] "keys-all"
+
 -- | Mines one block on a chain on top of a cut and waits until the 'CutDb'
 -- has it.
 --
@@ -285,7 +293,7 @@ mineChain
     -> IO (Cut, PayloadWithOutputs)
 mineChain webPact cutDb pdb c cid = do
     parent <- maybe (throwIO $ userError "fixture: no parent") (return . ParentHeader) $ HM.lookup cid (_cutMap c)
-    nb <- throwIfNoHistory =<< _webPactNewBlock webPact cid noMiner NewBlockFill parent
+    nb <- throwIfNoHistory =<< _webPactNewBlock webPact cid fxMiner NewBlockFill parent
     let pwo = newBlockToPayloadWithOutputs nb
     t :: Time Micros <- getCurrentTimeIntegral
     testMineWithPayloadHash (view cutDbWebBlockHeaderDb cutDb) (Nonce 0) t (_payloadWithOutputsPayloadHash pwo) cid c >>= \case

@@ -99,6 +99,7 @@ tests = testGroup "Requests"
     , testCase "a class whose every compared answer is the same non-2xx is at best PartialPass" sameNon2xxOnly
     , testCase "a Pact set entry that expects success needs a Same success in each class, or the run is at best PartialPass" hollowEntries
     , testCase "lookups whose window crosses the oracle's tip stop at the height of its cut" nearTip
+    , testCase "a preflight sender is a k: account of the block; plain /local takes any account" preflightSenders
     ]
 
 cid0, cid3, cid10 :: ChainId
@@ -183,11 +184,14 @@ rk h i = "rk" <> tshow h <> "-" <> tshow i
 b64 :: Value -> T.Text
 b64 = encodeB64UrlNoPaddingText . BL.toStrict . encode
 
-payloadObjWith :: (Word64 -> Bool) -> Word64 -> Value
-payloadObjWith txsAt h = object
+-- | A payload with the miner account given, transactions at the heights of
+-- the predicate.
+--
+payloadObjMiner :: T.Text -> (Word64 -> Bool) -> Word64 -> Value
+payloadObjMiner minerAccount txsAt h = object
     [ "transactions" .= [ [b64 (txJson i), b64 (outJson i)] | txsAt h, i <- [0, 1] ]
     , "minerData" .= b64 (object
-        [ "account" .= ("k:miner" :: T.Text), "predicate" .= ("keys-all" :: T.Text), "public-keys" .= ["miner-key" :: T.Text] ])
+        [ "account" .= minerAccount, "predicate" .= ("keys-all" :: T.Text), "public-keys" .= ["miner-key" :: T.Text] ])
     , "coinbase" .= b64 (object [ "reqKey" .= ("cb" <> tshow h), "txId" .= (10 * h), "continuation" .= Null ])
     , "payloadHash" .= payloadAt h
     , "transactionsHash" .= ("T" <> tshow h)
@@ -218,7 +222,12 @@ headerObj h = object
     ]
 
 oracleAppWith :: (Word64 -> Bool) -> IORef Int -> Application
-oracleAppWith txsAt arrivals req respond = do
+oracleAppWith = oracleAppMiner "k:miner"
+
+-- | 'oracleAppWith' with another miner account.
+--
+oracleAppMiner :: T.Text -> (Word64 -> Bool) -> IORef Int -> Application
+oracleAppMiner minerAccount txsAt arrivals req respond = do
     atomicModifyIORef' arrivals (\n -> (n + 1, ()))
     body <- BL.toStrict <$> strictRequestBody req
     let q k = lookup k (queryString req) >>= id >>= readMaybe . B8.unpack
@@ -237,7 +246,7 @@ oracleAppWith txsAt arrivals req respond = do
                 in json $ object [ "items" .= items, "limit" .= length items, "next" .= Null ]
         ["chain", _, "payload", "outputs", "batch"]
             | Just hs <- decodeStrict body >>= parseMaybe (withObject "batch" (.: "heights")) ->
-                json $ toJSON [ payloadObjWith txsAt h | h <- hs ]
+                json $ toJSON [ payloadObjMiner minerAccount txsAt h | h <- hs ]
         _ -> respond $ responseLBS status404 [] "not found"
 
 withOracle :: (IORef Int -> HostLimiters -> ServiceApi -> T.Text -> IO a) -> IO a
@@ -843,3 +852,22 @@ nearTip = withOracle $ \_ _ api _ -> do
     case r of
         Left (NoTxWithin lo hi) -> (lo, hi) @?= (stubTip, stubTip)
         x -> assertFailure ("expected NoTxWithin at the tip: " <> show x)
+
+-- | Task 6 re-review (1): coin's enforce-reserved gives a k: account a keyset
+-- guard, so a preflight's buy-gas evaluates no user guard.
+--
+preflightSenders :: Assertion
+preflightSenders = do
+    arrivals <- newIORef 0
+    testWithApplication (return (oracleAppMiner "NoMiner" hasTxs arrivals)) $ \port -> do
+        hl <- newHostLimiters 1_000 Nothing
+        api <- oracleServiceApi hl mainnet ("http://127.0.0.1:" <> tshow port)
+        let sender r = either (const Nothing) (field ["meta", "sender"]) (commandPayload (fromMaybe "" (_reqBody r)))
+        -- 300 has transactions of k:sender300, 301 has none
+        withTxs <- forM [1 .. 20] $ \s -> sender <$> gen api s ClsPreflight 300
+        nub withTxs @?= [Just (String "k:sender300")]
+        without <- forM [1 .. 20] $ \s -> sender <$> gen api s ClsPreflight 301
+        nub without @?= [Just (String "cw-compare")]
+        -- plain /local fills {account} from any account, the miner included
+        codes <- forM [1 .. 40] $ \s -> execCode <$> gen api s ClsLocal 301
+        assertBool "a plain /local reads the miner NoMiner" (any (maybe False ("NoMiner" `T.isInfixOf`)) codes)

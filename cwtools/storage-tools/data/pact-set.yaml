@@ -57,7 +57,10 @@ entries:
       load of the coin module and its interfaces (a few SYS:Modules rows of fixed
       size); the module code runs under the gas limit of 100,000. Preflight adds
       buy-gas and redeem-gas on the sender's row: a few more indexed reads and
-      writes of one row each, never committed
+      writes of one row each, never committed. The preflight sender is a k:
+      account of the block, whose guard coin's enforce-reserved makes a keyset,
+      so buy-gas evaluates no user guard (below Pact 4 height 3,250,348 a
+      guard runs on free gas)
 
   - name: coin-table-read
     classes: [local]
@@ -73,7 +76,8 @@ entries:
     code: '(coin.get-balance "{account}")'
     why: >-
       the same row through module code (a different read path and gas).
-      Bound: as coin-details, one indexed row read plus the coin module
+      Bound: as coin-details, one indexed row read plus the coin module; in
+      preflight, buy-gas and redeem-gas on a k: sender as for coin-details
 
   - name: keys-small-table
     classes: [local]

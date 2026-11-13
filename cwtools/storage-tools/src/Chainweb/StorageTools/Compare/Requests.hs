@@ -507,7 +507,9 @@ requestsFor = requestsForWith defaultGenOptions
 --   sampled height; with '_goSameSnapshot', also a plain range;
 -- * local, history, preflight: a pinned @/local@ ('localCommandWith') of an
 --   entry of the Pact set, filled from the block; history only at Pact 4
---   heights ('historyMaxHeight'), refused otherwise;
+--   heights ('historyMaxHeight'), refused otherwise; the sender of a
+--   preflight is a @k:@ account of the block (the miner or a transaction's
+--   sender), @cw-compare@ if the block has none;
 -- * poll: request keys of the first block with transactions plus one or two
 --   unknown keys;
 -- * spv: a request key of the first block with transactions, to a chain
@@ -599,7 +601,13 @@ requestsForWith opts api pset seed (cls, cid, BlockHeight t) = case cls of
             [(_, f)] -> return f
             _ -> genError "the oracle's payload batch has the wrong length"
         let (entry, g1) = pickOr firstEntry entries g0
-            ((account, keys), g2) = pickOr ("cw-compare", []) (_fAccounts facts) g1
+            -- a preflight sender is a k: account: coin's enforce-reserved
+            -- gives it a keyset guard, so buy-gas runs no user guard (at Pact
+            -- 4 heights below 3,250,348 that guard runs on free gas)
+            senders
+                | cls == ClsPreflight = filter (("k:" `T.isPrefixOf`) . fst) (_fAccounts facts)
+                | otherwise = _fAccounts facts
+            ((account, keys), g2) = pickOr ("cw-compare", []) senders g1
             (txid, g3) = pickOr 0 (_fTxids facts) g2
             (pid, _) = pickOr "cw-compare-no-pact" (_fPactIds facts <> _fKeys facts <> maybeToList (_fCoinbaseKey facts)) g3
             code = T.replace "{account}" account
