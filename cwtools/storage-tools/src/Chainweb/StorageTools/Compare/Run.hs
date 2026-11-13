@@ -28,6 +28,7 @@ module Chainweb.StorageTools.Compare.Run
 , RunOptions(..)
 , defaultRunOptions
 , runCompareWith
+, runCompareClasses
 , tipProbe
 , compareWorkers
 , tipRefreshInterval
@@ -178,7 +179,8 @@ data Role = OracleRole | TestRole
 data Env = Env
     { _envOptions :: !RunOptions
     , _envManager :: !HTTP.Manager
-    , _envCoverage :: !Coverage
+    , _envCoverage :: !(RequestClass -> Coverage)
+        -- ^ the coverage of each class, see 'classCoverage'
     , _envOracle :: !Side
     , _envTest :: !Side
     , _envTips :: !(IORef (M.Map (Role, ChainId) (BlockHeight, Int)))
@@ -477,7 +479,7 @@ checkOrphan env r ph = case (_reqTarget r, apiPrefixOfPath (_reqPath r)) of
 compareOne :: Env -> (Int, Request) -> IO Outcome
 compareOne env (i, r) = do
     atomicModifyIORef' (_envStarted env) (\n -> (n + 1, ()))
-    case preJudge (_envCoverage env) r of
+    case preJudge (_envCoverage env (_reqClass r)) r of
         Just v -> return (Outcome i r v Nothing Nothing 0 Nothing Nothing)
         Nothing -> go 1
   where
@@ -490,7 +492,7 @@ compareOne env (i, r) = do
             Decided v na -> return (Outcome i r v Nothing Nothing attempt Nothing na)
             Answers ds (Right a) (Right b) ->
                 let done v = return (Outcome i r v (Just a) (Just b) attempt ds Nothing)
-                in case judge (_envCoverage env) r a b of
+                in case judge (_envCoverage env (_reqClass r)) r a b of
                     Final v -> done v
                     RetryPinMismatch
                         | attempt <= maxPinRetries -> go (attempt + 1)
@@ -524,7 +526,23 @@ runCompare logger = runCompareWith logger defaultRunOptions
 -- | 'runCompare' with other 'RunOptions'.
 --
 runCompareWith :: Logger l => l -> RunOptions -> Coverage -> Side -> Side -> [Request] -> IO Report
-runCompareWith logger opts cov oracle test reqs = do
+runCompareWith logger opts cov = runCompareClasses logger opts (const cov)
+
+-- | 'runCompareWith' with a coverage per request class, for instance
+-- @'classCoverage' (Just pactChains) cov@ for an in-process test side: a
+-- request outside the coverage of its class is 'Skipped' 'NotCovered' and
+-- never sent.
+--
+runCompareClasses
+    :: Logger l
+    => l
+    -> RunOptions
+    -> (RequestClass -> Coverage)
+    -> Side
+    -> Side
+    -> [Request]
+    -> IO Report
+runCompareClasses logger opts cov oracle test reqs = do
     mgr <- HTTP.newTlsManagerWith HTTP.tlsManagerSettings
         { HTTP.managerResponseTimeout = HTTP.responseTimeoutMicro (_roResponseTimeout opts) }
     env <- Env opts mgr cov oracle test <$> newIORef mempty <*> newIORef 0 <*> pure logg

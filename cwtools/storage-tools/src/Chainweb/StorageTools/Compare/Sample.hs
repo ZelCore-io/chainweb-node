@@ -53,6 +53,10 @@ data SampleSpec = SampleSpec
     , _ssHistoryMax :: !(Maybe BlockHeight)
         -- ^ the highest height of a History target, from 'historyMaxHeight';
         -- 'Nothing': no History target is drawn
+    , _ssPactChains :: !(Maybe [ChainId])
+        -- ^ the Pact chains of an in-process test side: the classes of
+        -- 'isPactClass' are drawn on these chains only (see 'classCoverage');
+        -- 'Nothing': on every chain of the coverage
     }
 
 -- | The fork boundaries of mainnet: the coin v2 upgrade, the genesis of the
@@ -151,10 +155,10 @@ drawFrom ws g =
 sampleTargets :: SampleSpec -> [(RequestClass, ChainId, BlockHeight)]
 sampleTargets spec = go (mkStdGen (fromIntegral (_ssSeed spec))) (_ssCount spec)
   where
-    covered = windows (_ssCoverage spec)
     pools =
         [ (cls, regular, nearBoundaries (_ssBoundaries spec) regular)
         | cls <- _ssClasses spec
+        , let covered = windows (classCoverage (_ssPactChains spec) (_ssCoverage spec) cls)
         , let regular = classWindows spec cls covered
         , not (null regular)
         ]

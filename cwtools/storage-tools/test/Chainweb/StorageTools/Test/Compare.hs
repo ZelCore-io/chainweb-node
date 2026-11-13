@@ -257,7 +257,7 @@ sampleCov = Coverage $ M.fromList [(cid0, [(0, 150_000)]), (cid3, [(0, 6_100_000
 
 specFor :: Word64 -> SampleSpec
 specFor seed = SampleSpec seed 10_000 allRequestClasses sampleCov mainnetBoundaries boundaryShare
-    (historyMaxHeight mainnet)
+    (historyMaxHeight mainnet) Nothing
 
 spec1, spec2 :: SampleSpec
 spec1 = specFor 1

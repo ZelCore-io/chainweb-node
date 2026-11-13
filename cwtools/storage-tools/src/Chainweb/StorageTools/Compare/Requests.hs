@@ -30,6 +30,7 @@ module Chainweb.StorageTools.Compare.Requests
 , localCommandWith
 , localCreationTime
 , localGasLimit
+, historyGasLimit
 , localTtl
 , preflightTimeSlack
   -- * Generating requests
@@ -38,6 +39,8 @@ module Chainweb.StorageTools.Compare.Requests
 , requestsFor
 , requestsForWith
 , generateRequests
+, GenSkip(..)
+, generateRequestsSkipping
 , generateWorkers
 , RequestGenError(..)
 , oracleServiceApi
@@ -110,13 +113,14 @@ data LocalMeta = LocalMeta
         -- @signatureVerification=false@, since the command has no signatures
     , _lmCreationTime :: !Int64
         -- ^ seconds since the epoch
+    , _lmGasLimit :: !Int
     }
     deriving (Show, Eq)
 
--- | Sender @cw-compare@, no signers, 'localCreationTime'.
+-- | Sender @cw-compare@, no signers, 'localCreationTime', 'localGasLimit'.
 --
 defaultLocalMeta :: LocalMeta
-defaultLocalMeta = LocalMeta "cw-compare" [] localCreationTime
+defaultLocalMeta = LocalMeta "cw-compare" [] localCreationTime localGasLimit
 
 -- | The fixed creation time of every @/local@ command but preflight:
 -- 2020-09-13T12:26:40Z. Plain @/local@ does not check it.
@@ -126,6 +130,15 @@ localCreationTime = 1_600_000_000
 
 localGasLimit :: Int
 localGasLimit = 100_000
+
+-- | The gas limit of a History command. Pact 4 charges 100,000 for each of
+-- @txids@, @txlog@ and @keylog@, so 'localGasLimit' always ends in a gas
+-- error (seen on a mainnet 3.2.1 node at a Pact 4 height). Plain @/local@ is
+-- not held to the block gas limit; preflight, which is, keeps
+-- 'localGasLimit'.
+--
+historyGasLimit :: Int
+historyGasLimit = 150_000
 
 -- | One day, below Pact's maximum of two days.
 --
@@ -173,7 +186,7 @@ localCommandWith v cid lm pl seed = encodeStrict $ object
         , "meta" .= object
             [ "chainId" .= toText cid
             , "sender" .= _lmSender lm
-            , "gasLimit" .= localGasLimit
+            , "gasLimit" .= _lmGasLimit lm
             , "gasPrice" .= (0.00000001 :: Double)
             , "ttl" .= localTtl
             , "creationTime" .= _lmCreationTime lm
@@ -513,7 +526,7 @@ requestsForWith opts api pset seed (cls, cid, BlockHeight t) = case cls of
             (key, g2) = pickOr fallback (_fKeys facts) g1
             targets = [ c | c <- sort (HS.toList (chainIds v)), genesisBlockHeight v c <= BlockHeight hit ]
             (trg, _) = pickOr cid targets g2
-        return $ request (BlockHeight hit) methodPost "/pact/api/v1/spv"
+        return $ request (BlockHeight hit) methodPost "/pact/spv"
             (Just (encodeStrict (object [ "requestKey" .= key, "targetChainId" .= toText trg ])))
 
     _ -> do
@@ -539,9 +552,10 @@ requestsForWith opts api pset seed (cls, cid, BlockHeight t) = case cls of
                 PactCont -> LocalCont code (_peStep entry)
             (meta, query)
                 | cls == ClsPreflight =
-                    ( LocalMeta account keys (_hiCreation h0 `div` 1_000_000 - preflightTimeSlack)
+                    ( LocalMeta account keys (_hiCreation h0 `div` 1_000_000 - preflightTimeSlack) localGasLimit
                     , "?preflight=true&signatureVerification=false&rewindDepth="
                     )
+                | cls == ClsHistory = (defaultLocalMeta { _lmGasLimit = historyGasLimit }, "?rewindDepth=")
                 | otherwise = (defaultLocalMeta, "?rewindDepth=")
         return $ request (BlockHeight t) methodPost ("/pact/api/v1/local" <> query <> depthPlaceholder)
             (Just (localCommandWith v cid meta payload seed))
@@ -556,6 +570,37 @@ requestsForWith opts api pset seed (cls, cid, BlockHeight t) = case cls of
 --
 generateWorkers :: Int
 generateWorkers = 8
+
+-- | A target dropped at generation, and why.
+--
+data GenSkip = GenSkip
+    { _gsTarget :: !(RequestClass, ChainId, BlockHeight)
+    , _gsReason :: !T.Text
+    }
+    deriving (Show, Eq)
+
+-- | 'requestsForWith' for every target, in the order of the targets. A
+-- target whose lookups fail ('RequestGenError', or an HTTP failure after all
+-- attempts) is dropped and returned as a 'GenSkip' (ruling on Task 6a; the
+-- report counts them, see 'reportGeneration').
+--
+generateRequestsSkipping
+    :: GenOptions
+    -> ServiceApi
+    -> PactSet
+    -> Word64
+    -> [(RequestClass, ChainId, BlockHeight)]
+    -> IO ([Request], [GenSkip])
+generateRequestsSkipping opts api pset seed targets = do
+    rs <- fmap concat $ mapM (mapConcurrently one) $ chunks targets
+    return ([ r | Right r <- rs ], [ s | Left s <- rs ])
+  where
+    one target = try (try (requestsForWith opts api pset seed target)) >>= \case
+        Right (Right r) -> return (Right r)
+        Right (Left (RequestGenError e)) -> return (Left (GenSkip target e))
+        Left (e :: HTTP.HttpException) -> return (Left (GenSkip target (tshow e)))
+    chunks [] = []
+    chunks xs = let (a, b) = splitAt generateWorkers xs in a : chunks b
 
 -- | 'requestsForWith' for every target, in the order of the targets. The
 -- first 'RequestGenError' (or HTTP failure after all attempts) is rethrown.

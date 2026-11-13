@@ -372,7 +372,7 @@ pollAndSpv = withOracle $ \_ _ api _ -> do
         assertBool "an unknown key" (any (\k -> not ("rk" `T.isPrefixOf` k)) keys)
     spvs <- forM [1 .. 10] $ \s -> gen api s ClsSpv 301
     forM_ spvs $ \r -> do
-        _reqPath r @?= prefix <> "/pact/api/v1/spv"
+        _reqPath r @?= prefix <> "/pact/spv"
         _reqTarget r @?= Just 303
         case bodyValue r >>= field ["requestKey"] of
             Just (String k) -> assertBool "a sampled transaction" (k `elem` known)
@@ -391,7 +391,7 @@ genesisCoverageTest = do
         , (cid10, [(852_054, 900_000)])
         ])
     genesisCoverage mainnet [cid10] (100, 200) @?= Coverage (M.fromList [(cid10, [])])
-    let spec cov = SampleSpec 1 500 allRequestClasses cov mainnetBoundaries boundaryShare (historyMaxHeight mainnet)
+    let spec cov = SampleSpec 1 500 allRequestClasses cov mainnetBoundaries boundaryShare (historyMaxHeight mainnet) Nothing
         ts = sampleTargets (spec (genesisCoverage mainnet [cid0, cid10] (852_000, 852_100)))
     assertBool "targets drawn" (length ts == 500)
     forM_ ts $ \(_, c, h) -> when (c == cid10) $
@@ -418,7 +418,7 @@ spvRealProof = do
         bad = TransactionOutputProof cid0 proof { _merkleProofObject = obj' }
         spvBody p = BL.toStrict (encode (encodeB64UrlNoPaddingText (BL.toStrict (encode p))))
         cov = Coverage (M.fromList [(cid0, [(0, 1_000)])])
-        req = Request ClsSpv cid0 (Just 300) methodPost (prefix <> "/pact/api/v1/spv") (Just "{}")
+        req = Request ClsSpv cid0 (Just 300) methodPost (prefix <> "/pact/spv") (Just "{}")
         ans = Answer 200
     -- the encoded proof decodes to the same proof
     (decodeStrict (spvBody good) >>= \case

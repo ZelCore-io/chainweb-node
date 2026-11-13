@@ -27,6 +27,9 @@
 --
 module Chainweb.StorageTools.Compare.InProcess
 ( InProcessSpec(..)
+, LocalSettings(..)
+, defaultLocalSettings
+, localSettingsText
 , withInProcessSide
 
 -- * Parts
@@ -100,7 +103,50 @@ data InProcessSpec = InProcessSpec
         -- but no Pact API.
     , _ipTuning :: RocksDbTuning
         -- ^ the tuning the source RocksDB is opened with
+    , _ipLocal :: LocalSettings
+        -- ^ the Pact settings that change @/local@ answers; they must be
+        -- those of the oracle node
+    , _ipPauseFile :: Maybe FilePath
+        -- ^ while this file exists, the side's limiter grants no permit, as
+        -- for the oracle (@--pause-file@)
     }
+
+-- | The settings of a node's Pact service that change @/local@ answers,
+-- named as in the node's configuration file (@chainweb.*@).
+--
+data LocalSettings = LocalSettings
+    { _lsAllowReadsInLocal :: Bool
+        -- ^ @allowReadsInLocal@: at Pact 4 heights, direct reads of a table
+        -- outside its module (@read@, @keys@, @txids@, ...) succeed, instead
+        -- of failing on the module's governance
+    , _lsEnableLocalTimeout :: Bool
+        -- ^ @enableLocalTimeout@: a @/local@ call that takes more than 2
+        -- seconds fails
+    , _lsBlockGasLimit :: Maybe Integer
+        -- ^ @gasLimitOfBlock@, capped by the version's maximum: a preflight
+        -- command whose gas limit is above it fails. 'Nothing': the node
+        -- default (150,000)
+    }
+    deriving (Show, Eq)
+
+-- | The defaults of a node: no reads in @/local@, no timeout, the default
+-- block gas limit.
+--
+defaultLocalSettings :: LocalSettings
+defaultLocalSettings = LocalSettings
+    { _lsAllowReadsInLocal = False
+    , _lsEnableLocalTimeout = False
+    , _lsBlockGasLimit = Nothing
+    }
+
+-- | The settings by their names in the node's configuration, for the report.
+--
+localSettingsText :: LocalSettings -> [(T.Text, T.Text)]
+localSettingsText ls =
+    [ ("allowReadsInLocal", if _lsAllowReadsInLocal ls then "true" else "false")
+    , ("enableLocalTimeout", if _lsEnableLocalTimeout ls then "true" else "false")
+    , ("gasLimitOfBlock", maybe "default" sshow (_lsBlockGasLimit ls))
+    ]
 
 -- | The directory that holds @rocksDb@ and @sqlite@: the given directory, or
 -- @0@ under it, the layout of a node's database directory
@@ -124,21 +170,23 @@ inProcessRate :: Double
 inProcessRate = 100_000
 
 -- | The Pact service configuration of a node with the default configuration
--- of the version, except that the database is never reset and the full
--- history is not required (a node may have compacted its SQLite files).
+-- of the version and the given @/local@ settings, except that the database is
+-- never reset and the full history is not required (a node may have
+-- compacted its SQLite files).
 --
-inProcessPactConfig :: ChainwebVersion -> PactServiceConfig
-inProcessPactConfig v = PactServiceConfig
+inProcessPactConfig :: ChainwebVersion -> LocalSettings -> PactServiceConfig
+inProcessPactConfig v ls = PactServiceConfig
     { _pactReorgLimit = _configReorgLimit conf
     , _pactPreInsertCheckTimeout = _configPreInsertCheckTimeout conf
     , _pactQueueSize = _configPactQueueSize conf
     , _pactResetDb = False
-    , _pactAllowReadsInLocal = _configAllowReadsInLocal conf
+    , _pactAllowReadsInLocal = _lsAllowReadsInLocal ls
     , _pactUnlimitedInitialRewind = False
-    , _pactNewBlockGasLimit = maybe id min maxGasLimit (_configBlockGasLimit conf)
+    , _pactNewBlockGasLimit = maybe id min maxGasLimit
+        (maybe (_configBlockGasLimit conf) fromIntegral (_lsBlockGasLimit ls))
     , _pactLogGas = _configLogGas conf
     , _pactModuleCacheLimit = _configModuleCacheLimit conf
-    , _pactEnableLocalTimeout = _configEnableLocalTimeout conf
+    , _pactEnableLocalTimeout = _lsEnableLocalTimeout ls
     , _pactFullHistoryRequired = False
     , _pactPersistIntraBlockWrites =
         if _configFullHistoricPactState conf
@@ -184,7 +232,7 @@ withInProcessSide logger0 spec act = do
             let cutTable = cutHashesTable cutRdb
             seedCut v logger wbhdb (cutHashesTable src) cutTable
             mempool <- noopMempool
-            withPacts v logger wbhdb pdb mempool (dir </> "sqlite") pactChains $ \pacts -> do
+            withPacts v (inProcessPactConfig v (_ipLocal spec)) logger wbhdb pdb mempool (dir </> "sqlite") pactChains $ \pacts -> do
                 mgr <- HTTP.newManager HTTP.defaultManagerSettings
                 let webPact = mkWebPactExecutionService (HM.fromList pacts)
                 headerStore <- newWebBlockHeaderStore mgr wbhdb (logFunction logger)
@@ -205,7 +253,7 @@ withInProcessSide logger0 spec act = do
                         app = serviceApiApplication v dbs pactData Nothing
                             (HeaderStream False) Nothing defaultServicePayloadBatchLimit
                     Warp.withApplicationSettings warpSettings (return app) $ \port -> do
-                        lim <- newLimiter inProcessRate Nothing
+                        lim <- newLimiter inProcessRate (_ipPauseFile spec)
                         act Side
                             { _sideName = "test (in-process)"
                             , _sideBaseUrl = "http://127.0.0.1:" <> sshow port
@@ -243,6 +291,7 @@ seedCut v logger wbhdb src dst = do
 withPacts
     :: Logger l
     => ChainwebVersion
+    -> PactServiceConfig
     -> l
     -> WebBlockHeaderDb
     -> PayloadDb RocksDbTable
@@ -251,12 +300,12 @@ withPacts
     -> [ChainId]
     -> ([(ChainId, PactExecutionService)] -> IO a)
     -> IO a
-withPacts v logger wbhdb pdb mempool sqliteDir cids0 k = go cids0 []
+withPacts v conf logger wbhdb pdb mempool sqliteDir cids0 k = go cids0 []
   where
     go [] acc = k (reverse acc)
     go (cid : rest) acc = do
         bhdb <- getWebBlockHeaderDb wbhdb cid
         mpc <- mkMempoolConsensus mempool bhdb (Just pdb)
         let l = addLabel ("chain", toText cid) logger
-        withPactService v cid l Nothing mpc bhdb pdb sqliteDir (inProcessPactConfig v) $ \q ->
+        withPactService v cid l Nothing mpc bhdb pdb sqliteDir conf $ \q ->
             go rest ((cid, mkPactExecutionService q) : acc)

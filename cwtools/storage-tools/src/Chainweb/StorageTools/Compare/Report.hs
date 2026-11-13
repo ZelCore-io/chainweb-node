@@ -45,6 +45,11 @@ module Chainweb.StorageTools.Compare.Report
 , reportCompared
 , reportPactFailures
 , reportExpectClasses
+, reportGeneration
+, reportGenTargets
+, reportGenSkipped
+, reportGenSkippedTotal
+, reportSettings
 , maxDiffSamples
 , maxBodyBytes
 
@@ -181,6 +186,12 @@ data Report = Report
         -- 'reportPactFailures'
     , _repExpected :: ![RequestClass]
         -- ^ see 'reportExpectClasses'
+    , _repGenTargets :: !Int
+        -- ^ see 'reportGeneration'
+    , _repGenSkipped :: !(M.Map RequestClass Int)
+        -- ^ see 'reportGeneration'
+    , _repSettings :: ![(T.Text, T.Text)]
+        -- ^ see 'reportSettings'
     }
 
 -- | The number of differences kept with their bodies.
@@ -194,7 +205,7 @@ maxBodyBytes :: Int
 maxBodyBytes = 4_096
 
 emptyReport :: Report
-emptyReport = Report mempty mempty mempty mempty mempty 0 mempty 0 0 0 mempty mempty []
+emptyReport = Report mempty mempty mempty mempty mempty 0 mempty 0 0 0 mempty mempty [] 0 mempty []
 
 -- | Adds the outcome of a request. The result does not depend on the order
 -- in which outcomes are added.
@@ -357,6 +368,37 @@ reportPactFailures rep c = M.findWithDefault 0 c (_repPactFailures rep)
 reportExpectClasses :: [RequestClass] -> Report -> Report
 reportExpectClasses cs rep = rep { _repExpected = cs }
 
+-- | @reportGeneration targets skipped@: of the @targets@ sampled for a
+-- generated run, the classes of those dropped at generation because an oracle
+-- lookup failed (ruling on Task 6a). More than 1% of the targets dropped makes
+-- the run 'Void'.
+--
+reportGeneration :: Int -> [RequestClass] -> Report -> Report
+reportGeneration n skipped rep = rep
+    { _repGenTargets = n
+    , _repGenSkipped = M.fromListWith (+) [ (c, 1) | c <- skipped ]
+    }
+
+-- | The targets sampled for a generated run, see 'reportGeneration'.
+--
+reportGenTargets :: Report -> Int
+reportGenTargets = _repGenTargets
+
+-- | The targets of a class dropped at generation, see 'reportGeneration'.
+--
+reportGenSkipped :: Report -> RequestClass -> Int
+reportGenSkipped rep c = M.findWithDefault 0 c (_repGenSkipped rep)
+
+reportGenSkippedTotal :: Report -> Int
+reportGenSkippedTotal = sum . _repGenSkipped
+
+-- | Settings of the run that change answers, for the reader of the report:
+-- for instance the Pact @/local@ settings of an in-process test side, which
+-- must be those of the oracle.
+--
+reportSettings :: [(T.Text, T.Text)] -> Report -> Report
+reportSettings kvs rep = rep { _repSettings = kvs }
+
 -- | The status in @result@ (plain @/local@) or @preflightResult.result@
 -- (preflight) of a Pact answer.
 --
@@ -401,7 +443,9 @@ reportVerdict rep
 -- * 'PinUnstable' and 'Unpinned' requests that were sent are together more
 --   than 1% of the pinned requests that were sent;
 -- * 'NoOracleAnswer' requests (no HTTP answer from the oracle, or from
---   neither side) are more than 1% of the requests that were sent.
+--   neither side) are more than 1% of the requests that were sent;
+-- * the targets dropped at generation ('reportGeneration') are more than 1%
+--   of the targets sampled.
 --
 reportVoidReasons :: Report -> [T.Text]
 reportVoidReasons rep = concat
@@ -427,6 +471,10 @@ reportVoidReasons rep = concat
       | sent > 0
       , 100 * noa > sent
       ]
+    , [ sh gs <> " of " <> sh gt <> " targets skipped at generation (an oracle lookup failed), more than 1%"
+      | gt > 0
+      , 100 * gs > gt
+      ]
     ]
   where
     sent = reportSentTotal rep
@@ -434,6 +482,8 @@ reportVoidReasons rep = concat
     pinned = _repPinned rep
     pu = _repPinUnstable rep
     up = _repUnpinnedSent rep
+    gt = _repGenTargets rep
+    gs = reportGenSkippedTotal rep
     sh :: Int -> T.Text
     sh = T.pack . show
 
@@ -499,6 +549,14 @@ reportSummary rep = T.unlines $
     [ "verdict: " <> T.pack (show (reportVerdict rep))
     ]
     <> [ "  void: " <> r | reportVerdict rep == Void, r <- reportVoidReasons rep ]
+    <> [ "generation: " <> sh (_repGenTargets rep) <> " targets, "
+        <> sh (reportGenSkippedTotal rep) <> " skipped (an oracle lookup failed)"
+        <> T.concat [ ", " <> requestClassText c <> " " <> sh n | (c, n) <- M.toList (_repGenSkipped rep) ]
+       | _repGenTargets rep > 0
+       ]
+    <> [ "settings: " <> T.intercalate ", " [ k <> "=" <> v | (k, v) <- _repSettings rep ]
+       | not (null (_repSettings rep))
+       ]
     <> [ "compared: " <> sh (reportCompared rep)
         <> ", differences: " <> sh (_repDiffCount rep)
         <> ", sent: " <> sh (reportSentTotal rep)
@@ -554,6 +612,11 @@ instance ToJSON Report where
         [ "verdict" .= show (reportVerdict rep)
         , "voidReasons" .= reportVoidReasons rep
         , "classesOfRun" .= map requestClassText (_repExpected rep)
+        , "generation" .= object
+            [ "targets" .= _repGenTargets rep
+            , "skipped" .= reportGenSkippedTotal rep
+            ]
+        , "settings" .= object [ K.fromText k .= v | (k, v) <- _repSettings rep ]
         , "compared" .= reportCompared rep
         , "differences" .= _repDiffCount rep
         , "sent" .= reportSentTotal rep
@@ -569,6 +632,7 @@ instance ToJSON Report where
                    , "sameNon2xx" .= reportSameNon2xx rep c
                    , "sent" .= reportSent rep c
                    , "pactFailure200" .= reportPactFailures rep c
+                   , "generationSkipped" .= reportGenSkipped rep c
                    , "skippedPerReason" .= object
                         [ K.fromText (skipReasonText r) .= reportSkippedIn rep c r | r <- [minBound .. maxBound] ]
                    ]

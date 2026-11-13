@@ -20,6 +20,7 @@ module Chainweb.StorageTools.Compare.Types
 , requestClassText
 , requestClassFromText
 , isPinnedClass
+, isPactClass
 , Request(..)
 , depthPlaceholder
 , hasDepthPlaceholder
@@ -40,6 +41,7 @@ module Chainweb.StorageTools.Compare.Types
   -- * Coverage
 , Coverage(..)
 , isCovered
+, classCoverage
 
   -- * Sides
 , Side(..)
@@ -113,6 +115,20 @@ isPinnedClass = \case
     ClsHistory -> True
     ClsPreflight -> True
     _ -> False
+
+-- | The classes that a Pact service answers: @/local@ (plain, history and
+-- preflight), @/poll@ and @/spv@. An in-process test side answers them on its
+-- Pact chains only.
+--
+isPactClass :: RequestClass -> Bool
+isPactClass = \case
+    ClsPayload -> False
+    ClsHeader -> False
+    ClsLocal -> True
+    ClsHistory -> True
+    ClsPoll -> True
+    ClsSpv -> True
+    ClsPreflight -> True
 
 -- | A request, sent unchanged to both sides, except for the depth placeholder.
 --
@@ -291,6 +307,16 @@ isCovered (Coverage m) cid target = case M.lookup cid m of
     Just ranges -> case target of
         Nothing -> not (null ranges)
         Just h -> any (\(lo, hi) -> lo <= h && h <= hi) ranges
+
+-- | The coverage of a request class. With @Just@ the Pact chains of the test
+-- side, a class of 'isPactClass' is covered on those chains only; every other
+-- class, and every class with 'Nothing', has the whole coverage.
+--
+classCoverage :: Maybe [ChainId] -> Coverage -> RequestClass -> Coverage
+classCoverage Nothing cov _ = cov
+classCoverage (Just pactChains) cov@(Coverage m) cls
+    | isPactClass cls = Coverage (M.filterWithKey (\c _ -> c `elem` pactChains) m)
+    | otherwise = cov
 
 -- -------------------------------------------------------------------------- --
 -- Sides
