@@ -99,7 +99,7 @@ module Chainweb.StorageTools.Measure.Cold
 , renderProjection
 ) where
 
-import Control.Exception (bracket, evaluate)
+import Control.Exception (bracket, evaluate, onException)
 import Control.Monad
 
 import Data.Aeson
@@ -527,9 +527,13 @@ copyTransactionIndex w c sq =
 -- SQLite
 
 withSqliteReadOnly :: FilePath -> (SQ.Database -> IO a) -> IO a
-withSqliteReadOnly path = bracket
-    (SQ.open2 (T.pack path) [SQ.SQLOpenReadOnly] SQ.SQLVFSDefault)
-    SQ.close
+withSqliteReadOnly path = bracket open SQ.close
+  where
+    open = do
+        db <- SQ.open2 (T.pack path) [SQ.SQLOpenReadOnly] SQ.SQLVFSDefault
+        -- wait instead of failing with SQLITE_BUSY when another connection holds a lock
+        SQ.exec db "PRAGMA busy_timeout = 10000" `onException` SQ.close db
+        return db
 
 withStatement :: SQ.Database -> Text -> [SQ.SQLData] -> (SQ.Statement -> IO a) -> IO a
 withStatement db q params k = bracket (SQ.prepare db q) SQ.finalize $ \stmt -> do

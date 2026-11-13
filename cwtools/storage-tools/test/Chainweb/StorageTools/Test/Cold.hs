@@ -13,6 +13,7 @@
 module Chainweb.StorageTools.Test.Cold (tests) where
 
 import Control.Lens ((&), (.~), view)
+import Control.Exception (finally)
 import Control.Monad
 
 import Data.Aeson (decode, encode)
@@ -169,6 +170,11 @@ acquire = do
     let sqlite = dir </> "pact.sqlite"
         cold = dir </> "cold"
     writeFixture sqlite
+    -- The checkpointer leaves the file in WAL mode. Many tests open it
+    -- read-only at once, and concurrent read-only opens of a WAL file without
+    -- a -shm file can fail with SQLITE_BUSY. Convert it to a plain
+    -- rollback-journal file, which read-only connections share safely.
+    useRollbackJournal sqlite
     sizes <- buildColdFromSqlite quietLogger ColdBuildSpec
         { _cbSqlite = sqlite
         , _cbChain = cid
@@ -177,6 +183,14 @@ acquire = do
         , _cbBatchBytes = 4096
         }
     return $ Fixture dir sqlite cold sizes
+
+useRollbackJournal :: FilePath -> IO ()
+useRollbackJournal path = do
+    db <- SQ.open2 (T.pack path) [SQ.SQLOpenReadWrite] SQ.SQLVFSDefault
+    rows <- queryAll db "PRAGMA journal_mode=DELETE" [] `finally` SQ.close db
+    case rows of
+        [[SQ.SQLText m]] | T.toLower m == "delete" -> return ()
+        _ -> assertFailure $ "could not switch the fixture to journal_mode=DELETE: " <> show rows
 
 release :: Fixture -> IO ()
 release = removeDirectoryRecursive . _fxDir
@@ -198,6 +212,8 @@ queryAll db q params = do
 withSqlite :: FilePath -> (SQ.Database -> IO a) -> IO a
 withSqlite path k = do
     db <- SQ.open2 (T.pack path) [SQ.SQLOpenReadOnly] SQ.SQLVFSDefault
+    -- wait instead of failing with SQLITE_BUSY when another connection holds a lock
+    SQ.exec db "PRAGMA busy_timeout = 10000"
     r <- k db
     SQ.close db
     return r
