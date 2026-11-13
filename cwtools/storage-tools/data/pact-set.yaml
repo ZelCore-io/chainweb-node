@@ -18,8 +18,14 @@
 # An entry of kind "cont" sends a continuation of {pactId} at the given step
 # (rollback false, no proof) instead of code; it reads the defpact state.
 #
-# All entries are reads. /local never commits, and every read is allowed in
-# /local (Pact's AllowReadInLocal), so tables can be read directly.
+# All entries are reads. /local never commits. Direct table reads (read,
+# keys, txids, txlog, keylog) succeed at Pact 4 heights only on a node with
+# allowReadsInLocal: true, as the mainnet oracle has; the in-process side
+# must be started with the same setting (--allow-reads-in-local).
+#
+# A preflight command runs as a transaction, not in local mode: local-only
+# natives (describe-module, ...) and direct table reads fail there on every
+# node, so the preflight entries call module code only.
 
 entries:
 
@@ -29,12 +35,12 @@ entries:
     why: coin details for a sampled account; the read every wallet makes
 
   - name: coin-table-read
-    classes: [local, preflight]
+    classes: [local]
     code: '(read coin.coin-table "{account}")'
     why: a direct row read of coin.coin-table, the largest table on every chain
 
   - name: coin-get-balance
-    classes: [local]
+    classes: [local, preflight]
     code: '(coin.get-balance "{account}")'
     why: the same row through module code (a different read path and gas)
 
@@ -45,11 +51,11 @@ entries:
 
   - name: keys-large-table
     classes: [local]
-    code: '(length (keys coin.coin-table))'
-    why: keys on the largest table; length keeps the answer small, but every key is read (or the gas limit is hit, identically on both sides)
+    code: '(length (keys marmalade-v2.ledger.ledger))'
+    why: keys on a large table; length keeps the answer small, but every key is read. Gas does not bound keys (Pact charges a flat 40,000), the time does. On a mainnet 3.2.1 node this table had 106,828 keys on chain 8 (1.9 s); (keys coin.coin-table) on chain 0 ran for minutes and blocked the chain's Pact service, so it must not be sent. Below its creation height both sides give the same error
 
   - name: describe-module
-    classes: [local, preflight]
+    classes: [local]
     code: '(describe-module "coin")'
     why: module code, hash and governance from SYS:Modules at the target height (the coin module was upgraded several times)
 
