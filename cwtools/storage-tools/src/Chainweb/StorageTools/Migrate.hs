@@ -33,10 +33,23 @@
 -- recorded, so that a rerun retries it.
 --
 -- The database is opened read-write, which takes the RocksDB @LOCK@ file. A
--- running node holds that lock, so the steps fail before they change
--- anything if a node (or another migration) uses the database. A step whose
--- namespaces are all done does not open the database: a rerun after
--- completion changes nothing, not even the files.
+-- process that has the database open read-write (a node, another migration)
+-- holds that lock, so the steps fail before they change anything while it
+-- runs. A process that opens the database read-only takes no lock and is not
+-- detected: for instance a node with @--read-only-replay@ or
+-- @--only-sync-pact@ that does not prune the chain database, the source of
+-- @compact@, or @cw-range-db diff@. The operator must stop every process that
+-- opens the database, read-only ones included, before a step runs.
+--
+-- A step whose namespaces are all done does not open the database: a rerun
+-- after completion changes nothing, not even the files. The progress file is
+-- tied to the database by RocksDB's @IDENTITY@, so a database that replaced
+-- another in place does not inherit its progress.
+--
+-- After the migration, the node must run with @--store-merkle-trees false@
+-- and @--payload-compression zstd-dict@. With the defaults (@true@ and
+-- @snappy@) it writes the trees and Snappy files again, while the progress
+-- file still says that the steps are done.
 --
 module Chainweb.StorageTools.Migrate
 ( -- * Steps
@@ -44,11 +57,17 @@ module Chainweb.StorageTools.Migrate
 , migrateStepName
 , MigrateOpts(..)
 , defaultMigrateOpts
+, pausePollMicros
 , migrateTrees
 , migratePayloads
 , migrate
 , runMigrate
 , MigrateException(..)
+
+  -- * Command line
+, MigrateCommand(..)
+, migrateParserInfo
+, migrateCommandParser
 
   -- * Checks
 , compactNamespaceChecked
@@ -72,6 +91,8 @@ module Chainweb.StorageTools.Migrate
 , progressKey
 , readProgress
 , writeProgress
+, dbIdentity
+, checkedProgress
 ) where
 
 import Control.Concurrent (threadDelay)
@@ -86,6 +107,8 @@ import qualified Data.Map.Strict as M
 import qualified Data.Set as S
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
+
+import Options.Applicative
 
 import Foreign.C
 import Foreign.Marshal.Alloc (alloca)
@@ -109,6 +132,8 @@ import Text.Read (readMaybe)
 
 import qualified Database.RocksDB.Internal as R
 
+import Chainweb.Chainweb.Configuration
+    (PayloadCompression(..), payloadCompressionReader, payloadCompressionToText, payloadCompressionTuning)
 import Chainweb.Logger
 import Chainweb.Storage.Table
 import Chainweb.Storage.Table.RocksDB
@@ -241,14 +266,31 @@ data MigrateOpts = MigrateOpts
         -- ^ test hook: the work on these namespaces is skipped, as if it had
         -- failed without an error. The check of the namespace must then
         -- fail.
+    , _moPayloadCompression :: !PayloadCompression
+        -- ^ @trees@: the compression of the node, with which the compaction
+        -- rewrites the files that hold tree entries and other entries. Once
+        -- a payload namespace is done, @trees@ uses zstd-dict.
+    , _moPauseFile :: !(Maybe FilePath)
+        -- ^ no namespace is started while this file exists
     }
     deriving (Show, Eq)
 
+-- | The defaults of the command line: no test hook, the compression of
+-- chainweb-node 3.2.1 (Snappy), no pause file.
+--
 defaultMigrateOpts :: MigrateOpts
 defaultMigrateOpts = MigrateOpts
     { _moStopAfter = Nothing
     , _moSkipWork = []
+    , _moPayloadCompression = PayloadSnappy
+    , _moPauseFile = Nothing
     }
+
+-- | How often a paused step checks whether the pause file is gone, in
+-- microseconds. The same as the limiter of the range-database tools.
+--
+pausePollMicros :: Int
+pausePollMicros = 100_000
 
 -- | The work on a namespace failed, or its check failed. The namespace is not
 -- marked as done, so that a rerun retries it.
@@ -274,16 +316,24 @@ instance Exception CheckFailed
 -- Progress
 
 -- | The namespaces that are done, as 'progressKey's, for instance
--- @trees:TransactionTree@. Stored as JSON in 'progressFile'.
+-- @trees:TransactionTree@, and the database they were done on. Stored as JSON
+-- in 'progressFile'.
 --
-newtype Progress = Progress { _progressDone :: S.Set T.Text }
+data Progress = Progress
+    { _progressIdentity :: !T.Text
+        -- ^ the content of the @IDENTITY@ file of the database (see
+        -- 'dbIdentity')
+    , _progressDone :: !(S.Set T.Text)
+    }
     deriving (Show, Eq)
 
 instance ToJSON Progress where
-    toJSON (Progress d) = object ["done" .= S.toAscList d]
+    toJSON (Progress i d) = object ["identity" .= i, "done" .= S.toAscList d]
 
 instance FromJSON Progress where
-    parseJSON = withObject "Progress" $ \o -> Progress . S.fromList <$> o .: "done"
+    parseJSON = withObject "Progress" $ \o -> Progress
+        <$> o .: "identity"
+        <*> (S.fromList <$> o .: "done")
 
 -- | @<db>/storage-migrate.progress.json@. RocksDB ignores files whose names it
 -- does not use.
@@ -294,17 +344,43 @@ progressFile db = db </> "storage-migrate.progress.json"
 progressKey :: MigrateStep -> B.ByteString -> T.Text
 progressKey step ns = migrateStepName step <> ":" <> T.decodeUtf8 ns
 
--- | The progress of a database. No progress file means no progress; a file
--- that does not parse is an error.
+-- | The progress file of a database, if there is one. A file that does not
+-- parse is an error.
 --
-readProgress :: FilePath -> IO Progress
+readProgress :: FilePath -> IO (Maybe Progress)
 readProgress db = doesFileExist f >>= \case
-    False -> return $ Progress mempty
+    False -> return Nothing
     True -> eitherDecodeStrict' <$> B.readFile f >>= \case
-        Right p -> return p
+        Right p -> return (Just p)
         Left e -> throwIO $ userError $ "storage-migrate: cannot parse " <> f <> ": " <> e
   where
     f = progressFile db
+
+-- | The content of the @IDENTITY@ file of a database, without surrounding
+-- white space: a unique id that RocksDB writes when it creates the database
+-- (and when it opens one that has no such file).
+--
+dbIdentity :: FilePath -> IO T.Text
+dbIdentity db = doesFileExist f >>= \case
+    False -> throwIO $ userError $ "storage-migrate: no IDENTITY file in " <> db
+    True -> T.strip . T.decodeLatin1 <$> B.readFile f
+  where
+    f = db </> "IDENTITY"
+
+-- | The namespaces that are done on a database. No progress file means that
+-- none is done. A progress file of another database, which has another
+-- @IDENTITY@, is refused.
+--
+checkedProgress :: FilePath -> IO (S.Set T.Text)
+checkedProgress db = readProgress db >>= \case
+    Nothing -> return mempty
+    Just (Progress i done) -> do
+        i' <- dbIdentity db
+        unless (i == i') $ throwIO $ userError $ "storage-migrate: " <> progressFile db
+            <> " is the progress of the database with IDENTITY " <> show i
+            <> ", but the database in " <> db <> " has IDENTITY " <> show i'
+            <> ". The database was replaced. Delete the progress file to migrate this database from the start."
+        return done
 
 -- | Replaces the progress file atomically: the new content goes to a
 -- temporary file that is synced to disk and then renamed over the progress
@@ -352,29 +428,37 @@ migrate :: Logger l => l -> FilePath -> MigrateStep -> MigrateOpts -> IO ()
 migrate l db step opts = do
     isDb <- doesFileExist (db </> "CURRENT")
     unless isDb $ throwIO $ userError $ "storage-migrate: not a RocksDB database: " <> db
-    p0 <- readProgress db
-    if null (todoOf p0)
+    done0 <- checkedProgress db
+    if null (todoOf done0)
     then
         -- the database is not opened, so that it does not change at all
-        logg Info $ "storage-migrate " <> stepName <> ": nothing to do, all namespaces are done"
+        logg Info $ "storage-migrate " <> stepName <> ": nothing to do: "
+            <> T.pack (progressFile db) <> " lists every namespace of the step as done, so the database"
+            <> " is not opened. To redo a step, delete that file; both steps then start from the beginning."
     else do
         logg Info $ "storage-migrate " <> stepName <> ": opening " <> T.pack db
-            <> " (fails if a node uses the database)"
-        withRocksDbTuned db modernDefaultOptions (stepTuning p0) $ \rdb -> do
+            <> " read-write. This fails if a process has it open read-write (a node, another"
+            <> " storage-migrate), which holds the RocksDB LOCK. A process that opens it read-only is"
+            <> " not detected: stop it first."
+        when (step == MigrateTrees) $
+            logg Info $ "storage-migrate trees: rewritten files are written with " <> stepCompression done0
+        withRocksDbTuned db modernDefaultOptions (stepTuning done0) $ \rdb -> do
+            ident <- dbIdentity db
             -- again, under the lock
-            p1@(Progress done1) <- readProgress db
-            let todo = todoOf p1
+            done1 <- checkedProgress db
+            let todo = todoOf done1
                 todo' = maybe id take (_moStopAfter opts) todo
             forM_ (stepNamespaces step) $ \ns ->
                 when (progressKey step ns `S.member` done1) $
                     logg Info $ "storage-migrate " <> stepName <> ": " <> nsText ns <> ": done before"
             unless (null todo') $ flushRocksDb rdb
             foldM_ (\done ns -> do
+                waitWhilePaused
                 t0 <- getTime Monotonic
                 logg Info $ "storage-migrate " <> stepName <> ": " <> nsText ns <> ": start"
                 runNamespace rdb ns
                 let done' = S.insert (progressKey step ns) done
-                writeProgress db (Progress done')
+                writeProgress db (Progress ident done')
                 t1 <- getTime Monotonic
                 logg Info $ "storage-migrate " <> stepName <> ": " <> nsText ns <> ": done in "
                     <> sshow (toNanoSecs (diffTimeSpec t1 t0) `div` 1_000_000) <> " ms"
@@ -388,15 +472,30 @@ migrate l db step opts = do
     stepName = migrateStepName step
     nsText = T.decodeUtf8
 
-    todoOf (Progress done) =
+    todoOf done =
         [ns | ns <- stepNamespaces step, progressKey step ns `S.notMember` done]
 
-    stepTuning (Progress done) = case step of
+    stepCompression done = case step of
+        MigratePayloads -> payloadCompressionToText PayloadZstdDict
+        MigrateTrees
+            | any (\ns -> progressKey MigratePayloads ns `S.member` done) payloadNamespaces ->
+                payloadCompressionToText PayloadZstdDict <> " (a payload namespace is done)"
+            | otherwise -> payloadCompressionToText (_moPayloadCompression opts)
+
+    stepTuning done = case step of
         MigratePayloads -> payloadZstdTuning
         MigrateTrees
             | any (\ns -> progressKey MigratePayloads ns `S.member` done) payloadNamespaces ->
                 payloadZstdTuning
-            | otherwise -> defaultTuning
+            | otherwise -> payloadCompressionTuning (_moPayloadCompression opts)
+
+    waitWhilePaused = forM_ (_moPauseFile opts) $ \f -> do
+        paused <- doesFileExist f
+        when paused $ do
+            logg Info $ "storage-migrate " <> stepName <> ": paused while " <> T.pack f <> " exists"
+            let loop = doesFileExist f >>= \p -> when p (threadDelay pausePollMicros >> loop)
+            loop
+            logg Info $ "storage-migrate " <> stepName <> ": resumed"
 
     -- the work on a namespace and its check; any failure is a
     -- 'NamespaceFailed', which leaves the namespace out of the progress file
@@ -427,6 +526,81 @@ runMigrate l db step opts = try (migrate l db step opts) >>= \case
         | otherwise -> do
             logFunctionText l Error $ T.pack $ displayException e
             return $ ExitFailure 1
+
+-- -------------------------------------------------------------------------- --
+-- Command line
+
+data MigrateCommand = MigrateCommand
+    { _mcStep :: !MigrateStep
+    , _mcDatabaseDirectory :: !FilePath
+        -- ^ the @--database-directory@ of the node, or the RocksDB directory
+    , _mcOpts :: !MigrateOpts
+    }
+    deriving (Show, Eq)
+
+migrateParserInfo :: ParserInfo MigrateCommand
+migrateParserInfo = info (migrateCommandParser <**> helper)
+    ( fullDesc
+    <> progDesc "Offline, in-place conversions of the RocksDB database of a stopped node"
+    <> footer
+        ( "Stop every process that opens the database first, read-only ones included."
+        <> " A process that has it open read-write holds the RocksDB LOCK, and a step then fails"
+        <> " without a change; a process that opens it read-only is not detected."
+        <> " Progress is kept in storage-migrate.progress.json in the RocksDB directory, so an"
+        <> " interrupted step resumes, and a step that is done does nothing; delete that file to redo the steps."
+        <> " After the migration, run the node with --store-merkle-trees false and"
+        <> " --payload-compression zstd-dict: with the node's defaults (true and snappy) it writes"
+        <> " the trees and Snappy files again."
+        )
+    )
+
+migrateCommandParser :: Parser MigrateCommand
+migrateCommandParser = hsubparser $ mconcat
+    [ cmd MigrateTrees
+        ( "delete the Merkle-tree tables (TransactionTree, TransactionTree2, OutputTree,"
+        <> " OutputTree2). Run it first: payloads then has less to rewrite. Afterwards run the node with"
+        <> " --store-merkle-trees false, or it writes the trees again."
+        )
+        compressionOption
+    , cmd MigratePayloads
+        ( "rewrite the payload tables with zstd-dict (as --payload-compression zstd-dict writes"
+        <> " them). Afterwards run the node with --payload-compression zstd-dict, or it writes Snappy"
+        <> " files again."
+        )
+        (pure PayloadZstdDict)
+    ]
+  where
+    cmd step desc compression = command (T.unpack $ migrateStepName step) $ info
+        (MigrateCommand step <$> dirOption <*> (opts <$> compression <*> pauseOption))
+        (progDesc desc)
+
+    opts c pause = defaultMigrateOpts
+        { _moPayloadCompression = c
+        , _moPauseFile = pause
+        }
+
+    dirOption = strOption
+        ( long "database-directory"
+        <> metavar "DIR"
+        <> help "the --database-directory of the node (the RocksDB database is DIR/0/rocksDb), or the RocksDB directory itself"
+        )
+
+    compressionOption = option payloadCompressionReader
+        ( long "payload-compression"
+        <> metavar "snappy|zstd-dict"
+        <> value (_moPayloadCompression defaultMigrateOpts)
+        <> showDefaultWith (T.unpack . payloadCompressionToText)
+        <> help
+            ( "compression of the files that the compaction rewrites; use the value the node runs with."
+            <> " Once the payloads step has done a namespace, zstd-dict is used whatever this says."
+            )
+        )
+
+    pauseOption = optional $ strOption
+        ( long "pause-file"
+        <> metavar "FILE"
+        <> help "no namespace is started while this file exists; the namespace in progress is finished first"
+        )
 
 -- -------------------------------------------------------------------------- --
 -- Checks
@@ -479,8 +653,8 @@ verifyNamespace rdb db MigratePayloads ns = go (1 :: Int)
                 | i < attempts -> retry i
                 | otherwise -> throwIO $ CheckFailed $
                     "cannot read the compression of the live files: " <> T.pack (displayException e)
-            Right info -> do
-                let found = [(f, M.lookup (liveFilePath db f) info) | f <- files]
+            Right props -> do
+                let found = [(f, M.lookup (liveFilePath db f) props) | f <- files]
                     notZstd = [(_lfName f, c) | (f, Just (c, _)) <- found, c /= "ZSTD"]
                     missing = [_lfName f | (f, Nothing) <- found]
                 if

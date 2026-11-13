@@ -6,19 +6,25 @@
 -- Offline, in-place conversions of the RocksDB database of a stopped node:
 --
 -- @
--- storage-migrate trees --database-directory DIR
--- storage-migrate payloads --database-directory DIR
+-- storage-migrate trees --database-directory DIR [--payload-compression snappy|zstd-dict] [--pause-file FILE]
+-- storage-migrate payloads --database-directory DIR [--pause-file FILE]
 -- @
 --
 -- @trees@ deletes the Merkle-tree tables, @payloads@ rewrites the payload
 -- tables with zstd-dict. Run @trees@ first: @payloads@ then has less to
 -- rewrite. Both resume where an interrupted run stopped, from
--- @storage-migrate.progress.json@ in the RocksDB directory. They fail without
--- a change while a node uses the database.
+-- @storage-migrate.progress.json@ in the RocksDB directory.
+--
+-- A process that has the database open read-write (a node, another
+-- @storage-migrate@) holds the RocksDB @LOCK@, and a step then fails without
+-- a change. A process that opens the database read-only is not detected: the
+-- operator must stop every process that opens the database, read-only ones
+-- included, before a step runs.
+--
+-- See "Chainweb.StorageTools.Migrate".
 --
 module Main (main) where
 
-import qualified Data.Text as T
 import qualified Data.Text.IO as T
 
 import Options.Applicative
@@ -33,22 +39,6 @@ import System.LogLevel
 
 import Chainweb.Logger
 import Chainweb.StorageTools.Migrate
-
-data Command = Command MigrateStep FilePath
-
-commands :: Parser Command
-commands = hsubparser $ mconcat
-    [ cmd MigrateTrees "delete the Merkle-tree tables (TransactionTree, TransactionTree2, OutputTree, OutputTree2)"
-    , cmd MigratePayloads "rewrite the payload tables with zstd-dict (as --payload-compression zstd-dict writes them)"
-    ]
-  where
-    cmd step desc = command (T.unpack $ migrateStepName step) $
-        info (Command step <$> dirOption) (progDesc desc)
-    dirOption = strOption
-        ( long "database-directory"
-        <> metavar "DIR"
-        <> help "the --database-directory of the node (the RocksDB database is DIR/0/rocksDb), or the RocksDB directory itself"
-        )
 
 -- | The RocksDB directory: @DIR@ if it is a RocksDB database, else
 -- @DIR/0/rocksDb@, the layout of the node.
@@ -66,11 +56,8 @@ rocksDbDir dir = isDb dir >>= \case
 main :: IO ()
 main = do
     hSetBuffering stderr LineBuffering
-    Command step dir <- execParser $ info (commands <**> helper)
-        ( fullDesc
-        <> progDesc "Offline, in-place conversions of the RocksDB database of a stopped node"
-        )
+    MigrateCommand step dir opts <- execParser migrateParserInfo
     db <- rocksDbDir dir
-    exitWith =<< runMigrate logger db step defaultMigrateOpts
+    exitWith =<< runMigrate logger db step opts
   where
     logger = genericLogger Info (T.hPutStrLn stderr)

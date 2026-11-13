@@ -1,4 +1,5 @@
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE NumericUnderscores #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TypeApplications #-}
 
@@ -17,13 +18,17 @@ module Chainweb.StorageTools.Test.Migrate
 ( tests
 ) where
 
-import Control.Exception (SomeException, try)
+import Control.Concurrent (threadDelay)
+import Control.Concurrent.Async (poll, wait, withAsync)
+import Control.Exception (IOException, try)
 import Control.Monad
 
 import Data.Bits (complement)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as B8
 import Data.IORef
+import Data.List (isInfixOf)
+import Data.Maybe (isNothing)
 import qualified Data.Map.Strict as M
 import qualified Data.Set as S
 import Data.Text (Text)
@@ -37,6 +42,7 @@ import System.Exit (ExitCode(..))
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import System.LogLevel (LogLevel(..))
+import System.Timeout (timeout)
 
 import Test.Tasty
 import Test.Tasty.HUnit
@@ -238,7 +244,7 @@ assertTreeFilesGone msg db nss = forM_ nss $ \ns -> do
 -- | The namespaces in the progress file.
 --
 doneKeys :: FilePath -> IO (S.Set Text)
-doneKeys db = _progressDone <$> readProgress db
+doneKeys db = maybe mempty _progressDone <$> readProgress db
 
 -- | Runs an action with a logger at level 'Info' and returns the log lines.
 --
@@ -274,7 +280,7 @@ tests = testGroup "Migrate"
             -- the seven payload namespaces, and the headers and cuts as well
             d <- diffDbs pre db otherNamespaces
             assertNoDiff "trees changed another namespace" d
-            Progress done <- readProgress db
+            done <- doneKeys db
             assertEqual "progress" (keysOf MigrateTrees treeNamespaces) done
 
     , testCase "payloads: every SST of the seven payload namespaces ZSTD, the others still Snappy; diffRangeDbs against a pre-migration copy over all seven payload namespaces, old layout included: no differences" $
@@ -295,7 +301,7 @@ tests = testGroup "Migrate"
             -- the trees, headers and cuts as well
             d' <- diffDbs pre db (treeNamespaces <> headerNamespaces testVer <> metadataNamespaces)
             assertNoDiff "payloads changed another namespace" d'
-            Progress done <- readProgress db
+            done <- doneKeys db
             assertEqual "progress" (keysOf MigratePayloads payloadNamespaces) done
 
     , testCase "stop after namespace 2, rerun: final state equals an uninterrupted run; progress lists all" $
@@ -305,7 +311,7 @@ tests = testGroup "Migrate"
             copyDb db other
 
             migrateTrees silent db stop2
-            Progress p1 <- readProgress db
+            p1 <- doneKeys db
             assertEqual "progress after the stop" (keysOf MigrateTrees $ take 2 treeNamespaces) p1
             sizes <- namespaceSizes db treeNamespaces
             assertEqual "the first two tree namespaces are empty" [0, 0] (snd <$> take 2 sizes)
@@ -314,7 +320,7 @@ tests = testGroup "Migrate"
             migrateTrees silent db defaultMigrateOpts
 
             migratePayloads silent db stop2
-            Progress p2 <- readProgress db
+            p2 <- doneKeys db
             assertEqual "progress after the second stop"
                 (keysOf MigrateTrees treeNamespaces <> keysOf MigratePayloads (take 2 payloadNamespaces)) p2
             -- the files of the first two namespaces were rewritten, those of
@@ -333,9 +339,9 @@ tests = testGroup "Migrate"
             d <- diffDbs other db everyNamespace
             assertNoDiff "interrupted and uninterrupted runs differ" d
             let allKeys = keysOf MigrateTrees treeNamespaces <> keysOf MigratePayloads payloadNamespaces
-            Progress done <- readProgress db
+            done <- doneKeys db
             assertEqual "progress lists all" allKeys done
-            Progress done' <- readProgress other
+            done' <- doneKeys other
             assertEqual "progress of the uninterrupted run" allKeys done'
             assertNamespacesZstd "interrupted" db payloadNamespaces
             assertNamespacesZstd "uninterrupted" other payloadNamespaces
@@ -424,6 +430,107 @@ tests = testGroup "Migrate"
             d <- diffDbs done db everyNamespace
             assertNoDiff "rerun changed an entry" d
 
+    , testCase "trees, stop after namespace 1: TransactionTree empty and its files gone; TransactionTree2 and every other namespace unchanged" $
+        withFixture $ \dir db -> do
+            let pre = dir </> "pre"
+            copyDb db pre
+            migrateTrees silent db defaultMigrateOpts { _moStopAfter = Just 1 }
+            done <- doneKeys db
+            assertEqual "progress" (keysOf MigrateTrees ["TransactionTree"]) done
+            sizes <- M.fromList <$> namespaceSizes db ["TransactionTree", "TransactionTree2"]
+            assertEqual "TransactionTree is empty" (Just 0) (M.lookup "TransactionTree" sizes)
+            assertBool "TransactionTree2 has its entries" (maybe False (> 0) $ M.lookup "TransactionTree2" sizes)
+            assertTreeFilesGone "after the stop" db ["TransactionTree"]
+            d <- diffDbs pre db (drop 1 treeNamespaces <> otherNamespaces)
+            assertNoDiff "deleting TransactionTree changed another namespace" d
+            assertEqual "TransactionTree2 is compared" ["TransactionTree2"] (take 1 $ _ndNamespace <$> _dsNamespaces d)
+
+    , testCase "progress file: holds the IDENTITY of the database, refused on a database with another IDENTITY; nothing-to-do line names it" $
+        withFixture $ \dir db -> do
+            migrateTrees silent db defaultMigrateOpts { _moStopAfter = Just 1 }
+            ident <- dbIdentity db
+            assertBool "IDENTITY is not empty" (not $ T.null ident)
+            p <- readProgress db
+            assertEqual "progress" (Just $ Progress ident (keysOf MigrateTrees ["TransactionTree"])) p
+            -- a database that replaced this one in place, with its progress file
+            let other = dir </> "other"
+            withRocksDb other modernDefaultOptions $ \_ -> return ()
+            otherIdent <- dbIdentity other
+            assertBool "the other database has another IDENTITY" (otherIdent /= ident)
+            copyFile (progressFile db) (progressFile other)
+            progress0 <- B.readFile (progressFile other)
+            forM_ [MigrateTrees, MigratePayloads] $ \step -> do
+                r <- try @IOException $ migrate silent other step defaultMigrateOpts
+                case r of
+                    Left e -> assertBool ("the error names both IDENTITYs: " <> show e) $
+                        all (`isInfixOf` show e) ["IDENTITY", T.unpack ident, T.unpack otherIdent, progressFile other]
+                    Right () -> assertFailure "a progress file of another database is not refused"
+            progress1 <- B.readFile (progressFile other)
+            assertEqual "the progress file is unchanged" progress0 progress1
+            -- the step is done: the log line names the progress file
+            migrateTrees silent db defaultMigrateOpts
+            (_, logs) <- capturing $ \l -> migrateTrees l db defaultMigrateOpts
+            assertBool ("nothing-to-do line: " <> show logs) $ any
+                (\l -> T.pack (progressFile db) `T.isInfixOf` l && "delete that file" `T.isInfixOf` l)
+                logs
+
+    , testCase "command line: trees takes --payload-compression (default snappy), both take --pause-file; the help names the node's settings" $ do
+        let parse args = getParseResult $ execParserPure defaultPrefs migrateParserInfo args
+            helpOf args = case execParserPure defaultPrefs migrateParserInfo (args <> ["--help"]) of
+                Failure f -> unwords $ words $ fst $ renderFailure f "storage-migrate"
+                _ -> ""
+            dir = ["--database-directory", "d"]
+            expect step o = Just (MigrateCommand step "d" o)
+        assertEqual "trees, defaults" (expect MigrateTrees defaultMigrateOpts) (parse $ "trees" : dir)
+        assertEqual "the default is the node's" PayloadSnappy (_moPayloadCompression defaultMigrateOpts)
+        assertEqual "trees, zstd-dict and a pause file"
+            (expect MigrateTrees defaultMigrateOpts { _moPayloadCompression = PayloadZstdDict, _moPauseFile = Just "p" })
+            (parse $ "trees" : dir <> ["--payload-compression", "zstd-dict", "--pause-file", "p"])
+        assertEqual "trees rejects zstd" Nothing (parse $ "trees" : dir <> ["--payload-compression", "zstd"])
+        assertEqual "payloads, a pause file"
+            (expect MigratePayloads defaultMigrateOpts { _moPayloadCompression = PayloadZstdDict, _moPauseFile = Just "p" })
+            (parse $ "payloads" : dir <> ["--pause-file", "p"])
+        assertEqual "payloads takes no compression" Nothing (parse $ "payloads" : dir <> ["--payload-compression", "snappy"])
+        let top = helpOf []
+            trees = helpOf ["trees"]
+            payloads = helpOf ["payloads"]
+        forM_ ["--store-merkle-trees false", "--payload-compression zstd-dict", "read-only", "LOCK", "storage-migrate.progress.json"] $ \t ->
+            assertBool ("help: " <> show t <> " in " <> show top) (t `isInfixOf` top)
+        forM_ ["use the value the node runs with", "--store-merkle-trees false", "--pause-file"] $ \t ->
+            assertBool ("trees help: " <> show t <> " in " <> show trees) (t `isInfixOf` trees)
+        forM_ ["--payload-compression zstd-dict", "--pause-file"] $ \t ->
+            assertBool ("payloads help: " <> show t <> " in " <> show payloads) (t `isInfixOf` payloads)
+
+    , testCase "trees --payload-compression: files that trees rewrites get the node's compression (snappy by default, zstd-dict when given)" $
+        withMixedFixture $ \dir mixed -> do
+            let snappyDb = dir </> "snappy"
+            copyDb mixed snappyDb
+            migrateTrees silent snappyDb defaultMigrateOpts
+            cs <- compressions snappyDb
+            assertBool ("default: Snappy only: " <> show cs) (all (== "Snappy") cs && not (null cs))
+            migrateTrees silent mixed defaultMigrateOpts { _moPayloadCompression = PayloadZstdDict }
+            assertAllZstd "zstd-dict" mixed
+            d <- diffDbs snappyDb mixed everyNamespace
+            assertNoDiff "the compression changed an entry" d
+
+    , testCase "--pause-file: no namespace starts while the file exists; the run waits, and finishes after the file is removed" $
+        withFixture $ \dir db -> do
+            let pause = dir </> "PAUSE"
+            writeFile pause "pause"
+            withAsync (migrateTrees silent db defaultMigrateOpts { _moPauseFile = Just pause }) $ \a -> do
+                threadDelay 1_500_000
+                r <- poll a
+                assertBool "the run waits" (isNothing r)
+                done <- doneKeys db
+                assertEqual "no namespace is done while paused" mempty done
+                sizes <- namespaceSizes db treeNamespaces
+                assertBool "no tree namespace was deleted while paused" (all ((> 0) . snd) sizes)
+                removeFile pause
+                finished <- timeout 60_000_000 (wait a)
+                assertEqual "the run finishes after the removal" (Just ()) finished
+            done <- doneKeys db
+            assertEqual "progress" (keysOf MigrateTrees treeNamespaces) done
+
     , testCase "range DB built with --store-merkle-trees false --payload-compression zstd-dict: no tree entries, ZSTD files" $
         withSource $ \src -> withSystemTempDirectory "storage-migrate-range" $ \dir -> do
             let parse args = getParseResult $
@@ -451,17 +558,26 @@ tests = testGroup "Migrate"
     , testCase "refuses a database that is open elsewhere and a directory without a database; changes nothing" $
         withFixture $ \dir db -> do
             sizes0 <- namespaceSizes db treeNamespaces
-            withRocksDb db modernDefaultOptions $ \_ -> forM_ [migrateTrees, migratePayloads] $ \m -> do
-                r <- try @SomeException $ m silent db defaultMigrateOpts
-                assertBool "a database in use is refused" (either (const True) (const False) r)
+            withRocksDb db modernDefaultOptions $ \_ -> forM_ [MigrateTrees, MigratePayloads] $ \step -> do
+                r <- try @IOException $ migrate silent db step defaultMigrateOpts
+                case r of
+                    -- the error of RocksDB's lock on the LOCK file of the
+                    -- database (in one process: "lock hold by current process")
+                    Left e -> assertBool ("the lock error: " <> show e) $
+                        (db </> "LOCK: ") `isInfixOf` show e && "lock" `isInfixOf` show e
+                    Right () -> assertFailure "a database in use is not refused"
+                code <- runMigrate silent db step defaultMigrateOpts
+                assertEqual "exit code" (ExitFailure 1) code
             sizes1 <- namespaceSizes db treeNamespaces
             assertEqual "tree namespaces after the refusal" sizes0 sizes1
             noProgress <- not <$> doesFileExist (progressFile db)
             assertBool "no progress file" noProgress
             let notDb = dir </> "not-a-db"
             createDirectory notDb
-            r <- try @SomeException $ migrateTrees silent notDb defaultMigrateOpts
-            assertBool "a directory without a database is refused" (either (const True) (const False) r)
+            r <- try @IOException $ migrateTrees silent notDb defaultMigrateOpts
+            case r of
+                Left e -> assertBool ("the error: " <> show e) ("not a RocksDB database" `isInfixOf` show e)
+                Right () -> assertFailure "a directory without a database is not refused"
             nothing <- null <$> listDirectory notDb
             assertBool "nothing is created" nothing
     ]
