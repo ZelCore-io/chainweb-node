@@ -344,12 +344,12 @@ reportTests = testGroup "report"
         reportDiffCount rep @?= 1
     , testCase "an allowed verdict with evidence passes" $ do
         let rep = addOutcome emptyReport (outcome 0 payloadReq (Allowed AllowOrphanPayload "no canonical header"))
-        reportVerdict rep @?= Pass
+        reportVerdict rep @?= PartialPass
         reportAllowedFor rep AllowOrphanPayload @?= 1
     , testCase "pin unstable above 1% of pinned requests voids the run" $ do
         let run k = foldl addOutcome emptyReport
                 [ outcome i localReq (if i < k then Skipped PinUnstable else Same) | i <- [0 .. 199] ]
-        reportVerdict (run 2) @?= Pass
+        reportVerdict (run 2) @?= PartialPass
         reportVerdict (run 3) @?= Void
         reportPinned (run 3) @?= 200
     , testCase "a run that compared nothing is void" $
@@ -369,9 +369,9 @@ reportTests = testGroup "report"
                 [ out i localReq (if i < k then Skipped Unpinned else Same) Nothing Nothing (if i < k then attempts else 1)
                 | i <- [0 .. 199]
                 ]
-        reportVerdict (run 2 1) @?= Pass
+        reportVerdict (run 2 1) @?= PartialPass
         reportVerdict (run 3 1) @?= Void
-        reportVerdict (run 3 0) @?= Pass
+        reportVerdict (run 3 0) @?= PartialPass
     , testCase "1% split between PinUnstable and Unpinned after sending: Void" $ do
         let rep = foldl addOutcome emptyReport $
                 [ out 0 localReq (Skipped PinUnstable) Nothing Nothing 6
@@ -394,7 +394,7 @@ reportTests = testGroup "report"
         let rep = foldl addOutcome emptyReport $
                 [ out i (historyReqAt 100) { _reqChain = cid3 } (Skipped NotCovered) Nothing Nothing 0 | i <- [0 .. 49] ]
                 <> [ out i payloadReq Same Nothing Nothing 1 | i <- [50 .. 59] ]
-        reportVerdict rep @?= Pass
+        reportVerdict rep @?= PartialPass
         reportSkippedIn rep ClsHistory NotCovered @?= 50
         reportSkippedFor rep NotCovered @?= 50
         reportSent rep ClsHistory @?= 0
@@ -416,7 +416,7 @@ reportTests = testGroup "report"
                     else out i payloadReq Same Nothing Nothing 1
                 | i <- [0 .. 199]
                 ]
-        reportVerdict (run 2) @?= Pass
+        reportVerdict (run 2) @?= PartialPass
         reportVerdict (run 3) @?= Void
         reportNoAnswer (run 3) NoAnswerOracle @?= 3
     , testCase "transport failures are counted per side, in the summary and the JSON" $ do
@@ -444,8 +444,9 @@ reportTests = testGroup "report"
         assertBool "a plain body as is" $ "body: {\"code\":\"(coin.details" `T.isInfixOf`
             reportSummary (addOutcome emptyReport (out 0 localReq (Differ "d") Nothing Nothing 1))
         assertBool "json" $ "\"depths\":{\"oracle\":900,\"test\":890}" `B.isInfixOf` BL.toStrict (encode rep)
-    , testCase "exit codes: 0 Pass, 2 Fail, 3 Void" $ do
+    , testCase "exit codes: 0 Pass, 2 Fail, 3 Void, 4 PartialPass" $ do
         gateExitCode Pass @?= ExitSuccess
+        gateExitCode PartialPass @?= ExitFailure 4
         gateExitCode Fail @?= ExitFailure 2
         gateExitCode Void @?= ExitFailure 3
     , testCase "the first 50 differences by request index are kept, bodies cut to 4 KB" $ do
@@ -641,7 +642,7 @@ runTests = testGroup "runCompare"
                     , uncoveredReq
                     ]
             rep <- runCompare quietLogger cov o t reqs
-            reportVerdict rep @?= Pass
+            reportVerdict rep @?= PartialPass
             reportCompared rep @?= 6
             reportClassTotal rep KindSame @?= 6
             reportSkippedFor rep NotCovered @?= 1
@@ -668,7 +669,7 @@ runTests = testGroup "runCompare"
     , testCase "an orphan that no canonical header references: Allowed with evidence, Pass" $
         withStubs 1_000 oracleConf testConf $ \o t so st -> do
             rep <- runCompare quietLogger cov o t [payloadReqFor payloadO]
-            reportVerdict rep @?= Pass
+            reportVerdict rep @?= PartialPass
             reportAllowedFor rep AllowOrphanPayload @?= 1
             assertBool "evidence" $ all (not . T.null . _asEvidence) (reportAllowedSamples rep)
             pso <- seenPaths so
@@ -730,14 +731,14 @@ runTests = testGroup "runCompare"
     , testCase "a failed tip probe is tried again on its own: Pass after two failures" $
         withStubs 1_000 oracleConf { _scProbeFailures = 2 } testConf $ \o t so _ -> do
             rep <- runCompareWith quietLogger fastOptions cov o t [localReqAt 100]
-            reportVerdict rep @?= Pass
+            reportVerdict rep @?= PartialPass
             n <- probeCount <$> seenPaths so
             n @?= 3
 
     , testCase "a History request whose code fails at the tip is pinned by the class-neutral probe and compared" $
         withStubs 1_000 oracleConf testConf $ \o t _ _ -> do
             rep <- runCompare quietLogger cov o t [historyReqAt 100]
-            reportVerdict rep @?= Pass
+            reportVerdict rep @?= PartialPass
             reportSame2xx rep ClsHistory @?= 1
 
     , testCase "a pinned difference names the depth used on each side" $
@@ -769,7 +770,7 @@ runTests = testGroup "runCompare"
                 [ localReqAt 100, localReqAt 200, keysReqAt 300
                 , payloadReqFor payloadA, payloadReqFor payloadB, payloadReqFor payloadO
                 ]
-            reportVerdict rep @?= Pass
+            reportVerdict rep @?= PartialPass
             arrivals <- (<>) <$> readIORef so <*> readIORef st
             permitsO <- limiterPermits (_sideLimiter o)
             permitsT <- limiterPermits (_sideLimiter t)

@@ -347,6 +347,7 @@ library storage-tools
 
         -- external
         , aeson
+        , optparse-applicative
         , async
         , base >= 4.12 && < 5
         , base16-bytestring
@@ -474,6 +475,7 @@ test-suite storage-tools-tests
 
         -- external
         , aeson
+        , optparse-applicative
         , async
         , base
         , bytestring

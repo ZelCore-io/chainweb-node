@@ -48,7 +48,9 @@ module Chainweb.StorageTools.Compare.Report
 , reportGeneration
 , reportGenTargets
 , reportGenSkipped
+, reportGenSkippedKind
 , reportGenSkippedTotal
+, reportRealKeyCompared
 , reportSettings
 , maxDiffSamples
 , maxBodyBytes
@@ -57,6 +59,7 @@ module Chainweb.StorageTools.Compare.Report
 , GateVerdict(..)
 , reportVerdict
 , reportVoidReasons
+, reportMissingClasses
 , gateExitCode
 
   -- * Output
@@ -188,9 +191,11 @@ data Report = Report
         -- ^ see 'reportExpectClasses'
     , _repGenTargets :: !Int
         -- ^ see 'reportGeneration'
-    , _repGenSkipped :: !(M.Map RequestClass Int)
-        -- ^ see 'reportGeneration'
+    , _repGenSkipped :: !(M.Map (RequestClass, T.Text) Int)
+        -- ^ per class and kind, see 'reportGeneration'
     , _repSettings :: ![(T.Text, T.Text)]
+    , _repRealKey :: !(M.Map RequestClass Int)
+        -- ^ see 'reportRealKeyCompared'
         -- ^ see 'reportSettings'
     }
 
@@ -205,7 +210,7 @@ maxBodyBytes :: Int
 maxBodyBytes = 4_096
 
 emptyReport :: Report
-emptyReport = Report mempty mempty mempty mempty mempty 0 mempty 0 0 0 mempty mempty [] 0 mempty []
+emptyReport = Report mempty mempty mempty mempty mempty 0 mempty 0 0 0 mempty mempty [] 0 mempty [] mempty
 
 -- | Adds the outcome of a request. The result does not depend on the order
 -- in which outcomes are added.
@@ -247,7 +252,15 @@ addOutcome rep0 o = case v of
         { _repCounts = M.insertWith (+) (cls, k) 1 (_repCounts r)
         , _repPinned = _repPinned r + pinnedSent
         , _repSent = if sent then M.insertWith (+) cls 1 (_repSent r) else _repSent r
+        , _repRealKey = if k /= KindSkipped && realKey then M.insertWith (+) cls 1 (_repRealKey r) else _repRealKey r
         }
+
+    -- the oracle's answer holds the result of a real request key
+    realKey = case (cls, _outOracle o) of
+        (ClsPoll, Just a) -> _ansStatus a == 200
+            && maybe False (not . KM.null) (decodeStrict (_ansBody a) :: Maybe Object)
+        (ClsSpv, Just a) -> _ansStatus a >= 200 && _ansStatus a < 300
+        _ -> False
 
     keepLowest m
         | M.size m > maxDiffSamples = M.deleteMax m
@@ -369,14 +382,15 @@ reportExpectClasses :: [RequestClass] -> Report -> Report
 reportExpectClasses cs rep = rep { _repExpected = cs }
 
 -- | @reportGeneration targets skipped@: of the @targets@ sampled for a
--- generated run, the classes of those dropped at generation because an oracle
--- lookup failed (ruling on Task 6a). More than 1% of the targets dropped makes
--- the run 'Void'.
+-- generated run, the class and kind of those dropped at generation, for
+-- instance because an oracle lookup failed (ruling on Task 6a) or because a
+-- poll or SPV target has no transaction within 1000 blocks (ruling C3 on Task
+-- 6). More than 1% of the targets dropped makes the run 'Void'.
 --
-reportGeneration :: Int -> [RequestClass] -> Report -> Report
+reportGeneration :: Int -> [(RequestClass, T.Text)] -> Report -> Report
 reportGeneration n skipped rep = rep
     { _repGenTargets = n
-    , _repGenSkipped = M.fromListWith (+) [ (c, 1) | c <- skipped ]
+    , _repGenSkipped = M.fromListWith (+) [ (s, 1) | s <- skipped ]
     }
 
 -- | The targets sampled for a generated run, see 'reportGeneration'.
@@ -387,7 +401,21 @@ reportGenTargets = _repGenTargets
 -- | The targets of a class dropped at generation, see 'reportGeneration'.
 --
 reportGenSkipped :: Report -> RequestClass -> Int
-reportGenSkipped rep c = M.findWithDefault 0 c (_repGenSkipped rep)
+reportGenSkipped rep c = sum [ n | ((c', _), n) <- M.toList (_repGenSkipped rep), c' == c ]
+
+-- | The targets dropped at generation with a kind, over all classes.
+--
+reportGenSkippedKind :: Report -> T.Text -> Int
+reportGenSkippedKind rep k = sum [ n | ((_, k'), n) <- M.toList (_repGenSkipped rep), k' == k ]
+
+-- | The compared requests of a class whose oracle answer holds the result of
+-- a real request key: for @/poll@ a 200 answer with at least one key, for
+-- @/spv@ a 2xx answer (a proof). An answer to unknown keys only (@{}@, or
+-- the same error) is the same on any two nodes, so a class of them is hollow
+-- (ruling C3 on Task 6). 0 for the other classes.
+--
+reportRealKeyCompared :: Report -> RequestClass -> Int
+reportRealKeyCompared rep c = M.findWithDefault 0 c (_repRealKey rep)
 
 reportGenSkippedTotal :: Report -> Int
 reportGenSkippedTotal = sum . _repGenSkipped
@@ -414,6 +442,9 @@ pactResultStatus b = decodeStrict b >>= parseMaybe (withObject "answer" $ \o ->
 
 data GateVerdict
     = Pass
+    | PartialPass
+        -- ^ no difference, but the run does not cover every class (ruling I1
+        -- on Task 6): it cannot pass the gate
     | Fail
     | Void
         -- ^ the run says nothing; rerun it
@@ -423,13 +454,27 @@ data GateVerdict
 --
 -- * 'Fail' on any difference, including an allowed one without evidence.
 -- * Otherwise 'Void' if any of 'reportVoidReasons' holds.
+-- * Otherwise 'PartialPass' if not every one of the 7 classes has a request
+--   compared, with a real key for poll and spv ('reportRealKeyCompared'): a
+--   run of fewer classes cannot pass the gate (ruling I1 on Task 6).
 -- * 'Pass' otherwise.
 --
 reportVerdict :: Report -> GateVerdict
 reportVerdict rep
     | _repDiffCount rep > 0 = Fail
     | not (null (reportVoidReasons rep)) = Void
+    | not (null (reportMissingClasses rep)) = PartialPass
     | otherwise = Pass
+
+-- | The classes that keep a run without differences from 'Pass': those
+-- without a request compared, and poll and spv without one with a real key.
+--
+reportMissingClasses :: Report -> [RequestClass]
+reportMissingClasses rep = filter (not . covers) allRequestClasses
+  where
+    covers c
+        | c `elem` [ClsPoll, ClsSpv] = reportRealKeyCompared rep c > 0
+        | otherwise = reportComparedIn rep c > 0
 
 -- | Why the run says nothing and must be rerun; empty if it does say
 -- something:
@@ -440,6 +485,8 @@ reportVerdict rep
 --   count here);
 -- * a class of a generated run ('reportExpectClasses') has no request
 --   compared, even if it has no request at all;
+-- * poll or spv is a class of a generated run, but no request of it with a
+--   real key was compared ('reportRealKeyCompared', ruling C3 on Task 6);
 -- * 'PinUnstable' and 'Unpinned' requests that were sent are together more
 --   than 1% of the pinned requests that were sent;
 -- * 'NoOracleAnswer' requests (no HTTP answer from the oracle, or from
@@ -462,6 +509,13 @@ reportVoidReasons rep = concat
       , inScope rep c == 0
       , reportComparedIn rep c == 0
       ]
+    , [ requestClassText c <> ": a class of the run (--classes) without a request with a real key compared, of "
+        <> sh (reportComparedIn rep c) <> " compared"
+      | c <- [ClsPoll, ClsSpv]
+      , c `elem` _repExpected rep
+      , reportComparedIn rep c > 0
+      , reportRealKeyCompared rep c == 0
+      ]
     , [ sh pu <> " pin unstable and " <> sh up <> " unpinned after sending of "
         <> sh pinned <> " pinned requests sent, more than 1%"
       | pinned > 0
@@ -471,7 +525,7 @@ reportVoidReasons rep = concat
       | sent > 0
       , 100 * noa > sent
       ]
-    , [ sh gs <> " of " <> sh gt <> " targets skipped at generation (an oracle lookup failed), more than 1%"
+    , [ sh gs <> " of " <> sh gt <> " targets skipped at generation (" <> genSkipKinds rep <> "), more than 1%"
       | gt > 0
       , 100 * gs > gt
       ]
@@ -487,8 +541,15 @@ reportVoidReasons rep = concat
     sh :: Int -> T.Text
     sh = T.pack . show
 
+-- | The skips at generation per kind, for example @no tx within 1000 blocks:
+-- 3, an oracle lookup failed: 1@.
+--
+genSkipKinds :: Report -> T.Text
+genSkipKinds rep = T.intercalate ", "
+    [ k <> ": " <> T.pack (show n) | (k, n) <- M.toList (M.mapKeysWith (+) snd (_repGenSkipped rep)) ]
+
 -- | The exit code of @cw-compare@ for a gate verdict: 0 'Pass', 2 'Fail',
--- 3 'Void'. Exit code 1 is left to bad arguments and crashes, so that a
+-- 3 'Void', 4 'PartialPass'. Exit code 1 is left to bad arguments and crashes, so that a
 -- crash is never read as a verdict.
 --
 gateExitCode :: GateVerdict -> ExitCode
@@ -496,6 +557,7 @@ gateExitCode = \case
     Pass -> ExitSuccess
     Fail -> ExitFailure 2
     Void -> ExitFailure 3
+    PartialPass -> ExitFailure 4
 
 -- -------------------------------------------------------------------------- --
 -- Output
@@ -549,9 +611,14 @@ reportSummary rep = T.unlines $
     [ "verdict: " <> T.pack (show (reportVerdict rep))
     ]
     <> [ "  void: " <> r | reportVerdict rep == Void, r <- reportVoidReasons rep ]
+    <> [ "  partial: no request compared (for poll and spv: with a real key) in "
+        <> T.intercalate ", " (map requestClassText (reportMissingClasses rep))
+       | reportVerdict rep == PartialPass
+       ]
     <> [ "generation: " <> sh (_repGenTargets rep) <> " targets, "
-        <> sh (reportGenSkippedTotal rep) <> " skipped (an oracle lookup failed)"
-        <> T.concat [ ", " <> requestClassText c <> " " <> sh n | (c, n) <- M.toList (_repGenSkipped rep) ]
+        <> sh (reportGenSkippedTotal rep) <> " skipped"
+        <> (if reportGenSkippedTotal rep > 0 then " (" <> genSkipKinds rep <> ")" else "")
+        <> T.concat [ ", " <> requestClassText c <> " " <> sh n | (c, n) <- M.toList (M.mapKeysWith (+) fst (_repGenSkipped rep)) ]
        | _repGenTargets rep > 0
        ]
     <> [ "settings: " <> T.intercalate ", " [ k <> "=" <> v | (k, v) <- _repSettings rep ]
@@ -611,10 +678,13 @@ instance ToJSON Report where
     toJSON rep = object
         [ "verdict" .= show (reportVerdict rep)
         , "voidReasons" .= reportVoidReasons rep
+        , "missingClasses" .= map requestClassText (reportMissingClasses rep)
         , "classesOfRun" .= map requestClassText (_repExpected rep)
         , "generation" .= object
             [ "targets" .= _repGenTargets rep
             , "skipped" .= reportGenSkippedTotal rep
+            , "skippedPerKind" .= object
+                [ K.fromText k .= n | (k, n) <- M.toList (M.mapKeysWith (+) snd (_repGenSkipped rep)) ]
             ]
         , "settings" .= object [ K.fromText k .= v | (k, v) <- _repSettings rep ]
         , "compared" .= reportCompared rep
@@ -633,6 +703,7 @@ instance ToJSON Report where
                    , "sent" .= reportSent rep c
                    , "pactFailure200" .= reportPactFailures rep c
                    , "generationSkipped" .= reportGenSkipped rep c
+                   , "realKeyCompared" .= reportRealKeyCompared rep c
                    , "skippedPerReason" .= object
                         [ K.fromText (skipReasonText r) .= reportSkippedIn rep c r | r <- [minBound .. maxBound] ]
                    ]

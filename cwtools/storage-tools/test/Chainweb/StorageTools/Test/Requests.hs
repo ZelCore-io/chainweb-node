@@ -40,6 +40,8 @@ import Network.Wai (Application, pathInfo, queryString, responseLBS, strictReque
 import Network.Wai.Handler.Warp (testWithApplication)
 import Test.Tasty
 import Test.Tasty.HUnit
+import qualified Options.Applicative as O
+import System.Exit (ExitCode(..))
 import Text.Read (readMaybe)
 
 import Data.MerkleLog (MerkleProof(..), decodeMerkleProofObject, encodeMerkleProofObject, merkleProof_)
@@ -52,6 +54,7 @@ import Chainweb.Crypto.MerkleLog (bodyTree, headerTree_)
 import Chainweb.MerkleUniverse (ChainwebHashTag, ChainwebMerkleHashAlgorithm)
 import Chainweb.Payload
 import Chainweb.SPV (TransactionOutputProof(..))
+import Chainweb.StorageTools.Compare.InProcess (LocalSettings(..), localSettingsParser)
 import Chainweb.StorageTools.Compare.PactSet
 import Chainweb.StorageTools.Compare.Report
 import Chainweb.StorageTools.Compare.Requests
@@ -78,6 +81,16 @@ tests = testGroup "Requests"
     , testCase "spv with a real proof: identical proofs Same, a tampered path element Differ" spvRealProof
     , testCase "report: per class, the 200 answers whose Pact result status is failure" pactFailures
     , testCase "a class in --classes with nothing compared voids the run" expectedClasses
+    , testCase "History against a live oracle (defaults) is txlog only over 1000 seeds; txids and keylog only with --same-snapshot" liveHistory
+    , testCase "keys against a live oracle only on coin.allocation-table; keys on a large table only with --same-snapshot" liveKeys
+    , testCase "the default Pact set: every live entry records its bound; unbounded entries are same-snapshot only; defpact state at step 0" pactSetBounds
+    , testCase "poll and spv scan up to 1000 blocks for a transaction: its block is the target, every request has a real key" sparseTxs
+    , testCase "poll and spv without a transaction within 1000 blocks are skipped at generation as no tx within 1000 blocks" noTxSkip
+    , testCase "report: poll and spv count compared requests with a real key; a run of them with none is Void" realKeys
+    , testCase "a run whose classes are not all 7 is at best PartialPass (exit 4)" partialPass
+    , testCase "generation skips are reported per kind" skipKinds
+    , testCase "spv: a target chain outside the coverage at the target height + 3 is NotCovered" spvTargetCoverage
+    , testCase "--allow-reads-in-local takes a required true|false" allowReadsOption
     ]
 
 cid0, cid3, cid10 :: ChainId
@@ -162,9 +175,9 @@ rk h i = "rk" <> tshow h <> "-" <> tshow i
 b64 :: Value -> T.Text
 b64 = encodeB64UrlNoPaddingText . BL.toStrict . encode
 
-payloadObj :: Word64 -> Value
-payloadObj h = object
-    [ "transactions" .= [ [b64 (txJson i), b64 (outJson i)] | hasTxs h, i <- [0, 1] ]
+payloadObjWith :: (Word64 -> Bool) -> Word64 -> Value
+payloadObjWith txsAt h = object
+    [ "transactions" .= [ [b64 (txJson i), b64 (outJson i)] | txsAt h, i <- [0, 1] ]
     , "minerData" .= b64 (object
         [ "account" .= ("k:miner" :: T.Text), "predicate" .= ("keys-all" :: T.Text), "public-keys" .= ["miner-key" :: T.Text] ])
     , "coinbase" .= b64 (object [ "reqKey" .= ("cb" <> tshow h), "txId" .= (10 * h), "continuation" .= Null ])
@@ -196,8 +209,8 @@ headerObj h = object
     , "chainId" .= (0 :: Int)
     ]
 
-oracleApp :: IORef Int -> Application
-oracleApp arrivals req respond = do
+oracleAppWith :: (Word64 -> Bool) -> IORef Int -> Application
+oracleAppWith txsAt arrivals req respond = do
     atomicModifyIORef' arrivals (\n -> (n + 1, ()))
     body <- BL.toStrict <$> strictRequestBody req
     let q k = lookup k (queryString req) >>= id >>= readMaybe . B8.unpack
@@ -214,13 +227,18 @@ oracleApp arrivals req respond = do
                 in json $ object [ "items" .= items, "limit" .= length items, "next" .= Null ]
         ["chain", _, "payload", "outputs", "batch"]
             | Just hs <- decodeStrict body >>= parseMaybe (withObject "batch" (.: "heights")) ->
-                json $ toJSON [ payloadObj h | h <- hs ]
+                json $ toJSON [ payloadObjWith txsAt h | h <- hs ]
         _ -> respond $ responseLBS status404 [] "not found"
 
 withOracle :: (IORef Int -> HostLimiters -> ServiceApi -> T.Text -> IO a) -> IO a
-withOracle act = do
+withOracle = withOracleTxs hasTxs
+
+-- | The stub oracle with transactions at the heights of the predicate.
+--
+withOracleTxs :: (Word64 -> Bool) -> (IORef Int -> HostLimiters -> ServiceApi -> T.Text -> IO a) -> IO a
+withOracleTxs txsAt act = do
     arrivals <- newIORef 0
-    testWithApplication (return (oracleApp arrivals)) $ \port -> do
+    testWithApplication (return (oracleAppWith txsAt arrivals)) $ \port -> do
         let url = "http://127.0.0.1:" <> tshow port
         hl <- newHostLimiters 1_000 Nothing
         api <- oracleServiceApi hl mainnet url
@@ -250,8 +268,9 @@ deterministic = withOracle $ \_ _ api _ -> do
     c2 <- mapM (\(c, h) -> gen api 2 c h) targets
     assertBool "seed 2 gives other requests" (a /= c2)
     map _reqClass a @?= map fst targets
-    -- every generated request is sent: none is decided before sending
-    let cov = Coverage (M.fromList [(cid0, [(0, 2_000)])])
+    -- every generated request is sent: none is decided before sending (an
+    -- spv request needs its target chain covered too)
+    let cov = Coverage (M.fromList [ (unsafeChainId i, [(0, 2_000)]) | i <- [0 .. 19] ])
     forM_ a $ \r -> preJudge cov r @?= Nothing
 
 oracleLimiter :: Assertion
@@ -468,18 +487,164 @@ pactFailures = do
     reportPactFailures rep ClsHistory @?= 0
     reportPactFailures rep ClsPreflight @?= 1
     reportPactFailures rep ClsPayload @?= 0
-    reportVerdict rep @?= Pass
+    reportVerdict rep @?= PartialPass
     field ["perClass", "local", "pactFailure200"] (toJSON rep) @?= Just (Number 2)
     assertBool "the summary names the count" ("pact failure" `isInfixOf` T.unpack (reportSummary rep))
 
 expectedClasses :: Assertion
 expectedClasses = do
     let rep = addOutcome emptyReport (outcomeWith 0 ClsPayload 200 "x")
-    reportVerdict rep @?= Pass
-    reportVerdict (reportExpectClasses [ClsPayload] rep) @?= Pass
+    reportVerdict rep @?= PartialPass
+    reportVerdict (reportExpectClasses [ClsPayload] rep) @?= PartialPass
     let rep7 = reportExpectClasses allRequestClasses rep
     reportVerdict rep7 @?= Void
     let reasons = reportVoidReasons rep7
     forM_ (filter (/= ClsPayload) allRequestClasses) $ \c ->
         assertBool (show c <> " named") (any (requestClassText c `T.isPrefixOf`) reasons)
     assertBool "payload not named" (not (any ("payload" `T.isPrefixOf`) reasons))
+
+-- -------------------------------------------------------------------------- --
+-- Fix round 1 (Task 6)
+
+-- | The code of an exec command.
+--
+execCode :: Request -> Maybe T.Text
+execCode r = do
+    b <- _reqBody r
+    c <- decodeStrict b >>= parseMaybe (withObject "command" (.: "cmd"))
+    v <- decodeStrict (T.encodeUtf8 c)
+    field ["payload", "exec", "code"] v >>= \case
+        String code -> Just code
+        _ -> Nothing
+
+requestKeysOf :: Request -> [T.Text]
+requestKeysOf r = case bodyValue r >>= field ["requestKeys"] of
+    Just (Array a) -> [ t | String t <- V.toList a ]
+    _ -> []
+
+liveHistory :: Assertion
+liveHistory = withOracle $ \_ _ api _ -> do
+    let targets = [ (s, 1 + (s * 37) `mod` 900) | s <- [1 .. 1000] ]
+    live <- forM targets $ \(s, h) -> execCode <$> gen api s ClsHistory h
+    forM_ live $ \c -> assertBool ("txlog only: " <> show c) (maybe False ("(txlog " `T.isPrefixOf`) c)
+    snap <- forM (take 200 targets) $ \(s, h) -> execCode <$> genSnap api s ClsHistory h
+    forM_ ["(txids ", "(keylog "] $ \f ->
+        assertBool (T.unpack f <> "with --same-snapshot") (any (maybe False (f `T.isPrefixOf`)) snap)
+
+liveKeys :: Assertion
+liveKeys = withOracle $ \_ _ api _ -> do
+    let targets = [ (s, 1 + (s * 37) `mod` 900) | s <- [1 .. 300] ]
+    live <- forM targets $ \(s, h) -> execCode <$> gen api s ClsLocal h
+    forM_ [ c | Just c <- live, "(keys " `T.isInfixOf` c ] $ \c -> c @?= "(keys coin.allocation-table)"
+    assertBool "keys on the small table is sent" (Just "(keys coin.allocation-table)" `elem` live)
+    snap <- forM targets $ \(s, h) -> execCode <$> genSnap api s ClsLocal h
+    assertBool "keys on a large table with --same-snapshot"
+        (any (maybe False (\c -> "(keys " `T.isInfixOf` c && not ("allocation-table" `T.isInfixOf` c))) snap)
+
+pactSetBounds :: Assertion
+pactSetBounds = do
+    let es = _pactEntries defaultPactSet
+        live = filter (not . _peSameSnapshotOnly) es
+        byName n = filter ((== n) . _peName) es
+    forM_ live $ \e -> assertBool (T.unpack (_peName e) <> ": the why records a bound") ("Bound:" `T.isInfixOf` _peWhy e)
+    forM_ ["txids", "keylog", "txids-small-table", "keys-large-table"] $ \n -> case byName n of
+        [e] -> assertBool (T.unpack n <> " is same-snapshot only") (_peSameSnapshotOnly e)
+        x -> assertFailure (T.unpack n <> ": " <> show x)
+    forM_ live $ \e -> do
+        when ("(keys " `T.isInfixOf` _peCode e) $ _peCode e @?= "(keys coin.allocation-table)"
+        assertBool (T.unpack (_peName e) <> ": no txids or keylog") $
+            not (any (`T.isInfixOf` _peCode e) ["(txids ", "(keylog "])
+    forM_ [ e | e <- es, _peKind e == PactCont ] $ \e -> _peStep e @?= 0
+    assertBool "a row created late that is found above its creation height"
+        (any (not . _peSameSnapshotOnly) (byName "namespace-before-creation"))
+
+sparseTxs :: Assertion
+sparseTxs = withOracleTxs (== 700) $ \_ _ api _ -> do
+    let known = [rk 700 0, rk 700 1]
+    forM_ [1 .. 5] $ \s -> do
+        p <- gen api s ClsPoll 100
+        _reqTarget p @?= Just 700
+        assertBool "a real key" (any (`elem` known) (requestKeysOf p))
+        sp <- gen api s ClsSpv 100
+        _reqTarget sp @?= Just 700
+        case bodyValue sp >>= field ["requestKey"] of
+            Just (String k) -> assertBool "a real key" (k `elem` known)
+            v -> assertFailure ("requestKey: " <> show v)
+
+noTxSkip :: Assertion
+noTxSkip = withOracleTxs (const False) $ \arrivals _ api _ -> do
+    r <- try @RequestGenError (gen api 1 ClsPoll 0)
+    case r of
+        Left (NoTxWithin lo hi) -> (lo, hi) @?= (0, txScanMax - 1)
+        Left e -> assertFailure ("expected NoTxWithin: " <> show e)
+        Right q -> assertFailure ("expected NoTxWithin, got a request: " <> show q)
+    n <- readIORef arrivals
+    assertBool ("the scan is bounded: " <> show n <> " lookups") (n <= 60)
+    (reqs, skips) <- generateRequestsSkipping defaultGenOptions api defaultPactSet 1
+        [(ClsPoll, cid0, 0), (ClsSpv, cid0, 500), (ClsHeader, cid0, 10)]
+    map _reqClass reqs @?= [ClsHeader]
+    map _gsKind skips @?= [skipNoTx, skipNoTx]
+
+realKeys :: Assertion
+realKeys = do
+    let pollOut i b = outcomeWith i ClsPoll 200 b
+        spvOut i st = outcomeWith i ClsSpv st "{}"
+        hollow = foldl addOutcome emptyReport [pollOut 0 "{}", spvOut 1 400]
+        real = foldl addOutcome emptyReport [pollOut 0 "{\"rk\":{}}", pollOut 1 "{}", spvOut 2 200]
+    reportRealKeyCompared hollow ClsPoll @?= 0
+    reportRealKeyCompared hollow ClsSpv @?= 0
+    reportRealKeyCompared real ClsPoll @?= 1
+    reportRealKeyCompared real ClsSpv @?= 1
+    let reasons = reportVoidReasons (reportExpectClasses [ClsPoll, ClsSpv] hollow)
+    forM_ ["poll", "spv"] $ \c -> assertBool (T.unpack c <> " named: " <> show reasons) $
+        any (\x -> (c <> ":") `T.isPrefixOf` x && "real key" `T.isInfixOf` x) reasons
+    reportVoidReasons (reportExpectClasses [ClsPoll, ClsSpv] real) @?= []
+    field ["perClass", "poll", "realKeyCompared"] (toJSON real) @?= Just (Number 1)
+
+partialPass :: Assertion
+partialPass = do
+    let body c = if c == ClsPoll then "{\"rk\":{}}" else "{}"
+        run cs = foldl addOutcome emptyReport [ outcomeWith i c 200 (body c) | (i, c) <- zip [0 ..] cs ]
+        six = filter (/= ClsSpv) allRequestClasses
+    reportVerdict (reportExpectClasses allRequestClasses (run allRequestClasses)) @?= Pass
+    reportVerdict (run allRequestClasses) @?= Pass
+    reportVerdict (reportExpectClasses six (run six)) @?= PartialPass
+    reportVerdict (run six) @?= PartialPass
+    gateExitCode PartialPass @?= ExitFailure 4
+    -- hollow poll in a run of every class: Void, not Pass
+    reportVerdict (reportExpectClasses allRequestClasses (run six `addOutcome` outcomeWith 9 ClsSpv 400 "{}")) @?= Void
+
+skipKinds :: Assertion
+skipKinds = do
+    let rep = reportGeneration 10 (replicate 3 (ClsPoll, skipNoTx) <> [(ClsLocal, skipLookupFailed)])
+            (addOutcome emptyReport (outcomeWith 0 ClsPayload 200 "x"))
+        summary = reportSummary rep
+    reportGenSkippedKind rep skipNoTx @?= 3
+    reportGenSkipped rep ClsPoll @?= 3
+    assertBool ("summary per kind: " <> T.unpack summary) $
+        "no tx within 1000 blocks: 3" `T.isInfixOf` summary && "an oracle lookup failed: 1" `T.isInfixOf` summary
+    assertBool "void reason per kind" (any ("no tx within 1000 blocks: 3" `T.isInfixOf`) (reportVoidReasons rep))
+
+spvTargetCoverage :: Assertion
+spvTargetCoverage = do
+    let cid1 = unsafeChainId 1
+        spvTo :: T.Text -> Request
+        spvTo trg = Request ClsSpv cid0 (Just 300) methodPost (prefix <> "/pact/spv")
+            (Just (BL.toStrict (encode (object ["requestKey" .= ("k" :: T.Text), "targetChainId" .= trg]))))
+        cov = Coverage . M.fromList
+        c0 = (cid0, [(0, 1_000)])
+    preJudge (cov [c0]) (spvTo "1") @?= Just (Skipped NotCovered)
+    preJudge (cov [c0, (cid1, [(0, 1_000)])]) (spvTo "1") @?= Nothing
+    preJudge (cov [c0, (cid1, [(0, 302)])]) (spvTo "1") @?= Just (Skipped NotCovered)
+    preJudge (cov [c0]) (spvTo "0") @?= Nothing
+
+allowReadsOption :: Assertion
+allowReadsOption = do
+    let allow args = case O.execParserPure O.defaultPrefs (O.info localSettingsParser mempty) args of
+            O.Success x -> Just (_lsAllowReadsInLocal x)
+            _ -> Nothing
+    allow ["--allow-reads-in-local", "true"] @?= Just True
+    allow ["--allow-reads-in-local", "false"] @?= Just False
+    allow [] @?= Nothing
+    allow ["--allow-reads-in-local"] @?= Nothing
+    allow ["--allow-reads-in-local", "yes"] @?= Nothing

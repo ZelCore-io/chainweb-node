@@ -25,10 +25,16 @@
 --   answer @/local@, @/poll@ and @/spv@ requests. Each Pact chain must have its
 --   SQLite file: a missing file is an error, not a new database.
 --
+-- __Use a copy only__: point it at a copy of a node's database directory, or
+-- at the files of a node that is stopped and stays stopped for the whole run.
+-- Pact opens the SQLite files read-write (and may checkpoint their WAL), so
+-- serving a live node's files can corrupt that node's database.
+--
 module Chainweb.StorageTools.Compare.InProcess
 ( InProcessSpec(..)
 , LocalSettings(..)
 , defaultLocalSettings
+, localSettingsParser
 , localSettingsText
 , withInProcessSide
 
@@ -39,6 +45,7 @@ module Chainweb.StorageTools.Compare.InProcess
 , inProcessRate
 ) where
 
+import Control.Applicative (optional)
 import Control.Exception (bracket, throwIO)
 import Control.Monad
 
@@ -47,6 +54,7 @@ import Data.List (sort)
 import qualified Data.HashMap.Strict as HM
 import qualified Data.HashSet as HS
 import qualified Data.Text as T
+import qualified Options.Applicative as O
 
 import qualified Network.HTTP.Client as HTTP
 import qualified Network.Wai.Handler.Warp as Warp
@@ -138,6 +146,36 @@ defaultLocalSettings = LocalSettings
     , _lsEnableLocalTimeout = False
     , _lsBlockGasLimit = Nothing
     }
+
+-- | The options of @cw-compare --test-db@ for the Pact settings of the
+-- in-process side that change @/local@ answers. They must be those of the
+-- oracle node; the report records them.
+--
+localSettingsParser :: O.Parser LocalSettings
+localSettingsParser = LocalSettings
+    <$> O.option boolReader
+        ( O.long "allow-reads-in-local"
+        <> O.metavar "true|false"
+        <> O.help "with --test-db, required: the oracle node's allowReadsInLocal (true: direct table reads in /local at Pact 4 heights succeed). A mainnet oracle has it true; a wrong value makes every such read differ"
+        )
+    <*> O.switch
+        ( O.long "enable-local-timeout"
+        <> O.help "with --test-db: the oracle node's enableLocalTimeout is true (a /local call longer than 2 s fails)"
+        )
+    <*> optional (O.option O.auto
+        ( O.long "block-gas-limit"
+        <> O.metavar "GAS"
+        <> O.help "with --test-db: the oracle node's gasLimitOfBlock (preflight rejects a command above it); default: the node default"
+        ))
+
+-- | @true@ or @false@, nothing else: a required setting has no default to
+-- fall back on (Minor 6 of the Task 6 review).
+--
+boolReader :: O.ReadM Bool
+boolReader = O.eitherReader $ \case
+    "true" -> Right True
+    "false" -> Right False
+    s -> Left ("expected true or false: " <> s)
 
 -- | The settings by their names in the node's configuration, for the report.
 --

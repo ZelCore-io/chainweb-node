@@ -29,8 +29,16 @@
 -- A target whose oracle lookups fail is dropped and counted as skipped at
 -- generation; more than 1% of the targets dropped voids the run.
 --
--- Exit codes: 0 if the run passes, 2 if it fails (a difference), 3 if it is
--- void and must be rerun, 1 on bad arguments or a crash.
+-- A poll or SPV target without a transaction within 1000 blocks from the
+-- sampled height is dropped at generation too, with that reason.
+--
+-- Only a run of all 7 classes can pass: one of fewer classes (@--classes@),
+-- or one without a poll or SPV request with a real key compared, is at best
+-- a partial pass (exit code 4), never a pass.
+--
+-- Exit codes: 0 if the run passes, 4 if it partially passes (no difference,
+-- but not every class), 2 if it fails (a difference), 3 if it is void and
+-- must be rerun, 1 on bad arguments or a crash.
 --
 module Main (main) where
 
@@ -147,26 +155,7 @@ testDbOptions = DbSide
         <> value False
         <> help "with --test-db: the payload compression the database was written with (default: snappy)"
         )
-    <*> localSettingsOptions
-
--- | The Pact settings of the in-process side that change @/local@ answers.
--- They must be those of the oracle node; the report records them.
---
-localSettingsOptions :: Parser LocalSettings
-localSettingsOptions = LocalSettings
-    <$> switch
-        ( long "allow-reads-in-local"
-        <> help "with --test-db: the oracle node's allowReadsInLocal is true (direct table reads in /local at Pact 4 heights succeed)"
-        )
-    <*> switch
-        ( long "enable-local-timeout"
-        <> help "with --test-db: the oracle node's enableLocalTimeout is true (a /local call longer than 2 s fails)"
-        )
-    <*> optional (option auto
-        ( long "block-gas-limit"
-        <> metavar "GAS"
-        <> help "with --test-db: the oracle node's gasLimitOfBlock (preflight rejects a command above it); default: the node default"
-        ))
+    <*> localSettingsParser
 
 testSideOptions :: Parser TestSide
 testSideOptions = TestUrl <$> strOption
@@ -196,7 +185,7 @@ generateOptions = Generate
         <> metavar "payload,header,..."
         <> value allRequestClasses
         <> showDefaultWith (const (T.unpack (T.intercalate "," (map requestClassText allRequestClasses))))
-        <> help "the request classes; a class without a request compared voids the run"
+        <> help "the request classes; a class without a request compared voids the run. Only all 7 classes can pass; fewer give at best a partial pass (exit 4)"
         )
     <*> option auto
         ( long "count"
@@ -215,7 +204,7 @@ generateOptions = Generate
         ))
     <*> switch
         ( long "same-snapshot"
-        <> help "both nodes were copied from one RocksDB snapshot: also compare plain header ranges (orphans included)"
+        <> help "both nodes were copied from one RocksDB snapshot: also compare plain header ranges (orphans included) and send the Pact set entries marked sameSnapshotOnly (History txids and keylog, keys on a large table), whose cost has no bound on a live node. Never against a production node"
         )
 
 sourceOptions :: Parser Source
@@ -284,7 +273,7 @@ main = do
         ( fullDesc
         <> progDesc "Compare the answers of a test node with those of the oracle"
         <> footer (unwords
-            [ "Exit codes: 0 pass; 2 fail (a difference); 3 void (rerun); 1 bad arguments or a crash."
+            [ "Exit codes: 0 pass; 4 partial pass (no difference, but not all 7 classes); 2 fail (a difference); 3 void (rerun); 1 bad arguments or a crash."
             , "--test-db: use a copy or a stopped node's files only (Pact opens the SQLite files read-write)."
             ])
         )
@@ -318,10 +307,10 @@ main = do
                 targets = sampleTargets spec
             logFunctionText logger Info $ "generating " <> T.pack (show (length targets)) <> " requests"
             (rs, skips) <- generateRequestsSkipping (GenOptions (_genSameSnapshot g)) api pset (_genSeed g) targets
-            forM_ skips $ \(GenSkip (cls, cid, h) e) -> logFunctionText logger Warn $
+            forM_ skips $ \(GenSkip (cls, cid, h) k e) -> logFunctionText logger Warn $
                 "target skipped at generation (" <> requestClassText cls <> ", chain " <> toText cid
-                <> ", height " <> T.pack (show h) <> "): " <> e
-            return (rs, _genClasses g, reportGeneration (length targets) [ c | GenSkip (c, _, _) _ <- skips ])
+                <> ", height " <> T.pack (show h) <> "): " <> k <> ": " <> e
+            return (rs, _genClasses g, reportGeneration (length targets) [ (c, k) | GenSkip (c, _, _) k _ <- skips ])
     let compareWith test = runCompareClasses logger defaultRunOptions classCov oracle test reqs
     rep0 <- case _optTest o of
         TestUrl url -> limiterFor hl url >>= compareWith . Side "test" url

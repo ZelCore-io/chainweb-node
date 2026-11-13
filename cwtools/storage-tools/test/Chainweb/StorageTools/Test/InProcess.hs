@@ -324,14 +324,20 @@ singleRowAccount path = withSqlite path $ \db -> do
     SQ.finalize st
     maybe (throwIO $ userError "fixture: no single-row coin account") return r
 
--- | Changes one byte of the row of a coin account: a digit of its balance.
+-- | Changes one byte of one version of the row of a coin account, a digit of
+-- its balance: the version current after block 7. The other versions keep
+-- the oracle's bytes, so a Differ comes from the version a request reads.
 --
 changeBalanceByte :: FilePath -> T.Text -> IO ()
 changeBalanceByte path acct = withSqlite path $ \db -> do
-    st <- SQ.prepare db "SELECT rowdata FROM [coin_coin-table] WHERE rowkey = ?"
+    -- the version current after block 7: a pinned /local at height 8 runs on
+    -- top of block 7 and reads it
+    st <- SQ.prepare db "SELECT rowdata, txid FROM [coin_coin-table] WHERE rowkey = ? \
+        \AND txid < (SELECT endingtxid FROM BlockHistory WHERE blockheight = 7) ORDER BY txid DESC LIMIT 1"
     SQ.bindText st 1 acct
     _ <- SQ.step st
     old <- SQ.columnBlob st 0
+    txid <- SQ.columnInt64 st 1
     SQ.finalize st
     let (pre, rest) = B.breakSubstring "balance" old
     i <- case B.findIndex (\w -> w >= 48 && w <= 57) rest of
@@ -340,11 +346,14 @@ changeBalanceByte path acct = withSqlite path $ \db -> do
     let d = B.index old i
         d' = if d == 57 then 56 else d + 1
         new = B.take i old <> B.singleton d' <> B.drop (i + 1) old
-    up <- SQ.prepare db "UPDATE [coin_coin-table] SET rowdata = ? WHERE rowkey = ?"
+    up <- SQ.prepare db "UPDATE [coin_coin-table] SET rowdata = ? WHERE rowkey = ? AND txid = ?"
     SQ.bindBlob up 1 new
     SQ.bindText up 2 acct
+    SQ.bindInt64 up 3 txid
     _ <- SQ.step up
     SQ.finalize up
+    -- one version only: the others still give the oracle's bytes
+    SQ.changes db >>= (@?= 1) . (\n -> n :: Int)
 
 -- -------------------------------------------------------------------------- --
 -- Requests
@@ -556,6 +565,11 @@ endToEnd getFx = testGroup "EndToEnd"
                 assertBool ("same 2xx for " <> show cls <> ": " <> summary) (reportSame2xx rep cls > 0)
             -- History reads real state: no Pact failure (gas, or reads not allowed)
             assertEqual ("Pact failures in History: " <> summary) 0 (reportPactFailures rep ClsHistory)
+            -- a preflight at a Pact 4 height succeeds: a 200 answer that is not a Pact failure
+            let pre4 = [ r | r <- reqs, _reqClass r == ClsPreflight, maybe False (< 20) (_reqTarget r) ]
+            rep4 <- runCompareClasses quietLogger defaultRunOptions (const fullCoverage) sa sb pre4
+            assertBool ("a Pact 4 preflight succeeds: " <> T.unpack (reportSummary rep4)) $
+                reportSame2xx rep4 ClsPreflight > reportPactFailures rep4 ClsPreflight
             reportVerdict rep @?= Pass
             -- /poll: the known keys are answered, the unknown ones are not
             mgr <- HTTP.newManager HTTP.defaultManagerSettings
@@ -610,7 +624,7 @@ endToEnd getFx = testGroup "EndToEnd"
                 assertEqual ("all Same: " <> show cls) (length [ () | r <- reqs, _reqClass r == cls ])
                     (reportSame2xx rep cls + reportSameNon2xx rep cls)
             assertBool "a Same 2xx for /local" (reportSame2xx rep ClsLocal > 0)
-            reportVerdict rep @?= Pass
+            reportVerdict rep @?= PartialPass
 
     , testCase "uncovered chain is Skipped NotCovered, never sent to the test side" $ do
         fx <- getFx
@@ -663,7 +677,7 @@ endToEnd getFx = testGroup "EndToEnd"
             poll run >>= assertBool "still paused" . isNothing
             removeFile pause
             rep <- wait run
-            reportVerdict rep @?= Pass
+            reportVerdict rep @?= PartialPass
 
     , testCase "a failed lookup drops the target, counted as generation-skipped; above 1% the run is Void" $ do
         fx <- getFx
@@ -676,14 +690,14 @@ endToEnd getFx = testGroup "EndToEnd"
             map _gsTarget skips @?= [above]
             rep0 <- runCompareClasses quietLogger defaultRunOptions (const fullCoverage) sa sb reqs
             let rep = reportSettings (localSettingsText e2eSettings)
-                    $ reportGeneration (length targets) [ c | GenSkip (c, _, _) _ <- skips ] rep0
+                    $ reportGeneration (length targets) [ (c, k) | GenSkip (c, _, _) k _ <- skips ] rep0
             reportGenSkipped rep ClsLocal @?= 1
             reportVerdict rep @?= Void
             assertBool "a void reason names it" $
                 any ("skipped at generation" `T.isInfixOf`) (reportVoidReasons rep)
             -- exactly 1% is not above 1%; 2% is
-            reportVerdict (reportGeneration 100 [ClsLocal] rep0) @?= Pass
-            reportVerdict (reportGeneration 100 [ClsLocal, ClsLocal] rep0) @?= Void
+            reportVerdict (reportGeneration 100 [(ClsLocal, "an oracle lookup failed")] rep0) @?= PartialPass
+            reportVerdict (reportGeneration 100 (replicate 2 (ClsLocal, "an oracle lookup failed")) rep0) @?= Void
             -- the report and its JSON carry the count and the settings
             let j = toJSON rep
             parseMaybe (withObject "report" $ \o -> o .: "generation" >>= (.: "skipped")) j @?= Just (1 :: Int)
@@ -714,7 +728,7 @@ tests = withResource buildFixture removeFixture $ \getFx -> testGroup "InProcess
         reportDiffCount rep @?= 0
         forM_ [ClsHeader, ClsPayload, ClsLocal] $ \cls ->
             assertEqual ("same 2xx for " <> show cls) 1 (reportSame2xx rep cls)
-        reportVerdict rep @?= Pass
+        reportVerdict rep @?= PartialPass
         -- the /local request reads the account at a Pact 4 height
         st @?= 200
         assertBool ("a successful read of the account: " <> show body) $
@@ -765,7 +779,7 @@ tests = withResource buildFixture removeFixture $ \getFx -> testGroup "InProcess
         rep <- withInProcessSide quietLogger (specFor a) $ \sa ->
             withInProcessSide quietLogger (specFor b) $ \sb ->
                 runCompare quietLogger coverage sa sb reqs
-        reportVerdict rep @?= Pass
+        reportVerdict rep @?= PartialPass
         afterRun <- listing (b </> "rocksDb")
         afterRun @?= before
     ]

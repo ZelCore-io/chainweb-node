@@ -40,12 +40,16 @@ module Chainweb.StorageTools.Compare.Requests
 , requestsForWith
 , generateRequests
 , GenSkip(..)
+, skipNoTx
+, skipLookupFailed
 , generateRequestsSkipping
 , generateWorkers
 , RequestGenError(..)
 , oracleServiceApi
 , apiPrefix
 , txScanWindow
+, txScanMax
+, txScanStep
 , maxRangeExtent
 , maxBatchExtra
 ) where
@@ -208,11 +212,24 @@ newtype GenOptions = GenOptions
 defaultGenOptions :: GenOptions
 defaultGenOptions = GenOptions False
 
--- | Poll and SPV requests look for transactions in this many blocks from
--- the sampled height up.
+-- | Poll and SPV requests look for a block with transactions from the
+-- sampled height up, first in this many blocks, then in windows of
+-- 'txScanStep' blocks, up to 'txScanMax' blocks in all.
 --
 txScanWindow :: Word64
 txScanWindow = 8
+
+txScanStep :: Word64
+txScanStep = 64
+
+-- | A poll or SPV target without a block with a transaction in this many
+-- blocks from the sampled height up (or up to the oracle's tip) is skipped
+-- at generation with the reason 'skipNoTx' (ruling C3 on Task 6): a request
+-- of unknown keys only is answered the same by any two nodes and would be a
+-- hollow pass.
+--
+txScanMax :: Word64
+txScanMax = 1_000
 
 -- | A header range spans up to this many blocks above the sampled height.
 --
@@ -227,7 +244,11 @@ maxBatchExtra = 4
 -- | The oracle could not give what a request needs, or the target cannot
 -- have a request of its class.
 --
-newtype RequestGenError = RequestGenError T.Text
+data RequestGenError
+    = RequestGenError !T.Text
+    | NoTxWithin !Word64 !Word64
+        -- ^ no block with a transaction in the heights [lo, hi] (poll and
+        -- SPV), see 'txScanMax'
     deriving Show
 
 instance Exception RequestGenError
@@ -428,17 +449,29 @@ blockFacts api cid hs = do
         Nothing -> genError ("the oracle did not return the payload " <> _hiPayload h)
         Just p -> return (h, factsOf p)
 
--- | The first block from the sampled height up that has transactions,
--- within 'txScanWindow' blocks; the sampled block if none has.
+-- | The first block from the sampled height up that has transactions: in
+-- 'txScanWindow' blocks, then in windows of 'txScanStep' blocks, up to
+-- 'txScanMax' blocks in all or the oracle's tip. Throws 'NoTxWithin' if
+-- there is none (ruling C3 on Task 6), so a poll or SPV request always has a
+-- request key of a real transaction.
 --
 firstWithTxs :: ServiceApi -> ChainId -> Word64 -> IO (Word64, Facts)
-firstWithTxs api cid t = do
-    hs <- canonicalHeaders api cid t (t + txScanWindow - 1)
-    _ <- headerAt t hs
-    fs <- blockFacts api cid hs
-    return $ case [ x | x@(_, f) <- fs, not (null (_fKeys f)) ] ++ fs of
-        (h, f) : _ -> (_hiHeight h, f)
-        [] -> (t, Facts [] [] [] [] Nothing)
+firstWithTxs api cid t = go t txScanWindow
+  where
+    end = t + txScanMax - 1
+    go lo w = do
+        let hi = min end (lo + w - 1)
+        hs <- canonicalHeaders api cid lo hi
+        when (lo == t) $ void (headerAt t hs)
+        -- the heights from lo up without a gap, so that no block is missed
+        unless (map _hiHeight hs == take (length hs) [lo ..]) $
+            genError ("the oracle's branch from " <> tshow lo <> " to " <> tshow hi <> " has a gap")
+        fs <- if null hs then return [] else blockFacts api cid hs
+        case [ x | x@(_, f) <- fs, not (null (_fKeys f)) ] of
+            (h, f) : _ -> return (_hiHeight h, f)
+            []
+                | hi < end && length hs == fromIntegral (hi - lo + 1) -> go (hi + 1) txScanStep
+                | otherwise -> throwIO (NoTxWithin t (if null hs then lo - 1 else _hiHeight (last hs)))
 
 -- -------------------------------------------------------------------------- --
 -- Requests
@@ -460,9 +493,16 @@ requestsFor = requestsForWith defaultGenOptions
 -- * poll: request keys of the first block with transactions plus one or two
 --   unknown keys;
 -- * spv: a request key of the first block with transactions, to a chain
---   that exists at that height.
+--   that exists at that height;
+-- * poll and spv: the first block with transactions is searched up to
+--   'txScanMax' blocks from the sampled height up; without one, the target
+--   is refused with 'NoTxWithin'.
 --
--- Throws 'RequestGenError' if the oracle cannot give what the request needs.
+-- The Pact set entries marked 'sameSnapshotOnly' are used only with
+-- '_goSameSnapshot' ('generatedEntries').
+--
+-- Throws 'RequestGenError' if the oracle cannot give what the request needs,
+-- and 'NoTxWithin' (poll and spv) if no block has a transaction.
 --
 requestsForWith
     :: GenOptions
@@ -522,8 +562,8 @@ requestsForWith opts api pset seed (cls, cid, BlockHeight t) = case cls of
 
     ClsSpv -> do
         (hit, facts) <- firstWithTxs api cid t
-        let (fallback, g1) = unknownKey g0
-            (key, g2) = pickOr fallback (_fKeys facts) g1
+        -- '_fKeys' is not empty: 'firstWithTxs' found a transaction
+        let (key, g2) = pickOr "" (_fKeys facts) g0
             targets = [ c | c <- sort (HS.toList (chainIds v)), genesisBlockHeight v c <= BlockHeight hit ]
             (trg, _) = pickOr cid targets g2
         return $ request (BlockHeight hit) methodPost "/pact/spv"
@@ -532,14 +572,15 @@ requestsForWith opts api pset seed (cls, cid, BlockHeight t) = case cls of
     _ -> do
         when (cls == ClsHistory && maybe True (\m -> BlockHeight t > m) (historyMaxHeight v)) $
             genError ("no history request above the last Pact 4 height, at " <> tshow t)
-        firstEntry <- case entriesFor pset cls of
+        let entries = generatedEntries (_goSameSnapshot opts) pset cls
+        firstEntry <- case entries of
             [] -> genError ("the Pact set has no entry for the class " <> requestClassText cls)
             e : _ -> return e
         h0 <- canonicalHeaders api cid t t >>= headerAt t
         facts <- blockFacts api cid [h0] >>= \case
             [(_, f)] -> return f
             _ -> genError "the oracle's payload batch has the wrong length"
-        let (entry, g1) = pickOr firstEntry (entriesFor pset cls) g0
+        let (entry, g1) = pickOr firstEntry entries g0
             ((account, keys), g2) = pickOr ("cw-compare", []) (_fAccounts facts) g1
             (txid, g3) = pickOr 0 (_fTxids facts) g2
             (pid, _) = pickOr "cw-compare-no-pact" (_fPactIds facts <> _fKeys facts <> maybeToList (_fCoinbaseKey facts)) g3
@@ -575,14 +616,30 @@ generateWorkers = 8
 --
 data GenSkip = GenSkip
     { _gsTarget :: !(RequestClass, ChainId, BlockHeight)
+    , _gsKind :: !T.Text
+        -- ^ 'skipNoTx' or 'skipLookupFailed'; the report counts skips per
+        -- class and kind
     , _gsReason :: !T.Text
+        -- ^ the details
     }
     deriving (Show, Eq)
+
+-- | The kind of a 'GenSkip' of a poll or SPV target without a transaction
+-- within 'txScanMax' blocks.
+--
+skipNoTx :: T.Text
+skipNoTx = "no tx within 1000 blocks"
+
+-- | The kind of a 'GenSkip' whose oracle lookups failed.
+--
+skipLookupFailed :: T.Text
+skipLookupFailed = "an oracle lookup failed"
 
 -- | 'requestsForWith' for every target, in the order of the targets. A
 -- target whose lookups fail ('RequestGenError', or an HTTP failure after all
 -- attempts) is dropped and returned as a 'GenSkip' (ruling on Task 6a; the
--- report counts them, see 'reportGeneration').
+-- report counts them per kind, see 'reportGeneration'), and so is a poll or
+-- SPV target without a transaction within 'txScanMax' blocks ('NoTxWithin').
 --
 generateRequestsSkipping
     :: GenOptions
@@ -597,8 +654,10 @@ generateRequestsSkipping opts api pset seed targets = do
   where
     one target = try (try (requestsForWith opts api pset seed target)) >>= \case
         Right (Right r) -> return (Right r)
-        Right (Left (RequestGenError e)) -> return (Left (GenSkip target e))
-        Left (e :: HTTP.HttpException) -> return (Left (GenSkip target (tshow e)))
+        Right (Left (RequestGenError e)) -> return (Left (GenSkip target skipLookupFailed e))
+        Right (Left (NoTxWithin lo hi)) -> return (Left (GenSkip target skipNoTx
+            ("no block with a transaction at heights " <> tshow lo <> " to " <> tshow hi)))
+        Left (e :: HTTP.HttpException) -> return (Left (GenSkip target skipLookupFailed (tshow e)))
     chunks [] = []
     chunks xs = let (a, b) = splitAt generateWorkers xs in a : chunks b
 
