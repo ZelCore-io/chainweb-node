@@ -83,7 +83,7 @@ import System.Random (StdGen, mkStdGen, uniformR)
 import Chainweb.BlockHeight
 import Chainweb.ChainId
 import Chainweb.StorageTools.Compare.PactSet
-import Chainweb.StorageTools.Compare.Run (HostLimiters, isPreSendFailure, isRefusal, limiterFor, newCompareManager)
+import Chainweb.StorageTools.Compare.Run (HostLimiters, isPreSendFailure, isRefusal, limiterFor)
 import Chainweb.StorageTools.Compare.Sample (historyMaxHeight)
 import Chainweb.StorageTools.Compare.Types
 import Chainweb.StorageTools.Http
@@ -258,15 +258,16 @@ genError = throwIO . RequestGenError
 
 -- | The oracle's service API, throttled by the limiter of its host from
 -- 'limiterFor': the limiter the oracle 'Side' gets from the same
--- 'HostLimiters'. Its manager is 'newCompareManager' with a response timeout
--- of 120 seconds: no connection is reused, so http-client never sends a
--- lookup again on its own.
+-- 'HostLimiters'.
+--
+-- Its manager keeps connections open between lookups, which are many and
+-- cheap. On a reused connection that closes without an answer (the oracle
+-- closed it while idle), http-client sends the lookup once more on a new
+-- connection. A lookup is a read of headers or payloads, never a @/local@;
+-- the runner's manager ('newCompareManager') reuses no connection.
 --
 oracleServiceApi :: HostLimiters -> ChainwebVersion -> T.Text -> IO ServiceApi
-oracleServiceApi hl v url = do
-    api <- limiterFor hl url >>= newServiceApi url v
-    mgr <- newCompareManager 120_000_000
-    return api { _saManager = mgr }
+oracleServiceApi hl v url = limiterFor hl url >>= newServiceApi url v
 
 -- | @/chainweb/0.0/{version}@
 --
