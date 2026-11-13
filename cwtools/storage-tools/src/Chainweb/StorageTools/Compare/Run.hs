@@ -427,6 +427,8 @@ tipOf env role prefix cid force = do
 -- * The oracle's probe got no HTTP answer: 'Skipped' 'NoOracleAnswer'.
 -- * The oracle's probe answered without block metadata, or the target is
 --   above the oracle's tip: 'Skipped' 'Unpinned'. Both count toward 'Void'.
+--   If the test side's probe got no HTTP answer as well, neither side
+--   answered usefully: 'NoAnswerBoth'.
 -- * The oracle's probe worked and the test side's did not, or the target is
 --   above the test side's tip: 'Differ', since the test side claims to hold
 --   the target.
@@ -454,7 +456,7 @@ sendPinned env r force = case (_reqTarget r, apiPrefixOfPath (_reqPath r)) of
             (Left fo@ProbeNoPin{}, ft) -> do
                 logg Warn $ "the tip probe of the oracle failed: " <> probeText fo
                 return $ Decided (Skipped Unpinned) $ case ft of
-                    Left (ProbeTransport _) -> Just NoAnswerTest
+                    Left (ProbeTransport _) -> Just NoAnswerBoth
                     _ -> Nothing
             (Right _, Left ft) -> return $ Decided
                 (Differ ("the tip probe failed on the test side only: " <> probeText ft))

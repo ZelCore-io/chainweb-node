@@ -424,6 +424,33 @@ reportTests = testGroup "report"
         reportVerdict (run 2) @?= PartialPass
         reportVerdict (run 3) @?= Void
         reportNoAnswer (run 3) NoAnswerOracle @?= 3
+    , testCase "one 1% budget for every inconclusive outcome over the requests sent, with counts per kind" $ do
+        let skipped i r na = Outcome i localReq (Skipped r) Nothing Nothing 1 Nothing na
+            rep = reportGeneration 400 [ (ClsLocal, "an oracle lookup failed") | _ <- [1 .. 3 :: Int] ] $
+                foldl addOutcome emptyReport $
+                    [ skipped 0 PinUnstable Nothing
+                    , skipped 1 PinUnstable Nothing
+                    , skipped 2 Unpinned Nothing
+                    , skipped 3 NoOracleAnswer (Just NoAnswerOracle)
+                    , skipped 4 NoOracleAnswer (Just NoAnswerOracle)
+                    ]
+                    <> [ out i localReq Same Nothing Nothing 1 | i <- [5 .. 299] ]
+        -- each kind alone is within 1% of its old base; together 8 of 300 sent
+        reportSentTotal rep @?= 300
+        reportVerdict rep @?= Void
+        assertBool ("one reason names every kind: " <> show (reportVoidReasons rep)) $ any
+            (\r -> all (`T.isInfixOf` r) ["8 inconclusive of 300", "pin unstable 2", "unpinned after sending 1", "no oracle answer 2", "skipped at generation 3"])
+            (reportVoidReasons rep)
+        assertBool "summary" $ "inconclusive: 8 of 300 sent" `T.isInfixOf` reportSummary rep
+        let json = BL.toStrict (encode rep)
+        assertBool "json" $ all (`B.isInfixOf` json)
+            ["\"inconclusive\":{", "\"total\":8", "\"pinUnstable\":2", "\"noOracleAnswer\":2", "\"generationSkipped\":3"]
+        -- 3 of 300 is within the budget
+        let small = foldl addOutcome emptyReport $
+                [ skipped 0 PinUnstable Nothing, skipped 1 NoOracleAnswer (Just NoAnswerOracle), skipped 2 Unpinned Nothing ]
+                <> [ out i localReq Same Nothing Nothing 1 | i <- [3 .. 299] ]
+        reportVerdict small @?= PartialPass
+
     , testCase "transport failures are counted per side, in the summary and the JSON" $ do
         let rep = foldl addOutcome emptyReport
                 [ Outcome 0 payloadReq (Differ "no answer") (Just (ok "p")) Nothing 1 Nothing (Just NoAnswerTest)
@@ -738,6 +765,12 @@ runTests = testGroup "runCompare"
             reportVerdict rep @?= Void
             n <- probeCount <$> seenPaths so
             n @?= 3
+
+    , testCase "the oracle's tip probe gives no block metadata and the test side no answer: no answer from both" $
+        withSides 1_000 (Just oracleConf { _scProbeFailures = maxBound }) Nothing $ \o t _ _ -> do
+            rep <- runCompareWith quietLogger fastOptions cov o t [localReqAt 100]
+            reportSkippedIn rep ClsLocal Unpinned @?= 1
+            map (reportNoAnswer rep) [NoAnswerTest, NoAnswerOracle, NoAnswerBoth] @?= [0, 0, 1]
 
     , testCase "the test side's tip probe never gives block metadata: Fail" $
         withStubs 1_000 oracleConf testConf { _scProbeFailures = maxBound } $ \o t _ _ -> do

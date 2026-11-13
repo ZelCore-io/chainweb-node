@@ -695,9 +695,10 @@ endToEnd getFx = testGroup "EndToEnd"
             reportVerdict rep @?= Void
             assertBool "a void reason names it" $
                 any ("skipped at generation" `T.isInfixOf`) (reportVoidReasons rep)
-            -- exactly 1% is not above 1%; 2% is
-            reportVerdict (reportGeneration 100 [(ClsLocal, "an oracle lookup failed")] rep0) @?= PartialPass
-            reportVerdict (reportGeneration 100 (replicate 2 (ClsLocal, "an oracle lookup failed")) rep0) @?= Void
+            -- one 1% budget over the requests sent (Task 5 re-review, ruling
+            -- (b)): with one request sent, one skip is above it
+            reportVerdict (reportGeneration 100 [] rep0) @?= PartialPass
+            reportVerdict (reportGeneration 100 [(ClsLocal, "an oracle lookup failed")] rep0) @?= Void
             -- the report and its JSON carry the count and the settings
             let j = toJSON rep
             parseMaybe (withObject "report" $ \o -> o .: "generation" >>= (.: "skipped")) j @?= Just (1 :: Int)

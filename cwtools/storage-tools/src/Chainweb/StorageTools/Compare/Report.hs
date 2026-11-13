@@ -42,6 +42,7 @@ module Chainweb.StorageTools.Compare.Report
 , reportPinUnstable
 , reportUnpinnedSent
 , reportNoAnswer
+, reportInconclusive
 , reportCompared
 , reportPactFailures
 , reportExpectClasses
@@ -358,6 +359,24 @@ reportUnpinnedSent = _repUnpinnedSent
 reportNoAnswer :: Report -> NoAnswer -> Int
 reportNoAnswer rep na = M.findWithDefault 0 na (_repNoAnswer rep)
 
+-- | The inconclusive outcomes of a run, which share one budget of 1% of the
+-- requests sent (ruling (b) on the Task 5 re-review): 'PinUnstable',
+-- 'Unpinned' after sending, 'NoOracleAnswer', and the targets skipped at
+-- generation ('reportGeneration').
+--
+reportInconclusive :: Report -> Int
+reportInconclusive rep = sum (map snd (inconclusiveKinds rep))
+
+-- | The kinds of 'reportInconclusive' with their counts.
+--
+inconclusiveKinds :: Report -> [(T.Text, Int)]
+inconclusiveKinds rep =
+    [ ("pin unstable", _repPinUnstable rep)
+    , ("unpinned after sending", _repUnpinnedSent rep)
+    , ("no oracle answer", reportSkippedFor rep NoOracleAnswer)
+    , ("skipped at generation", reportGenSkippedTotal rep)
+    ]
+
 -- | The number of requests whose answers were judged: same, allowed or
 -- different.
 --
@@ -530,12 +549,11 @@ reportMissingClasses rep = filter (not . covers) allRequestClasses
 --   compared, even if it has no request at all;
 -- * poll or spv is a class of a generated run, but no request of it with a
 --   real key was compared ('reportRealKeyCompared', ruling C3 on Task 6);
--- * 'PinUnstable' and 'Unpinned' requests that were sent are together more
---   than 1% of the pinned requests that were sent;
--- * 'NoOracleAnswer' requests (no HTTP answer from the oracle, or from
---   neither side) are more than 1% of the requests that were sent;
--- * the targets dropped at generation ('reportGeneration') are more than 1%
---   of the targets sampled.
+-- * the inconclusive outcomes ('reportInconclusive': 'PinUnstable',
+--   'Unpinned' after sending, 'NoOracleAnswer', and the targets dropped at
+--   generation) are together more than 1% of the requests sent. One budget
+--   for all of them, as spec 10.1 states the 1% as one fraction (ruling (b)
+--   on the Task 5 re-review); the report keeps the count of each kind.
 --
 reportVoidReasons :: Report -> [T.Text]
 reportVoidReasons rep = concat
@@ -559,30 +577,23 @@ reportVoidReasons rep = concat
       , reportComparedIn rep c > 0
       , reportRealKeyCompared rep c == 0
       ]
-    , [ sh pu <> " pin unstable and " <> sh up <> " unpinned after sending of "
-        <> sh pinned <> " pinned requests sent, more than 1%"
-      | pinned > 0
-      , 100 * (pu + up) > pinned
-      ]
-    , [ sh noa <> " requests without an answer from the oracle of " <> sh sent <> " sent, more than 1%"
-      | sent > 0
-      , 100 * noa > sent
-      ]
-    , [ sh gs <> " of " <> sh gt <> " targets skipped at generation (" <> genSkipKinds rep <> "), more than 1%"
-      | gt > 0
-      , 100 * gs > gt
+    , [ sh inc <> " inconclusive of " <> sh sent <> " requests sent, more than 1%: " <> inconclusiveText rep
+      | inc > 0
+      , 100 * inc > sent
       ]
     ]
   where
     sent = reportSentTotal rep
-    noa = reportSkippedFor rep NoOracleAnswer
-    pinned = _repPinned rep
-    pu = _repPinUnstable rep
-    up = _repUnpinnedSent rep
-    gt = _repGenTargets rep
-    gs = reportGenSkippedTotal rep
+    inc = reportInconclusive rep
     sh :: Int -> T.Text
     sh = T.pack . show
+
+-- | The inconclusive outcomes per kind, the skips at generation per kind
+-- too.
+--
+inconclusiveText :: Report -> T.Text
+inconclusiveText rep = T.intercalate ", " [ k <> " " <> T.pack (show n) | (k, n) <- inconclusiveKinds rep ]
+    <> if reportGenSkippedTotal rep > 0 then " (" <> genSkipKinds rep <> ")" else ""
 
 -- | The skips at generation per kind, for example @no tx within 1000 blocks:
 -- 3, an oracle lookup failed: 1@.
@@ -679,6 +690,8 @@ reportSummary rep = T.unlines $
         <> ", pinned requests sent: " <> sh (_repPinned rep)
         <> ", pin unstable: " <> sh (_repPinUnstable rep)
         <> ", unpinned after sending: " <> sh (_repUnpinnedSent rep)
+    , "inconclusive: " <> sh (reportInconclusive rep) <> " of " <> sh (reportSentTotal rep)
+        <> " sent (budget 1%): " <> inconclusiveText rep
     , "no HTTP answer (" <> T.intercalate ", " (map noAnswerText [minBound .. maxBound]) <> "): "
         <> T.intercalate " / " [ sh (reportNoAnswer rep na) | na <- [minBound .. maxBound] ]
     , ""
@@ -747,6 +760,14 @@ instance ToJSON Report where
         , "pinnedSent" .= _repPinned rep
         , "pinUnstable" .= _repPinUnstable rep
         , "unpinnedSent" .= _repUnpinnedSent rep
+        , "inconclusive" .= object
+            [ "total" .= reportInconclusive rep
+            , "sent" .= reportSentTotal rep
+            , "pinUnstable" .= _repPinUnstable rep
+            , "unpinnedSent" .= _repUnpinnedSent rep
+            , "noOracleAnswer" .= reportSkippedFor rep NoOracleAnswer
+            , "generationSkipped" .= reportGenSkippedTotal rep
+            ]
         , "noAnswer" .= object
             [ K.fromText (noAnswerText na) .= reportNoAnswer rep na | na <- [minBound .. maxBound] ]
         , "perClass" .= object
