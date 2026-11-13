@@ -48,18 +48,30 @@ tests = testGroup "Http"
 
 limiterTests :: TestTree
 limiterTests = testGroup "Limiter"
-    [ testCase "8 threads, 50 permits at 20 r/s take at least 2.4 s and under 4 s" $ do
-        lim <- newLimiter 20 Nothing
+    [ testCase "8 threads, 50 permits at 20 r/s take 49 / 20 s plus at most 1.5 s" $ do
+        let rate = 20 :: Double
+            permits = 50 :: Int
+            -- With a burst size of 1, N permits take at least (N - 1) / rate:
+            -- 2.45 s. The 0.05 s below it only absorb clock rounding.
+            lower = fromIntegral (permits - 1) / rate
+            -- The slack above it is for thread wake-ups on a loaded machine
+            -- (tasty runs the suite's tests in parallel). Each of the 8
+            -- threads holds a reserved slot at an absolute time, so a wake-up
+            -- less than 8 slots (0.4 s) late does not push later slots back;
+            -- mostly the last permit's delay adds to the total. 1.5 s still
+            -- fails a limiter that runs at half the rate, which needs 4.9 s.
+            upper = lower + 1.5
+        lim <- newLimiter rate Nothing
         t0 <- getMonotonicTime
         -- 7 + 7 + 6 * 6 = 50 permits
         mapConcurrently_ (\n -> replicateM_ n (throttled lim (return ())))
             [7, 7, 6, 6, 6, 6, 6, 6]
         t1 <- getMonotonicTime
         let dt = t1 - t0
-        assertBool ("took " <> show dt <> " s, expected at least 2.4 s") (dt >= 2.4)
-        assertBool ("took " <> show dt <> " s, expected under 4 s") (dt < 4)
+        assertBool ("took " <> show dt <> " s, expected at least " <> show lower <> " s") (dt >= lower - 0.05)
+        assertBool ("took " <> show dt <> " s, expected under " <> show upper <> " s") (dt < upper)
         n <- limiterPermits lim
-        assertEqual "number of permits" 50 n
+        assertEqual "number of permits" (fromIntegral permits) n
 
     , testCase "no permit while the pause file exists; resumes within 1 s of removal" $
         withSystemTempDirectory "limiter-pause" $ \dir -> do
