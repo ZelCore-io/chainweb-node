@@ -71,6 +71,6 @@ main = do
         <> progDesc "Offline, in-place conversions of the RocksDB database of a stopped node"
         )
     db <- rocksDbDir dir
-    migrate logger db step defaultMigrateOpts
+    exitWith =<< runMigrate logger db step defaultMigrateOpts
   where
     logger = genericLogger Info (T.hPutStrLn stderr)

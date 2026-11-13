@@ -20,17 +20,23 @@ module Chainweb.StorageTools.Test.Migrate
 import Control.Exception (SomeException, try)
 import Control.Monad
 
+import Data.Bits (complement)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as B8
+import Data.IORef
 import qualified Data.Map.Strict as M
 import qualified Data.Set as S
 import Data.Text (Text)
+import qualified Data.Text as T
+import qualified Data.Text.Encoding as T
 
 import Options.Applicative
 
 import System.Directory
+import System.Exit (ExitCode(..))
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
+import System.LogLevel (LogLevel(..))
 
 import Test.Tasty
 import Test.Tasty.HUnit
@@ -38,6 +44,7 @@ import Test.Tasty.HUnit
 -- internal modules
 
 import Chainweb.Chainweb.Configuration (PayloadCompression(..))
+import Chainweb.Logger (GenericLogger, genericLogger)
 import Chainweb.Payload
 import Chainweb.Payload.PayloadStore
 import Chainweb.Payload.PayloadStore.RocksDB
@@ -228,6 +235,26 @@ assertTreeFilesGone msg db nss = forM_ nss $ \ns -> do
     fs <- filesOverlapping db ns
     assertEqual (msg <> ": live files that overlap " <> B8.unpack ns) [] fs
 
+-- | The namespaces in the progress file.
+--
+doneKeys :: FilePath -> IO (S.Set Text)
+doneKeys db = _progressDone <$> readProgress db
+
+-- | Runs an action with a logger at level 'Info' and returns the log lines.
+--
+capturing :: (GenericLogger -> IO a) -> IO (a, [Text])
+capturing act = do
+    ref <- newIORef []
+    a <- act $ genericLogger Info $ \t -> atomicModifyIORef' ref (\ls -> (t : ls, ()))
+    ls <- reverse <$> readIORef ref
+    return (a, ls)
+
+-- | A log line names the namespace and contains the text.
+--
+assertLogged :: [Text] -> B.ByteString -> Text -> Assertion
+assertLogged logs ns txt = assertBool ("a log line names " <> B8.unpack ns <> " and says " <> show txt <> ": " <> show logs) $
+    any (\l -> T.decodeUtf8 ns `T.isInfixOf` l && txt `T.isInfixOf` l) logs
+
 keysOf :: MigrateStep -> [B.ByteString] -> S.Set Text
 keysOf step = S.fromList . fmap (progressKey step)
 
@@ -274,7 +301,7 @@ tests = testGroup "Migrate"
     , testCase "stop after namespace 2, rerun: final state equals an uninterrupted run; progress lists all" $
         withFixture $ \dir db -> do
             let other = dir </> "uninterrupted"
-                stop2 = MigrateOpts (Just 2)
+                stop2 = defaultMigrateOpts { _moStopAfter = Just 2 }
             copyDb db other
 
             migrateTrees silent db stop2
@@ -312,6 +339,73 @@ tests = testGroup "Migrate"
             assertEqual "progress of the uninterrupted run" allKeys done'
             assertNamespacesZstd "interrupted" db payloadNamespaces
             assertNamespacesZstd "uninterrupted" other payloadNamespaces
+
+    , testCase "payloads: a namespace whose compaction did not happen fails its check: exit 1, named, not marked done; a rerun completes" $
+        withFixture $ \_ db -> do
+            let victim = payloadNamespaces !! 2
+                skip = defaultMigrateOpts { _moSkipWork = [victim] }
+            assertEqual "the victim" "BlockPayload2" victim
+            (code, logs) <- capturing $ \l -> runMigrate l db MigratePayloads skip
+            assertEqual "exit code" (ExitFailure 1) code
+            assertLogged logs victim "not ZSTD"
+            r <- try @MigrateException $ migratePayloads silent db skip
+            case r of
+                Left (NamespaceFailed step ns _) -> assertEqual "the failure" (MigratePayloads, victim) (step, ns)
+                Right () -> assertFailure "migratePayloads did not fail"
+            done <- doneKeys db
+            assertEqual "progress: the namespaces before it, and not it"
+                (keysOf MigratePayloads (take 2 payloadNamespaces)) done
+            assertNamespacesSnappy "the namespace that failed" db [victim]
+            code' <- runMigrate silent db MigratePayloads defaultMigrateOpts
+            assertEqual "exit code of the rerun" ExitSuccess code'
+            done' <- doneKeys db
+            assertEqual "progress after the rerun" (keysOf MigratePayloads payloadNamespaces) done'
+            assertNamespacesZstd "after the rerun" db payloadNamespaces
+
+    , testCase "trees: a namespace whose delete and compaction did not happen fails its check: exit 1, named, not marked done; a rerun completes" $
+        withFixture $ \_ db -> do
+            let victim = treeNamespaces !! 2
+                skip = defaultMigrateOpts { _moSkipWork = [victim] }
+            assertEqual "the victim" "OutputTree" victim
+            (code, logs) <- capturing $ \l -> runMigrate l db MigrateTrees skip
+            assertEqual "exit code" (ExitFailure 1) code
+            assertLogged logs victim "still has entries"
+            done <- doneKeys db
+            assertEqual "progress: the namespaces before it, and not it"
+                (keysOf MigrateTrees (take 2 treeNamespaces)) done
+            sizes <- namespaceSizes db [victim]
+            assertBool "the namespace that failed has its entries" (all ((> 0) . snd) sizes)
+            code' <- runMigrate silent db MigrateTrees defaultMigrateOpts
+            assertEqual "exit code of the rerun" ExitSuccess code'
+            done' <- doneKeys db
+            assertEqual "progress after the rerun" (keysOf MigrateTrees treeNamespaces) done'
+            sizes' <- namespaceSizes db treeNamespaces
+            assertEqual "tree namespaces after the rerun" [(ns, 0) | ns <- treeNamespaces] sizes'
+            assertTreeFilesGone "after the rerun" db treeNamespaces
+
+    , testCase "payloads: a compaction that fails (a corrupt block) raises rocksdb.background-errors: exit 1, named, not marked done; a rerun after the repair completes" $
+        withFixture $ \_ db -> do
+            let victim = payloadNamespaces !! 4
+            assertEqual "the victim" "BlockTransactions2" victim
+            f <- filesOverlapping db victim >>= \case
+                f : _ -> return $ liveFilePath db f
+                [] -> assertFailure "no file of the victim"
+            original <- B.readFile f
+            -- the first data block starts at offset 0; its checksum no longer
+            -- matches, which the compaction detects when it reads the block
+            B.writeFile f $ B.map complement (B.take 16 original) <> B.drop 16 original
+            (code, logs) <- capturing $ \l -> runMigrate l db MigratePayloads defaultMigrateOpts
+            assertEqual "exit code" (ExitFailure 1) code
+            assertLogged logs victim "rocksdb.background-errors went from 0 to 1"
+            done <- doneKeys db
+            assertEqual "progress: the namespaces before it, and not it"
+                (keysOf MigratePayloads (take 4 payloadNamespaces)) done
+            B.writeFile f original
+            code' <- runMigrate silent db MigratePayloads defaultMigrateOpts
+            assertEqual "exit code of the rerun" ExitSuccess code'
+            done' <- doneKeys db
+            assertEqual "progress after the rerun" (keysOf MigratePayloads payloadNamespaces) done'
+            assertNamespacesZstd "after the rerun" db payloadNamespaces
 
     , testCase "rerun after completion changes nothing" $
         withFixture $ \dir db -> do

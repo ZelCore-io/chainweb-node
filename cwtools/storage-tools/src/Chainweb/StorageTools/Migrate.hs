@@ -1,7 +1,10 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE NumericUnderscores #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TypeApplications #-}
 
 -- |
 -- Module: Chainweb.StorageTools.Migrate
@@ -21,6 +24,14 @@
 -- is simply done again. No namespace outside of the two lists is deleted or
 -- written.
 --
+-- A namespace is recorded as done only after its work was verified (see
+-- 'compactNamespaceChecked' and 'verifyNamespace'): the compaction did not
+-- raise RocksDB's count of background errors, and afterwards a tree namespace
+-- has no entries and every live file that overlaps a payload namespace is
+-- ZSTD. If the work on a namespace fails, the step stops with
+-- 'NamespaceFailed', which names the namespace, and the namespace is not
+-- recorded, so that a rerun retries it.
+--
 -- The database is opened read-write, which takes the RocksDB @LOCK@ file. A
 -- running node holds that lock, so the steps fail before they change
 -- anything if a node (or another migration) uses the database. A step whose
@@ -36,6 +47,12 @@ module Chainweb.StorageTools.Migrate
 , migrateTrees
 , migratePayloads
 , migrate
+, runMigrate
+, MigrateException(..)
+
+  -- * Checks
+, compactNamespaceChecked
+, verifyNamespace
 
   -- * Namespaces
 , treeNamespaces
@@ -57,12 +74,15 @@ module Chainweb.StorageTools.Migrate
 , writeProgress
 ) where
 
-import Control.Exception (bracket, throwIO)
+import Control.Concurrent (threadDelay)
+import Control.Exception
 import Control.Monad
 
-import Data.Aeson
+import Data.Aeson hiding (Error)
 import qualified Data.ByteString as B
+import qualified Data.ByteString.Char8 as B8
 import qualified Data.ByteString.Lazy as BL
+import qualified Data.Map.Strict as M
 import qualified Data.Set as S
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
@@ -77,16 +97,20 @@ import qualified GHC.IO.Encoding as GHC
 
 import System.Clock
 import System.Directory (doesFileExist, renameFile)
+import System.Exit (ExitCode(..))
 import System.FilePath ((</>), takeDirectory)
 import System.LogLevel
 import System.Posix.IO (OpenMode(..), closeFd, defaultFileFlags, openFd)
 import System.Posix.Unistd (fileSynchronise)
+
+import Text.Read (readMaybe)
 
 -- internal modules
 
 import qualified Database.RocksDB.Internal as R
 
 import Chainweb.Logger
+import Chainweb.Storage.Table
 import Chainweb.Storage.Table.RocksDB
 import Chainweb.Storage.Table.RocksDB.Tuning
 import Chainweb.StorageTools.RangeDb (rawTable)
@@ -209,15 +233,42 @@ stepNamespaces :: MigrateStep -> [B.ByteString]
 stepNamespaces MigrateTrees = treeNamespaces
 stepNamespaces MigratePayloads = payloadNamespaces
 
-newtype MigrateOpts = MigrateOpts
-    { _moStopAfter :: Maybe Int
+data MigrateOpts = MigrateOpts
+    { _moStopAfter :: !(Maybe Int)
         -- ^ test hook: return after this many namespaces were done in this
         -- run, as if the process had been stopped.
+    , _moSkipWork :: ![B.ByteString]
+        -- ^ test hook: the work on these namespaces is skipped, as if it had
+        -- failed without an error. The check of the namespace must then
+        -- fail.
     }
     deriving (Show, Eq)
 
 defaultMigrateOpts :: MigrateOpts
-defaultMigrateOpts = MigrateOpts Nothing
+defaultMigrateOpts = MigrateOpts
+    { _moStopAfter = Nothing
+    , _moSkipWork = []
+    }
+
+-- | The work on a namespace failed, or its check failed. The namespace is not
+-- marked as done, so that a rerun retries it.
+--
+data MigrateException = NamespaceFailed !MigrateStep !B.ByteString !T.Text
+    deriving (Eq)
+
+instance Show MigrateException where
+    show (NamespaceFailed step ns reason) = "storage-migrate " <> T.unpack (migrateStepName step)
+        <> ": namespace " <> B8.unpack ns <> " failed and is not marked as done (a rerun retries it): "
+        <> T.unpack reason
+
+instance Exception MigrateException
+
+-- | A failed check of 'compactNamespaceChecked' or 'verifyNamespace'.
+--
+newtype CheckFailed = CheckFailed T.Text
+    deriving (Show)
+
+instance Exception CheckFailed
 
 -- -------------------------------------------------------------------------- --
 -- Progress
@@ -278,7 +329,8 @@ fsyncPath path = bracket (openFd path ReadOnly defaultFileFlags) closeFd fileSyn
 -- | Deletes the namespaces of 'treeNamespaces', one after the other: a range
 -- delete of the namespace, a flush that puts the range tombstone into an SST
 -- file, and a forced compaction of the range, which drops the entries from
--- the files. Then the namespace is marked as done.
+-- the files. The namespace is marked as done once the compaction succeeded
+-- and the namespace has no entries.
 --
 -- The compaction writes its files with the compression of the database: with
 -- zstd-dict once any payload namespace is done (see 'migratePayloads'),
@@ -289,8 +341,9 @@ migrateTrees l db = migrate l db MigrateTrees
 
 -- | Rewrites the namespaces of 'payloadNamespaces', one after the other, with
 -- a forced compaction of the range under 'payloadZstdTuning', so that every
--- file of the range is written with zstd and a dictionary. Then the namespace
--- is marked as done. Keys and values do not change.
+-- file of the range is written with zstd and a dictionary. The namespace is
+-- marked as done once the compaction succeeded and every live file that
+-- overlaps the namespace is ZSTD. Keys and values do not change.
 --
 migratePayloads :: Logger l => l -> FilePath -> MigrateOpts -> IO ()
 migratePayloads l db = migrate l db MigratePayloads
@@ -319,7 +372,7 @@ migrate l db step opts = do
             foldM_ (\done ns -> do
                 t0 <- getTime Monotonic
                 logg Info $ "storage-migrate " <> stepName <> ": " <> nsText ns <> ": start"
-                migrateNamespace rdb ns
+                runNamespace rdb ns
                 let done' = S.insert (progressKey step ns) done
                 writeProgress db (Progress done')
                 t1 <- getTime Monotonic
@@ -345,9 +398,96 @@ migrate l db step opts = do
                 payloadZstdTuning
             | otherwise -> defaultTuning
 
-    migrateNamespace rdb ns = do
-        let tbl = rawTable rdb ns
-        when (step == MigrateTrees) $ do
-            deleteRangeRocksDb tbl (Nothing, Nothing)
-            flushRocksDb rdb
-        compactRangeForced tbl (Nothing, Nothing)
+    -- the work on a namespace and its check; any failure is a
+    -- 'NamespaceFailed', which leaves the namespace out of the progress file
+    runNamespace rdb ns = (migrateNamespace rdb ns >> verifyNamespace rdb db step ns) `catch` \e -> if
+        | Just (_ :: SomeAsyncException) <- fromException e -> throwIO e
+        | Just (nf :: MigrateException) <- fromException e -> throwIO nf
+        | Just (CheckFailed reason) <- fromException e -> throwIO $ NamespaceFailed step ns reason
+        | otherwise -> throwIO $ NamespaceFailed step ns (T.pack $ displayException e)
+
+    migrateNamespace rdb ns
+        | ns `elem` _moSkipWork opts =
+            logg Warn $ "storage-migrate " <> stepName <> ": " <> nsText ns <> ": test hook: the work is skipped"
+        | otherwise = do
+            when (step == MigrateTrees) $ do
+                let tbl = rawTable rdb ns
+                deleteRangeRocksDb tbl (Nothing, Nothing)
+                flushRocksDb rdb
+            compactNamespaceChecked rdb ns
+
+-- | 'migrate' for a command line: a failure is logged at level 'Error' and
+-- gives @ExitFailure 1@.
+--
+runMigrate :: Logger l => l -> FilePath -> MigrateStep -> MigrateOpts -> IO ExitCode
+runMigrate l db step opts = try (migrate l db step opts) >>= \case
+    Right () -> return ExitSuccess
+    Left (e :: SomeException)
+        | Just (_ :: SomeAsyncException) <- fromException e -> throwIO e
+        | otherwise -> do
+            logFunctionText l Error $ T.pack $ displayException e
+            return $ ExitFailure 1
+
+-- -------------------------------------------------------------------------- --
+-- Checks
+
+-- | 'compactRangeForced' of a namespace, which throws if the compaction
+-- failed.
+--
+-- @rocksdb_compact_range_opt@ discards the status of the compaction. RocksDB
+-- 8.3.2 counts every failed compaction, manual ones included, in the property
+-- @rocksdb.background-errors@ (@DBImpl::BackgroundCallCompaction@), so the
+-- property is read before and after the compaction.
+--
+compactNamespaceChecked :: RocksDb -> B.ByteString -> IO ()
+compactNamespaceChecked rdb ns = do
+    e0 <- backgroundErrors rdb
+    compactRangeForced (rawTable rdb ns) (Nothing, Nothing)
+    e1 <- backgroundErrors rdb
+    when (e1 > e0) $ throwIO $ CheckFailed $
+        "the compaction failed: rocksdb.background-errors went from " <> sshow e0 <> " to " <> sshow e1
+        <> "; the LOG file of the database has the error"
+
+backgroundErrors :: RocksDb -> IO Integer
+backgroundErrors rdb = rocksDbProperty rdb "rocksdb.background-errors" >>= \case
+    Just v | Just n <- readMaybe (B8.unpack v) -> return n
+    v -> throwIO $ CheckFailed $ "cannot read rocksdb.background-errors: " <> sshow v
+
+-- | The check of a namespace after its work, before it is marked as done:
+--
+-- * @trees@: the namespace has no entries;
+-- * @payloads@: every live SST file whose key range overlaps the namespace is
+--   ZSTD.
+--
+-- The compression of the files is read from their table properties
+-- ('sstCompressionInfo', which opens a read-only instance of the database).
+-- An automatic compaction can replace live files while they are read; the
+-- check is then repeated, up to five times.
+--
+verifyNamespace :: RocksDb -> FilePath -> MigrateStep -> B.ByteString -> IO ()
+verifyNamespace rdb _ MigrateTrees ns = do
+    e <- withTableIterator (rawTable rdb ns) iterEntry
+    forM_ e $ \(Entry k _) -> throwIO $ CheckFailed $
+        "the namespace still has entries after the delete and the compaction, for instance the key " <> sshow k
+verifyNamespace rdb db MigratePayloads ns = go (1 :: Int)
+  where
+    attempts = 5
+    go i = do
+        files <- filter (overlapsNamespace rdb ns) <$> liveFileRanges rdb
+        unless (null files) $ try @IOException (sstCompressionInfo db) >>= \case
+            Left e
+                | i < attempts -> retry i
+                | otherwise -> throwIO $ CheckFailed $
+                    "cannot read the compression of the live files: " <> T.pack (displayException e)
+            Right info -> do
+                let found = [(f, M.lookup (liveFilePath db f) info) | f <- files]
+                    notZstd = [(_lfName f, c) | (f, Just (c, _)) <- found, c /= "ZSTD"]
+                    missing = [_lfName f | (f, Nothing) <- found]
+                if
+                    | not (null notZstd) -> throwIO $ CheckFailed $
+                        "live files of the namespace are not ZSTD after the compaction: " <> sshow notZstd
+                    | not (null missing) && i < attempts -> retry i
+                    | not (null missing) -> throwIO $ CheckFailed $
+                        "the live files changed while their compression was read: " <> sshow missing
+                    | otherwise -> return ()
+    retry i = threadDelay 1_000_000 >> go (i + 1)
