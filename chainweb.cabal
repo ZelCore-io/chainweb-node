@@ -316,6 +316,7 @@ library
         , Chainweb.Pact.Backend.PactState.GrandHash.Utils
         , Chainweb.Pact.Backend.SQLite.DirectV2
         , Chainweb.Pact.Backend.SQLite.V2
+        , Chainweb.Pact.Backend.Store.Cold.Key
         , Chainweb.Pact.Backend.InMemDb
         , Chainweb.Pact.Backend.Types
         , Chainweb.Pact.Backend.Utils
@@ -667,6 +668,7 @@ test-suite chainweb-tests
         Chainweb.Test.Pact5.SPVTest
         Chainweb.Test.Pact5.TransactionExecTest
         Chainweb.Test.Pact5.TransactionTests
+        Chainweb.Test.Pact.Store.ColdKey
         Chainweb.Test.ResponseSizeLimiter
         Chainweb.Test.RestAPI
         Chainweb.Test.Roundtrips

@@ -56,6 +56,7 @@ import qualified Chainweb.Test.Mempool.Sync (tests)
 import qualified Chainweb.Test.MinerReward (tests)
 import qualified Chainweb.Test.Mining (tests)
 import qualified Chainweb.Test.Misc (tests)
+import qualified Chainweb.Test.Pact.Store.ColdKey (tests)
 import qualified Chainweb.Test.Pact4.Checkpointer (tests)
 import qualified Chainweb.Test.Pact4.DbCacheTest (tests)
 import qualified Chainweb.Test.Pact4.GrandHash (tests)
@@ -180,6 +181,7 @@ suite rdb =
         , Chainweb.Test.Mining.tests rdb
         , Chainweb.Test.MinerReward.tests
         , Chainweb.Test.Misc.tests
+        , Chainweb.Test.Pact.Store.ColdKey.tests
         , Chainweb.Test.BlockHeader.Genesis.tests
         , Chainweb.Test.BlockHeader.Validation.tests
         , Chainweb.Test.Version.tests
