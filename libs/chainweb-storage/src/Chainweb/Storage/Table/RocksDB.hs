@@ -47,6 +47,9 @@ module Chainweb.Storage.Table.RocksDB
   , withRocksDb
   , withReadOnlyRocksDb
   , withTempRocksDb
+  , withRocksDbTuned
+  , withReadOnlyRocksDbTuned
+  , withTempRocksDbTuned
   , destroyRocksDb
   , resetOpenRocksDb
   , modernDefaultOptions
@@ -86,6 +89,11 @@ module Chainweb.Storage.Table.RocksDB
   , deleteRangeRocksDb
   , deleteNamespaceRocksDb
   , compactRangeRocksDb
+  , compactRangeForced
+  , compactAllForced
+  , flushRocksDb
+  , rocksDbProperty
+  , approximateSize
   ) where
 
 import Control.Exception(evaluate)
@@ -104,6 +112,7 @@ import Data.Foldable
 import Data.Maybe
 
 import Chainweb.Storage.Table
+import Chainweb.Storage.Table.RocksDB.Tuning
 import Data.String
 import qualified Data.Text as T
 
@@ -250,24 +259,43 @@ closeRocksDb (RocksDb (R.DB db_ptr) _) = C.c_rocksdb_close db_ptr
 -- the provided directory path, a new database is created.
 --
 withRocksDb :: FilePath -> R.Options -> (RocksDb -> IO a) -> IO a
-withRocksDb path opts act =
-    withOpts opts $ \(R.Options' opts_ptr _ _) ->
+withRocksDb path opts = withRocksDbTuned path opts defaultTuning
+
+-- | 'withRocksDb' with a 'RocksDbTuning' applied to the options before the
+-- database is opened.
+--
+withRocksDbTuned :: FilePath -> R.Options -> RocksDbTuning -> (RocksDb -> IO a) -> IO a
+withRocksDbTuned path opts tuning act =
+    withOpts opts $ \(R.Options' opts_ptr _ _) -> do
+        applyTuning tuning opts_ptr
         bracket (openRocksDb path opts_ptr) closeRocksDb act
 
 -- | Provide a computation with a read-only 'RocksDb' instance. If no rocks db exists at
 -- the provided directory path, a new database is created(?) TODO
 --
 withReadOnlyRocksDb :: FilePath -> R.Options -> (RocksDb -> IO a) -> IO a
-withReadOnlyRocksDb path opts act =
-    withOpts opts $ \(R.Options' opts_ptr _ _) ->
+withReadOnlyRocksDb path opts = withReadOnlyRocksDbTuned path opts defaultTuning
+
+-- | 'withReadOnlyRocksDb' with a 'RocksDbTuning' applied to the options before
+-- the database is opened.
+--
+withReadOnlyRocksDbTuned :: FilePath -> R.Options -> RocksDbTuning -> (RocksDb -> IO a) -> IO a
+withReadOnlyRocksDbTuned path opts tuning act =
+    withOpts opts $ \(R.Options' opts_ptr _ _) -> do
+        applyTuning tuning opts_ptr
         bracket (openReadOnlyRocksDb path opts_ptr) closeRocksDb act
 
 -- | Provide a computation with a temporary 'RocksDb'. The database is deleted
 -- when the computation exits.
 --
 withTempRocksDb :: String -> (RocksDb -> IO a) -> IO a
-withTempRocksDb template f = withSystemTempDirectory template $ \dir ->
-    withRocksDb dir modernDefaultOptions f
+withTempRocksDb template = withTempRocksDbTuned template defaultTuning
+
+-- | 'withTempRocksDb' with a 'RocksDbTuning'.
+--
+withTempRocksDbTuned :: String -> RocksDbTuning -> (RocksDb -> IO a) -> IO a
+withTempRocksDbTuned template tuning f = withSystemTempDirectory template $ \dir ->
+    withRocksDbTuned dir modernDefaultOptions tuning f
 
 -- | Delete the RocksDb instance.
 --
@@ -719,6 +747,86 @@ compactRangeRocksDb table range =
   where
     !range' = validateRangeOrdered table range
     R.DB dbPtr = _rocksDbTableDb table
+
+-- | Like 'compactRangeRocksDb', but the bottommost level is always rewritten
+-- (@BottommostLevelCompaction::kForce@). All files in the range are rewritten
+-- with the current options, for instance with a new compression.
+--
+compactRangeForced :: HasCallStack => RocksDbTable k v -> (Maybe k, Maybe k) -> IO ()
+compactRangeForced table range =
+    withForcedCompactOptions $ \copts ->
+    BU.unsafeUseAsCStringLen (fst range') $ \(minKeyPtr, minKeyLen) ->
+    BU.unsafeUseAsCStringLen (snd range') $ \(maxKeyPtr, maxKeyLen) ->
+        c_rocksdb_compact_range_opt dbPtr copts
+            minKeyPtr (fromIntegral minKeyLen :: CSize)
+            maxKeyPtr (fromIntegral maxKeyLen :: CSize)
+  where
+    !range' = validateRangeOrdered table range
+    R.DB dbPtr = _rocksDbTableDb table
+
+-- | Compacts the whole database and rewrites the bottommost level
+-- (@BottommostLevelCompaction::kForce@), so that every SST file is written
+-- with the current options.
+--
+compactAllForced :: RocksDb -> IO ()
+compactAllForced db =
+    withForcedCompactOptions $ \copts ->
+        c_rocksdb_compact_range_opt dbPtr copts nullPtr 0 nullPtr 0
+  where
+    R.DB dbPtr = _rocksDbHandle db
+
+withForcedCompactOptions :: (Ptr CompactOptions -> IO a) -> IO a
+withForcedCompactOptions act =
+    bracket c_rocksdb_compactoptions_create c_rocksdb_compactoptions_destroy $ \copts -> do
+        c_rocksdb_compactoptions_set_bottommost_level_compaction copts bottommostLevelForce
+        act copts
+  where
+    -- BottommostLevelCompaction::kForce
+    bottommostLevelForce = 2
+
+-- | Flushes the memtables to SST files and waits for the flush to finish.
+--
+flushRocksDb :: RocksDb -> IO ()
+flushRocksDb db =
+    bracket c_rocksdb_flushoptions_create c_rocksdb_flushoptions_destroy $ \fopts -> do
+        c_rocksdb_flushoptions_set_wait fopts 1
+        checked "flushing" $ c_rocksdb_flush dbPtr fopts
+  where
+    R.DB dbPtr = _rocksDbHandle db
+
+-- | The value of a RocksDB property, for instance
+-- @"rocksdb.total-sst-files-size"@, or 'Nothing' if the property is unknown.
+--
+rocksDbProperty :: RocksDb -> ByteString -> IO (Maybe ByteString)
+rocksDbProperty db name = B.useAsCString name $ \namePtr -> do
+    valPtr <- c_rocksdb_property_value dbPtr namePtr
+    if valPtr == nullPtr
+        then return Nothing
+        else Just <$> B.packCString valPtr `finally` C.c_rocksdb_free valPtr
+  where
+    R.DB dbPtr = _rocksDbHandle db
+
+-- | The approximate size on disk of the raw key range @[start, limit)@. Raw
+-- keys include the table namespace.
+--
+-- Covers SST files only: the C API of RocksDB 8.3.2 has no approximate-sizes
+-- call that includes memtables.
+--
+approximateSize :: RocksDb -> ByteString -> ByteString -> IO Word64
+approximateSize db start limit =
+    BU.unsafeUseAsCStringLen start $ \(startPtr, startLen) ->
+    BU.unsafeUseAsCStringLen limit $ \(limitPtr, limitLen) ->
+    with startPtr $ \startPtrs ->
+    with (fromIntegral startLen :: CSize) $ \startLens ->
+    with limitPtr $ \limitPtrs ->
+    with (fromIntegral limitLen :: CSize) $ \limitLens ->
+    with 0 $ \sizes -> do
+        checked "approximating sizes" $
+            c_rocksdb_approximate_sizes dbPtr 1
+                startPtrs startLens limitPtrs limitLens sizes
+        peek sizes
+  where
+    R.DB dbPtr = _rocksDbHandle db
 
 -- | Read a value by key.
 -- One less copy than the version in rocksdb-haskell by using unsafePackCStringFinalizer.
