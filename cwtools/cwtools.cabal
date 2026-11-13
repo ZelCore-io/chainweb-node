@@ -333,6 +333,7 @@ library storage-tools
         Chainweb.StorageTools.Compare.Sample
         Chainweb.StorageTools.Compare.Types
         Chainweb.StorageTools.Http
+        Chainweb.StorageTools.Measure.Cold
         Chainweb.StorageTools.Measure.Payload
         Chainweb.StorageTools.RangeDb
     build-depends:
@@ -348,6 +349,7 @@ library storage-tools
         , bytestring
         , clock
         , containers
+        , direct-sqlite
         , directory
         , exceptions
         , filepath
@@ -359,6 +361,7 @@ library storage-tools
         , merkle-log
         , pact-tng
         , random
+        , rocksdb-haskell-kadena
         , servant-client
         , streaming
         , text
@@ -425,11 +428,15 @@ executable cw-measure
     main-is: Main.hs
     build-depends:
         -- internal
+        , chainweb
         , chainweb-storage
         , cwtools:storage-tools
 
         -- external
+        , aeson
         , base
+        , bytestring
+        , loglevel
         , optparse-applicative
         , text
 
@@ -444,6 +451,7 @@ test-suite storage-tools-tests
     hs-source-dirs: storage-tools/test
     main-is: StorageToolsTests.hs
     other-modules:
+        Chainweb.StorageTools.Test.Cold
         Chainweb.StorageTools.Test.Compare
         Chainweb.StorageTools.Test.Http
         Chainweb.StorageTools.Test.RangeDb
@@ -460,13 +468,16 @@ test-suite storage-tools-tests
         , base
         , bytestring
         , containers
+        , direct-sqlite
         , directory
         , filepath
         , http-client
         , http-types
         , lens
         , loglevel
+        , pact
         , resourcet
+        , rocksdb-haskell-kadena
         , servant-client
         , streaming
         , tasty
