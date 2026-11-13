@@ -1,10 +1,11 @@
 {-# LANGUAGE NumericUnderscores #-}
+{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
 -- |
 -- Module: Chainweb.StorageTools.Test.Http
 --
--- Tests of the request limiter.
+-- Tests of the request limiter and of the retries of the service API.
 --
 module Chainweb.StorageTools.Test.Http
 ( tests
@@ -12,10 +13,20 @@ module Chainweb.StorageTools.Test.Http
 
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async
-import Control.Exception (finally)
+import Control.Exception (finally, toException, try)
 import Control.Monad
 
+import Data.IORef
+import qualified Data.Text as T
+
 import GHC.Clock (getMonotonicTime)
+
+import qualified Network.HTTP.Client as HTTP
+import Network.HTTP.Types (status200, status429, status500, status503)
+import Network.Wai (Application, responseLBS, responseRaw)
+import Network.Wai.Handler.Warp (testWithApplication)
+
+import Servant.Client (ClientError(..))
 
 import System.Directory (removeFile)
 import System.FilePath ((</>))
@@ -25,10 +36,18 @@ import System.Timeout (timeout)
 import Test.Tasty
 import Test.Tasty.HUnit
 
+import Chainweb.ChainId (unsafeChainId)
 import Chainweb.StorageTools.Http
+import Chainweb.Version.Mainnet (mainnet)
 
 tests :: TestTree
-tests = testGroup "Limiter"
+tests = testGroup "Http"
+    [ limiterTests
+    , retryTests
+    ]
+
+limiterTests :: TestTree
+limiterTests = testGroup "Limiter"
     [ testCase "8 threads, 50 permits at 20 r/s take at least 2.4 s and under 4 s" $ do
         lim <- newLimiter 20 Nothing
         t0 <- getMonotonicTime
@@ -81,4 +100,72 @@ tests = testGroup "Limiter"
                 threadDelay 1_000_000
                 n3 <- limiterPermits lim
                 assertBool ("permits resume within 1 s of removing the pause file, " <> show (n2, n3)) (n3 > n2)
+    ]
+
+-- -------------------------------------------------------------------------- --
+-- Retries
+
+-- | Serves the application on a loopback port and makes one header request
+-- through 'runServiceApi', with a response timeout of 300 ms. Returns the
+-- number of requests that reached the server and whether the call failed.
+-- The application gets the number of the request, counted from 1.
+--
+requestsReceived :: (Int -> Application) -> IO (Int, Bool)
+requestsReceived app = do
+    counter <- newIORef (0 :: Int)
+    let counted req respond = do
+            n <- atomicModifyIORef' counter (\n -> (n + 1, n + 1))
+            app n req respond
+    testWithApplication (return counted) $ \port -> do
+        mgr <- HTTP.newManager HTTP.defaultManagerSettings
+            { HTTP.managerResponseTimeout = HTTP.responseTimeoutMicro 300_000 }
+        lim <- newLimiter 1_000 Nothing
+        let api = ServiceApi ("http://127.0.0.1:" <> T.pack (show port)) mainnet mgr lim
+        r <- try (hasHeaderAtOrAbove api (unsafeChainId 0) 0)
+        n <- readIORef counter
+        return (n, either (\(_ :: ServiceApiError) -> True) (const False) r)
+
+emptyPage :: Application
+emptyPage _ respond = respond $ responseLBS status200
+    [("Content-Type", "application/json")]
+    "{\"limit\":0,\"items\":[],\"next\":null}"
+
+retryTests :: TestTree
+retryTests = testGroup "runServiceApi retries"
+    [ testCase "a request that times out on the server is sent once" $ do
+        r <- requestsReceived $ \_ _ respond -> do
+            threadDelay 2_000_000
+            respond (responseLBS status200 [] "")
+        assertEqual "(requests received, failed)" (1, True) r
+
+    , testCase "a request whose connection the server closes without an answer is sent once" $ do
+        r <- requestsReceived $ \_ _ respond ->
+            respond (responseRaw (\_ _ -> return ()) (responseLBS status500 [] ""))
+        assertEqual "(requests received, failed)" (1, True) r
+
+    , testCase "status 500 is final" $ do
+        r <- requestsReceived $ \_ _ respond -> respond (responseLBS status500 [] "")
+        assertEqual "(requests received, failed)" (1, True) r
+
+    , testCase "status 429 and 503 are retried" $ do
+        r <- requestsReceived $ \n req respond -> case n of
+            1 -> respond (responseLBS status429 [] "")
+            2 -> respond (responseLBS status503 [] "")
+            _ -> emptyPage req respond
+        assertEqual "(requests received, failed)" (3, False) r
+
+    , testCase "of the transport errors only a connection that never opened is retried" $ do
+        let transport = ConnectionError . toException . HTTP.HttpExceptionRequest HTTP.defaultRequest
+        forM_
+            [ ("ConnectionFailure", HTTP.ConnectionFailure (toException (userError "refused")), True)
+            , ("ConnectionTimeout", HTTP.ConnectionTimeout, True)
+            , ("ResponseTimeout", HTTP.ResponseTimeout, False)
+            , ("ConnectionClosed", HTTP.ConnectionClosed, False)
+            , ("NoResponseDataReceived", HTTP.NoResponseDataReceived, False)
+            , ("IncompleteHeaders", HTTP.IncompleteHeaders, False)
+            , ("InternalException", HTTP.InternalException (toException (userError "reset")), False)
+            ] $ \(name, c, expected) ->
+                assertEqual name expected (retriableClientError (transport c))
+        assertEqual "not an HttpException" False
+            (retriableClientError (ConnectionError (toException (userError "other"))))
     ]

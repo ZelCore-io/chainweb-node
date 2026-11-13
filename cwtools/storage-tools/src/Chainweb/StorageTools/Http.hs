@@ -24,6 +24,7 @@ module Chainweb.StorageTools.Http
 , newServiceApi
 , ServiceApiError(..)
 , runServiceApi
+, retriableClientError
 
   -- * Requests
 , headerPageLimit
@@ -35,7 +36,7 @@ module Chainweb.StorageTools.Http
 
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.MVar
-import Control.Exception (Exception, throwIO, evaluate)
+import Control.Exception (Exception, evaluate, fromException, throwIO)
 import Control.Lens (view)
 import Control.Monad
 
@@ -171,9 +172,9 @@ data ServiceApiError = ServiceApiError !T.Text !ClientError
 
 instance Exception ServiceApiError
 
--- | Runs a request. Each attempt takes a permit of the limiter. Connection
--- errors and the HTTP status 429 and 5xx are retried up to 5 times with a
--- delay of 1, 2, 4 and 8 seconds; all other errors are thrown.
+-- | Runs a request. Each attempt takes a permit of the limiter. A failure
+-- that 'retriableClientError' accepts is retried up to 5 times with a delay
+-- of 1, 2, 4 and 8 seconds; all other errors are thrown.
 --
 runServiceApi :: forall a. ServiceApi -> ClientM a -> IO a
 runServiceApi api m = do
@@ -183,16 +184,37 @@ runServiceApi api m = do
         go attempt = throttled (_saLimiter api) (runClientM m env) >>= \case
             Right a -> return a
             Left e
-                | attempt < 5 && retriable e -> backoff attempt >> go (attempt + 1)
+                | attempt < 5 && retriableClientError e -> backoff attempt >> go (attempt + 1)
                 | otherwise -> throwIO $ ServiceApiError (_saBaseUrl api) e
     go 1
   where
     backoff attempt = threadDelay (1_000_000 * 2 ^ (attempt - 1))
-    retriable = \case
-        ConnectionError _ -> True
-        FailureResponse _ r ->
-            let c = statusCode (responseStatusCode r) in c == 429 || c >= 500
+
+-- | Whether a failed request may be sent again: only if the server never got
+-- it, or answered that it did no work.
+--
+-- * A connection that could not be opened (@ConnectionFailure@,
+--   @ConnectionTimeout@): the request was never sent.
+-- * The status 429 or 503: the server refused the request.
+--
+-- Everything else is final. Servant wraps transport errors in
+-- 'ConnectionError'; after a response timeout, a connection the server closed
+-- or an incomplete answer, the server may have received the request and may
+-- still be working on it, so sending it again would only add load to a node
+-- that is already slow. A 500, 502 or 504 can likewise come after the work
+-- was done.
+--
+retriableClientError :: ClientError -> Bool
+retriableClientError = \case
+    ConnectionError e -> case fromException e of
+        Just (HTTP.HttpExceptionRequest _ c) -> case c of
+            HTTP.ConnectionFailure _ -> True
+            HTTP.ConnectionTimeout -> True
+            _ -> False
         _ -> False
+    FailureResponse _ r ->
+        let c = statusCode (responseStatusCode r) in c == 429 || c == 503
+    _ -> False
 
 -- -------------------------------------------------------------------------- --
 -- Requests
