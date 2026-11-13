@@ -34,6 +34,8 @@ import qualified Database.RocksDB.ReadOptions as R
 import Options.Applicative
     (ParserResult(..), defaultPrefs, execParserPure, getParseResult, info, renderFailure)
 
+import System.Directory (listDirectory)
+import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 
 import Test.Tasty
@@ -64,7 +66,7 @@ tests = testGroup "Payload store"
     , testCase "addPayload is all-or-nothing" allOrNothingTest
     , testCase "storeMerkleTrees: default True; --store-merkle-trees true and false parse, any other value fails; JSON round trip"
         storeMerkleTreesConfigTest
-    , testCase "zstd-dict: payloads added then flushed live only in ZSTD SSTs with max_dict_bytes=65536"
+    , testCase "zstd-dict: payloads added then flushed live only in ZSTD SSTs with level 3, max_dict_bytes 65536, zstd_max_train_bytes 6553600, 32 KB blocks"
         zstdDictFilesTest
     , testCase "mixed files: Snappy half, zstd half, reopened under each setting: every payload byte-equal"
         mixedFilesTest
@@ -234,8 +236,26 @@ zstdDictFilesTest = withSystemTempDirectory "payload-store-zstd" $ \dir -> do
     assertBool "no SST files" (not (M.null info'))
     forM_ (M.toList info') $ \(f, (c, o)) -> do
         assertEqual ("compression of " <> f) "ZSTD" c
-        assertBool ("compression options of " <> f <> ": " <> show o)
-            ("max_dict_bytes=65536;" `B.isInfixOf` o)
+        forM_ ["level=3;", "max_dict_bytes=65536;", "zstd_max_train_bytes=6553600;"] $ \opt ->
+            assertBool ("compression options of " <> f <> " have " <> B8.unpack opt <> ": " <> show o)
+                (opt `B.isInfixOf` o)
+    -- the block size is not a property of an SST file; RocksDB records the
+    -- table options that it writes the files with in its OPTIONS file
+    opts <- latestOptionsFile dir
+    assertBool ("block_size=32768 in the OPTIONS file:\n" <> B8.unpack opts)
+        ("\n  block_size=32768\n" `B.isInfixOf` opts)
+
+-- | The newest OPTIONS file of a closed database.
+--
+latestOptionsFile :: FilePath -> IO B.ByteString
+latestOptionsFile dir = do
+    fs <- filter isOptions <$> listDirectory dir
+    case L.sortOn (read @Int . drop (length prefix)) fs of
+        [] -> assertFailure ("no OPTIONS file in " <> dir)
+        xs -> B.readFile (dir </> last xs)
+  where
+    prefix = "OPTIONS-"
+    isOptions f = prefix `L.isPrefixOf` f && all (`elem` ['0' .. '9']) (drop (length prefix) f)
 
 -- | Node-level twin of the engine-level @mixedCompressionReadTest@ of
 -- chainweb-storage.

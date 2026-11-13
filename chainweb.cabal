@@ -710,6 +710,8 @@ test-suite chainweb-tests
         , containers >= 0.5
         , crypton >= 1.1.2
         , crypton-connection >=0.4
+        , directory >= 1.2
+        , filepath >= 1.4
         , data-dword >= 0.3
         , data-ordlist >= 0.4.7
         , deepseq >= 1.4
