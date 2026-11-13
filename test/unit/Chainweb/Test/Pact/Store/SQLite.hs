@@ -18,6 +18,7 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as B8
 import qualified Data.ByteString.Short as SB
 import qualified Data.HashMap.Strict as HM
+import qualified Data.Map.Strict as M
 import Data.List (intersperse, sort)
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -125,9 +126,14 @@ tests = testGroup "PactStore SQLite"
         _psRowsAtTxId ps "t" 9 >>= (@?= Right [])
 
     , testCase "rowsInTxIdRange: from inclusive, to exclusive; readPrev and readHistorical: newest below the bound" $ withStore $ \sql ps -> do
-        commit ps 1 ["t"] [("t", [("a", 1, "a1"), ("a", 2, "a2"), ("b", 3, "b3"), ("a", 4, "a4")])] []
+        -- two rows at txid 3, written out of key order
+        commit ps 1 ["t"] [("t", [("a", 1, "a1"), ("a", 2, "a2"), ("d", 3, "d3"), ("b", 3, "b3"), ("a", 4, "a4")])] []
         Right r <- _psRowsInTxIdRange ps "t" 2 4
-        sort r @?= [(2, "a", "a2"), (3, "b", "b3")]
+        sort r @?= [(2, "a", "a2"), (3, "b", "b3"), (3, "d", "d3")]
+        -- guard: a store sorted by (txid, rowkey) would return sort r
+        assertBool ("rows not in (txid, rowkey) order: " <> show r) (r /= sort r)
+        -- at one txid, the rows come in rowid (insertion) order
+        [ k | (3, k, _) <- r ] @?= ["d", "b"]
         -- unsorted: the rows in the order 3.2.1's queryHistory statement returns them
         raw <- P4SQL.qry sql "SELECT txid, rowkey, rowdata FROM [t] WHERE txid >= ? AND txid < ?"
             [P4SQL.SInt 2, P4SQL.SInt 4] [P4SQL.RInt, P4SQL.RText, P4SQL.RBlob]
@@ -264,10 +270,15 @@ tests = testGroup "PactStore SQLite"
                 -- store, B through the frozen 3.2.1 functions
                 p5ScriptBlocks cpA
                 p5ScriptBlocks cpB
+                -- block 7 writes five rows of t1 in one transaction, so one
+                -- txid has rows that are not in key order
+                forM_ [cpA, cpB] $ \cp -> C.extend cp (Just (C.p5Headers !! 6))
+                    [C.p5Block (C.p5Headers !! 7)
+                        [C.tx 7 0 [ C.Put "t1" k n | (k, n) <- zip ["q", "e", "m", "c", "w"] [16..] ]]]
                 dumpAll sqlA >>= \a -> dumpAll sqlB >>= (@?= a)
                 let ps = sqlitePactStore sqlA
-                    -- blocks 0 to 6 are in the db, block 7 is not
-                    headers = take 8 C.p5Headers
+                    -- blocks 0 to 7 are in the db, block 8 is not
+                    headers = take 9 C.p5Headers
                     domains = [ P5.DUserTables (C.tn5 t) | t <- ["t1", "t2", "nope"] ]
                     keys = P5.RowKey <$> ["a", "b", "C", "zz", "k9", "k10", "B", "x", "y", "missing"]
                     -- BlockTxHistory's Show leaves out the prev map; compare both
@@ -281,10 +292,12 @@ tests = testGroup "PactStore SQLite"
                         newL <- try @SomeException $ Cp.lookupHistorical ps h d k
                         oldL <- try @SomeException $ Ref.lookupHistorical sqlB h d k
                         sameOutcome ("lookupHistorical " <> lbl <> " " <> show k) oldL newL
-                    return [ () | Right (Historical bth) <- [new], any ((> 1) . length) (_blockTxHistory bth) ]
-                -- some txid wrote two rows of one table, so the row order shows
-                -- in the per-txid log lists
-                assertBool "a txid with two rows of one table" (not (null multi))
+                    return [ ks | Right (Historical bth) <- [old], ls <- M.elems (_blockTxHistory bth)
+                                , let ks = P5._txKey <$> ls, ks /= sort ks, ks /= reverse (sort ks) ]
+                -- some txid's rows are in neither ascending nor descending key
+                -- order, so a store that sorts by (txid, rowkey) gives
+                -- different log lists
+                assertBool "a txid whose rows are not in key order" (not (null multi))
         ]
     ]
 

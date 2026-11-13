@@ -22,6 +22,7 @@ module Chainweb.Test.Pact.Store.Characterization
     -- * The script, for differential tests of the store
     , cid
     , extend
+    , Op(..)
     , p4Block
     , p4Header
     , p4Headers
@@ -30,6 +31,7 @@ module Chainweb.Test.Pact.Store.Characterization
     , p5Headers
     , scenario
     , tn5
+    , tx
     , v4
     , withP4
     , withP5
