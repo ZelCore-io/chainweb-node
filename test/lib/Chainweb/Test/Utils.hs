@@ -91,6 +91,7 @@ module Chainweb.Test.Utils
 , withPeerDbsServer
 , withPayloadServer
 , withRocksResource
+, testPayloadDbConfig
 
 -- * QuickCheck Properties
 , prop_iso
@@ -230,6 +231,7 @@ import Chainweb.Test.Pact5.Utils (getTestLogLevel)
 import Chainweb.Test.P2P.Peer.BootstrapConfig
     (testBootstrapCertificate, testBootstrapKey, testBootstrapPeerConfig)
 import Chainweb.Test.Utils.BlockHeader
+import Chainweb.Test.Utils.Storage (testPayloadDbConfig)
 import Chainweb.Time
 import Chainweb.TreeDB
 import Chainweb.Utils

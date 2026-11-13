@@ -66,6 +66,7 @@ module Chainweb.Chainweb.Configuration
 , configThrottling
 , configReorgLimit
 , configFullHistoricPactState
+, configStoreMerkleTrees
 , configBackup
 , configServiceApi
 , configOnlySyncPact
@@ -74,6 +75,7 @@ module Chainweb.Chainweb.Configuration
 , defaultChainwebConfiguration
 , pChainwebConfiguration
 , validateChainwebConfiguration
+, boolValueReader
 
 ) where
 
@@ -395,6 +397,9 @@ data ChainwebConfiguration = ChainwebConfiguration
     , _configPreInsertCheckTimeout :: !Micros
     , _configAllowReadsInLocal :: !Bool
     , _configFullHistoricPactState :: !Bool
+    , _configStoreMerkleTrees :: !Bool
+        -- ^ write the Merkle trees of block payloads. Nothing reads them: SPV
+        -- proofs rebuild the trees from the payloads.
     , _configBackup :: !BackupConfig
     , _configServiceApi :: !ServiceApiConfig
     , _configReadOnlyReplay :: !Bool
@@ -460,6 +465,7 @@ defaultChainwebConfiguration v = ChainwebConfiguration
     , _configPreInsertCheckTimeout = defaultPreInsertCheckTimeout
     , _configAllowReadsInLocal = False
     , _configFullHistoricPactState = True
+    , _configStoreMerkleTrees = True
     , _configServiceApi = defaultServiceApiConfig
     , _configOnlySyncPact = False
     , _configReadOnlyReplay = False
@@ -487,6 +493,7 @@ instance ToJSON ChainwebConfiguration where
         , "preInsertCheckTimeout" .= _configPreInsertCheckTimeout o
         , "allowReadsInLocal" .= _configAllowReadsInLocal o
         , "fullHistoricPactState" .= _configFullHistoricPactState o
+        , "storeMerkleTrees" .= _configStoreMerkleTrees o
         , "serviceApi" .= _configServiceApi o
         , "onlySyncPact" .= _configOnlySyncPact o
         , "readOnlyReplay" .= _configReadOnlyReplay o
@@ -518,6 +525,7 @@ instance FromJSON (ChainwebConfiguration -> ChainwebConfiguration) where
         <*< configAllowReadsInLocal ..: "allowReadsInLocal" % o
         <*< configPreInsertCheckTimeout ..: "preInsertCheckTimeout" % o
         <*< configFullHistoricPactState ..: "fullHistoricPactState" % o
+        <*< configStoreMerkleTrees ..: "storeMerkleTrees" % o
         <*< configServiceApi %.: "serviceApi" % o
         <*< configOnlySyncPact ..: "onlySyncPact" % o
         <*< configReadOnlyReplay ..: "readOnlyReplay" % o
@@ -564,6 +572,10 @@ pChainwebConfiguration = id
     <*< configFullHistoricPactState .:: boolOption_
         % long "full-historic-pact-state"
         <> help "Write full historic Pact state; only enable for custodial or archival nodes."
+    <*< configStoreMerkleTrees .:: option boolValueReader
+        % long "store-merkle-trees"
+        <> metavar "true|false"
+        <> help "Write the Merkle trees of block payloads. Nothing reads them: SPV proofs rebuild them from the payloads. false saves disk."
     <*< configCuts %:: pCutConfig
     <*< configServiceApi %:: pServiceApiConfig
     <*< configMining %:: pMiningConfig
@@ -585,6 +597,17 @@ pChainwebConfiguration = id
     <*< configEnableLocalTimeout .:: option auto
         % long "enable-local-timeout"
         <> help "Enable timeout support on /local endpoints"
+
+-- | Reads @true@ or @false@ and fails on any other value.
+--
+-- Unlike 'boolOption_' the option takes a value, so that it can be set
+-- either way on the command line, for the node and the tools alike.
+--
+boolValueReader :: ReadM Bool
+boolValueReader = eitherReader $ \case
+    "true" -> Right True
+    "false" -> Right False
+    s -> Left $ "expected true or false, got " <> show s
 
 parseVersion :: MParser ChainwebVersion
 parseVersion = constructVersion
