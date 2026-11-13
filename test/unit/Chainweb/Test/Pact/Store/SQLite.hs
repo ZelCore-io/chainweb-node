@@ -22,6 +22,7 @@ import qualified Data.HashMap.Strict as HM
 import qualified Data.Map.Strict as M
 import qualified Data.HashSet as HashSet
 import Data.List (intersperse, isPrefixOf, sort)
+import Data.List.NonEmpty (NonEmpty(..))
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
@@ -47,7 +48,7 @@ import Chainweb.Pact.Backend.Store.SQLite
 import Chainweb.Pact.Backend.Store.Types
 import qualified Chainweb.Pact.Backend.InMemDb as InMemDb
 import Chainweb.Pact.Backend.Types
-    ( BlockHandle(..), SQLiteEnv, SQLitePendingData(..), emptySQLitePendingData )
+    ( BlockHandle(..), SQLiteEnv, SQLitePendingData(..), SQLiteRowDelta(..), emptySQLitePendingData )
 import Chainweb.Pact.Backend.Utils
     ( chainwebPragmas, withSQLiteConnection, withTempSQLiteConnection )
 import qualified Chainweb.Pact.PactService.Checkpointer.Internal as Cp
@@ -129,34 +130,42 @@ tests = testGroup "PactStore SQLite"
 
     , testGroup "commit error text: each caller's 3.2.1 message" $
         let failures =
-                -- (what fails, setup, new tables, tx hashes, Pact 4 text, Pact 5 first line)
-                [ ( "TransactionIndex step (duplicate hash)", \_ ps -> commit ps 1 [] [] ["h"], [], ["h"]
+                -- (what fails, setup, new tables, tx hashes, rows of the user
+                -- table t of module m (SQLite table m_t), Pact 4 text,
+                -- Pact 5 first line)
+                [ ( "TransactionIndex step (duplicate hash)", \_ ps -> commit ps 1 [] [] ["h"], [], ["h"], []
                   , "user error (error during batch insert: ErrorConstraint)", "ErrorConstraint" )
-                , ( "TransactionIndex prepare (missing table)", \sql _ -> P4SQL.exec_ sql "DROP TABLE TransactionIndex", [], ["h"]
+                , ( "TransactionIndex prepare (missing table)", \sql _ -> P4SQL.exec_ sql "DROP TABLE TransactionIndex", [], ["h"], []
                   , "user error (Database error: ErrorError)", "ErrorError" )
-                , ( "BlockHistory step (height taken)", \_ ps -> commit ps 2 [] [] [], [], []
+                , ( "BlockHistory step (height taken)", \_ ps -> commit ps 2 [] [] [], [], [], []
                   , "user error (Database error: ErrorConstraint)", "ErrorConstraint" )
-                , ( "BlockHistory prepare (missing table)", \sql _ -> P4SQL.exec_ sql "DROP TABLE BlockHistory", [], []
+                , ( "BlockHistory prepare (missing table)", \sql _ -> P4SQL.exec_ sql "DROP TABLE BlockHistory", [], [], []
                   , "user error (Database error: ErrorError)", "ErrorError" )
-                , ( "CREATE TABLE (an index has the name)", \sql _ -> P4SQL.exec_ sql "CREATE INDEX [boom] ON BlockHistory(blockheight)", ["boom"], []
+                , ( "CREATE TABLE (an index has the name)", \sql _ -> P4SQL.exec_ sql "CREATE INDEX [boom] ON BlockHistory(blockheight)", ["boom"], [], []
                   , "user error (Database error: (ErrorError,\"there is already an index named boom\"))", "ErrorError" )
+                , ( "row batch step (a trigger aborts the insert)"
+                  , \sql ps -> do
+                      commit ps 1 ["m_t"] [] []
+                      P4SQL.exec_ sql "CREATE TRIGGER boom BEFORE INSERT ON [m_t] BEGIN SELECT RAISE(ABORT,'x'); END"
+                  , [], [], [("k", 15, "v")]
+                  , "user error (error during batch insert: ErrorConstraint)", "ErrorConstraint" )
                 ]
         in
         [ testCase "Pact 4: Database error, or error during batch insert for a batched step" $
-            forM_ failures $ \(lbl, setup, tables, txs, p4Text, _) -> withStore $ \sql ps -> do
+            forM_ failures $ \(lbl, setup, tables, txs, rows, p4Text, _) -> withStore $ \sql ps -> do
                 setup sql ps
-                let pending = (emptySQLitePendingData mempty)
+                let pending = (emptySQLitePendingData (p4Writes rows))
                         { _pendingTableCreation = HashSet.fromList tables
                         , _pendingSuccessfulTxs = HashSet.fromList txs }
                 r <- try @IOException $ Pact4.commitBlockStateToDatabase ps (mkHash 2) 2 (BlockHandle 20 pending)
                 assertEqual lbl p4Text (either show (const "no error") r)
         , testCase "Pact 5: the SQLite error, through throwOnDbError" $
-            forM_ failures $ \(lbl, setup, tables, txs, _, p5Text) -> withStore $ \sql ps -> do
+            forM_ failures $ \(lbl, setup, tables, txs, rows, _, p5Text) -> withStore $ \sql ps -> do
                 setup sql ps
-                let pending = (emptySQLitePendingData InMemDb.empty)
+                let pending = (emptySQLitePendingData (p5Writes rows))
                         { _pendingTableCreation = HashSet.fromList tables
                         , _pendingSuccessfulTxs = HashSet.fromList txs }
-                r <- try @SomeException $ pact5Commit sql ps (mkHash 2) 2 (BlockHandle 20 pending)
+                r <- try @SomeException $ pact5Commit ps (mkHash 2) 2 (BlockHandle 20 pending)
                 case r of
                     Right () -> assertFailure (lbl <> ": no error")
                     Left e -> do
@@ -397,8 +406,22 @@ commit ps h newTables rows txs =
     _psCommitBlock ps (blockCommit h newTables rows txs) >>= either (fail . show) return
 
 -- | Pact 5's @commitBlockStateToDatabase@.
-pact5Commit :: SQLiteEnv -> PactStore -> BlockHash -> BlockHeight -> BlockHandle Pact5 -> IO ()
-pact5Commit _ ps = Pact5.commitBlockStateToDatabase ps
+pact5Commit :: PactStore -> BlockHash -> BlockHeight -> BlockHandle Pact5 -> IO ()
+pact5Commit = Pact5.commitBlockStateToDatabase
+
+-- | Pact 4 pending writes of @(rowkey, txid, rowdata)@ to the table @m_t@.
+p4Writes :: [(Text, Int, ByteString)] -> HM.HashMap Text (HM.HashMap ByteString (NonEmpty SQLiteRowDelta))
+p4Writes rows = HM.fromList
+    [ ("m_t", HM.fromList [ (k', SQLiteRowDelta "m_t" (fromIntegral i) k' v :| []) | (k, i, v) <- rows, let k' = T.encodeUtf8 k ])
+    | not (null rows) ]
+
+-- | Pact 5 pending writes of @(rowkey, txid, rowdata)@ to the user table @t@
+-- of module @m@, whose SQLite table is @m_t@.
+p5Writes :: [(Text, Int, ByteString)] -> InMemDb.Store
+p5Writes = foldr
+    (\(k, i, v) -> InMemDb.insert (P5.DUserTables (C.tn5 "t")) (P5.RowKey k)
+        (InMemDb.WriteEntry (P5.TxId (fromIntegral i)) v (P5.RowData mempty)))
+    InMemDb.empty
 
 -- | Run both actions and compare their results.
 same :: (Eq a, Show a) => String -> IO a -> IO a -> Assertion
