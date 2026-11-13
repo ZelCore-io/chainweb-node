@@ -67,8 +67,11 @@ type TxId = Pact4.TxId
 -- bound: only rows with @txid < bound@ count.
 data KeysQuery
     = KeysAsStored !(Maybe TxId)
-    -- ^ Pact 4's statement, without @ORDER BY@: the keys in the order SQLite
-    -- returns them. Unbounded at the tip, bounded when rewound.
+    -- ^ Pact 4's statement, without @ORDER BY@: the keys in the order of the
+    -- index SQLite scans for it. Unbounded at the tip, bounded when rewound.
+    -- Callers depend on this order only through collisions in Pact 4's
+    -- @LHM.sort@, which re-sorts the keys by hash; still, a replacement
+    -- store must reproduce SQLite's index order.
     | KeysOrderedByKey !TxId
     -- ^ Pact 5's statement, with @ORDER BY rowkey@. Pact 5 always reads
     -- below a bound, so the bound is mandatory.
@@ -134,7 +137,20 @@ data CommitError = CommitError
 --
 -- Fields that replace a 3.2.1 function taking an 'SQLiteEnv' have that
 -- function's type without the 'SQLiteEnv' argument, and behave exactly like
--- it, exceptions included.
+-- it, exceptions included, except for these accepted differences:
+--
+-- * The unreachable errors (a prepare that returns no statement, an
+--   impossible result shape) are @PactInternalError@s with Pact 5's 3.2.1
+--   texts. 3.2.1 raised them as Pact 5's @InternalDbException@, and Pact 4
+--   raised @Database error: Statement prep failed@ for the empty prepare.
+-- * Call stacks: the corrupt-hash errors and @getBlockParent@ show frames
+--   in "Chainweb.Pact.Backend.Store.SQLite", called from @sqlitePactStore@
+--   instead of the checkpointer function. The @initSchema@ failure and
+--   Pact 5's @throwOnDbError@ texts keep 3.2.1's frame names; their line
+--   numbers differ, and for @initSchema@ the file too.
+-- * A finalize failure after a successful step or batch would be handled
+--   differently from 3.2.1's Pact 4. SQLite's finalize only repeats the
+--   last step's error, so this cannot happen.
 data PactStore = PactStore
     { _psGetLatestBlock :: !(IO (Maybe (BlockHeight, BlockHash)))
     , _psGetEarliestBlock :: !(IO (Maybe (BlockHeight, BlockHash)))
@@ -157,7 +173,8 @@ data PactStore = PactStore
         -- among rows with @txid < bound@ when a bound is given
     , _psRowsInTxIdRange :: !(Text -> TxId -> TxId -> IO (Either SQ3.Error [(TxId, ByteString, ByteString)]))
         -- ^ table, from, to: @(txid, rowkey, rowdata)@ with
-        -- @txid >= from AND txid < to@, in the order SQLite returns them
+        -- @txid >= from AND txid < to@: txid descending, rows of one txid in
+        -- rowid order (the @t_ix@ index order)
     , _psReadPrev :: !(Text -> ByteString -> TxId -> IO (Either SQ3.Error (Maybe ByteString)))
         -- ^ table, rowkey, bound: the newest row data with @txid < bound@
     , _psReadHistorical :: !(Text -> ByteString -> TxId -> IO (Either SQ3.Error (Maybe (ByteString, ByteString))))
