@@ -329,6 +329,7 @@ library storage-tools
     exposed-modules:
         Chainweb.StorageTools.Http
         Chainweb.StorageTools.Measure.Payload
+        Chainweb.StorageTools.Migrate
         Chainweb.StorageTools.RangeDb
     build-depends:
         -- internal
@@ -336,6 +337,7 @@ library storage-tools
         , chainweb-storage
 
         -- external
+        , aeson
         , base >= 4.12 && < 5
         , base16-bytestring
         , bytestring
@@ -349,10 +351,12 @@ library storage-tools
         , http-types
         , lens
         , loglevel
+        , optparse-applicative
         , random
         , servant-client
         , streaming
         , text
+        , unix
         , unordered-containers
         , vector
 
@@ -381,6 +385,28 @@ executable cw-range-db
         , optparse-applicative
         , text
         , yet-another-logger
+
+executable storage-migrate
+    import: warning-flags, debugging-flags
+    default-language: Haskell2010
+    ghc-options:
+        -threaded
+        -rtsopts
+        "-with-rtsopts=-N"
+    hs-source-dirs: storage-migrate
+    main-is: Main.hs
+    build-depends:
+        -- internal
+        , chainweb
+        , cwtools:storage-tools
+
+        -- external
+        , base
+        , directory
+        , filepath
+        , loglevel
+        , optparse-applicative
+        , text
 
 executable cw-measure
     import: warning-flags, debugging-flags
@@ -413,6 +439,7 @@ test-suite storage-tools-tests
     main-is: StorageToolsTests.hs
     other-modules:
         Chainweb.StorageTools.Test.Http
+        Chainweb.StorageTools.Test.Migrate
         Chainweb.StorageTools.Test.RangeDb
     build-depends:
         -- internal
@@ -431,6 +458,7 @@ test-suite storage-tools-tests
         , http-client
         , lens
         , loglevel
+        , optparse-applicative
         , resourcet
         , servant-client
         , streaming

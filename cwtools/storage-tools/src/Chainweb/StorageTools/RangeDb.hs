@@ -18,8 +18,15 @@
 -- Also the tools to compare, inspect and corrupt such databases.
 --
 module Chainweb.StorageTools.RangeDb
-( -- * Building
-  RangeSpec(..)
+( -- * Writing options
+  RangeDbWriteOpts(..)
+, defaultRangeDbWriteOpts
+, rangeDbWriteOptsParser
+, rangeDbPayloadDbConfig
+, withRangeDbWriting
+
+  -- * Building
+, RangeSpec(..)
 , RangeSummary(..)
 , buildRangeDb
 , buildRangeDbWith
@@ -70,6 +77,8 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
 import Data.Word
 
+import Options.Applicative
+
 import System.Directory (doesFileExist)
 import System.FilePath ((</>))
 import System.LogLevel
@@ -82,6 +91,9 @@ import Chainweb.BlockHeaderDB.Internal (unsafeInsertBlockHeaderDb)
 import Chainweb.BlockHeaderDB.RestAPI.Client (branchHeadersClient)
 import Chainweb.BlockHeight
 import Chainweb.ChainId
+import Chainweb.Chainweb.Configuration
+    (PayloadCompression(..), boolValueReader, payloadCompressionReader,
+    payloadCompressionToText, payloadCompressionTuning)
 import Chainweb.Cut (unsafeMkCut)
 import Chainweb.Cut.CutHashes
 import Chainweb.CutDB (cutHashesTable)
@@ -171,6 +183,61 @@ readNamespace db ns = withTableIterator (rawTable db ns) $ \it ->
     in go []
 
 -- -------------------------------------------------------------------------- --
+-- Writing options
+
+-- | How a range database is written: the payload store setting and the
+-- RocksDB compression of the node options @--store-merkle-trees@ and
+-- @--payload-compression@.
+--
+data RangeDbWriteOpts = RangeDbWriteOpts
+    { _rwoStoreMerkleTrees :: !Bool
+    , _rwoPayloadCompression :: !PayloadCompression
+    }
+    deriving (Show, Eq)
+
+-- | The defaults of the node: trees are written, Snappy.
+--
+defaultRangeDbWriteOpts :: RangeDbWriteOpts
+defaultRangeDbWriteOpts = RangeDbWriteOpts True PayloadSnappy
+
+-- | @--store-merkle-trees true|false@ and @--payload-compression
+-- snappy|zstd-dict@, with the readers and defaults of the node options.
+--
+rangeDbWriteOptsParser :: Parser RangeDbWriteOpts
+rangeDbWriteOptsParser = RangeDbWriteOpts
+    <$> option boolValueReader
+        ( long "store-merkle-trees"
+        <> metavar "true|false"
+        <> value (_rwoStoreMerkleTrees defaultRangeDbWriteOpts)
+        <> showDefaultWith (\b -> if b then "true" else "false")
+        <> help "write the Merkle trees of the payloads, as a node with this setting does"
+        )
+    <*> option payloadCompressionReader
+        ( long "payload-compression"
+        <> metavar "snappy|zstd-dict"
+        <> value (_rwoPayloadCompression defaultRangeDbWriteOpts)
+        <> showDefaultWith (T.unpack . payloadCompressionToText)
+        <> help "compression of the files that are written, as a node with this setting does"
+        )
+
+rangeDbPayloadDbConfig :: RangeDbWriteOpts -> PayloadDbConfig
+rangeDbPayloadDbConfig o = PayloadDbConfig
+    { _payloadDbConfigStoreTrees = if _rwoStoreMerkleTrees o
+        then StoreMerkleTrees
+        else DoNotStoreMerkleTrees
+    }
+
+-- | Opens (or creates) a range database with the compression of the options,
+-- and flushes the memtables to SST files before it is closed.
+--
+withRangeDbWriting :: RangeDbWriteOpts -> FilePath -> (RocksDb -> IO a) -> IO a
+withRangeDbWriting o path act =
+    withRocksDbTuned path modernDefaultOptions (payloadCompressionTuning $ _rwoPayloadCompression o) $ \db -> do
+        r <- act db
+        flushRocksDb db
+        return r
+
+-- -------------------------------------------------------------------------- --
 -- Building
 
 -- | A range database with all headers and payloads of all chains up to the
@@ -200,7 +267,8 @@ data RangeSummary = RangeSummary
 --
 -- Headers are fetched per chain in pages and are written with the header DB
 -- insert; payloads are fetched in batches of 'payloadBatchSize' and are
--- written with 'addNewPayload'. Each payload is read back, which fails if the
+-- written with 'addNewPayload' through a payload store with the given
+-- configuration. Each payload is read back, which fails if the
 -- payload that the service returned does not hash to the key that was
 -- requested.
 --
@@ -209,17 +277,17 @@ data RangeSummary = RangeSummary
 -- 'canonicalTips'). Orphan headers and their payloads, at that height and
 -- below, are copied like all others.
 --
-buildRangeDb :: Logger l => l -> ServiceApi -> RangeSpec -> RocksDb -> IO RangeSummary
-buildRangeDb l api = buildRangeDbWith l api (runServiceApi api $ cutGetClient $ _saVersion api)
+buildRangeDb :: Logger l => l -> PayloadDbConfig -> ServiceApi -> RangeSpec -> RocksDb -> IO RangeSummary
+buildRangeDb l cfg api = buildRangeDbWith l cfg api (runServiceApi api $ cutGetClient $ _saVersion api)
 
 -- | 'buildRangeDb' with the action that gets the current cut of the source.
 -- The cut is read once, after the headers and payloads were copied.
 --
-buildRangeDbWith :: Logger l => l -> ServiceApi -> IO CutHashes -> RangeSpec -> RocksDb -> IO RangeSummary
-buildRangeDbWith l api getSrcCut (RangeSpec maxHeight) rdb = do
+buildRangeDbWith :: Logger l => l -> PayloadDbConfig -> ServiceApi -> IO CutHashes -> RangeSpec -> RocksDb -> IO RangeSummary
+buildRangeDbWith l cfg api getSrcCut (RangeSpec maxHeight) rdb = do
     p0 <- limiterPermits (_saLimiter api)
     wdb <- initWebBlockHeaderDb rdb v
-    let pdb = newPayloadDb rdb
+    let pdb = newPayloadDbWith cfg rdb
     nHeaders <- newIORef (0 :: Int)
     nPayloads <- newIORef (0 :: Int)
     forM_ (sortedChains v) $ \cid -> do
@@ -346,8 +414,8 @@ probeMaxHeight api cid = do
 -- A target that has no header at the service is skipped and counted in
 -- '_rsSkipped'.
 --
-sampleRangeDb :: Logger l => l -> ServiceApi -> Word64 -> Int -> RocksDb -> IO RangeSummary
-sampleRangeDb l api seed count rdb = do
+sampleRangeDb :: Logger l => l -> PayloadDbConfig -> ServiceApi -> Word64 -> Int -> RocksDb -> IO RangeSummary
+sampleRangeDb l cfg api seed count rdb = do
     p0 <- limiterPermits (_saLimiter api)
     maxHeight <- probeMaxHeight api (minimum $ sortedChains v)
     let targets = sampleTargets v seed count maxHeight
@@ -365,7 +433,7 @@ sampleRangeDb l api seed count rdb = do
     return $ RangeSummary 0 ps 0 skipped (p1 - p0)
   where
     v = _saVersion api
-    pdb = newPayloadDb rdb
+    pdb = newPayloadDbWith cfg rdb
     logg = logFunctionText l
 
 -- | A database with the payloads (with outputs) of all blocks of one chain in
@@ -375,20 +443,21 @@ sampleRangeDb l api seed count rdb = do
 contiguousRangeDb
     :: Logger l
     => l
+    -> PayloadDbConfig
     -> ServiceApi
     -> ChainId
     -> BlockHeight
     -> BlockHeight
     -> RocksDb
     -> IO RangeSummary
-contiguousRangeDb l api cid lo hi rdb = do
+contiguousRangeDb l cfg api cid lo hi rdb = do
     when (lo > hi) $ throwIO $ userError $ "empty range: " <> show lo <> " > " <> show hi
     when (cid `notElem` sortedChains v) $ throwIO $ userError $ "unknown chain: " <> show cid
     p0 <- limiterPermits (_saLimiter api)
     hdrs <- collectHeaders api cid lo hi
     logg Info $ "chain " <> sshow cid <> ": " <> sshow (length hdrs) <> " headers in heights "
         <> sshow lo <> " to " <> sshow hi
-    ps <- storePayloads api (newPayloadDb rdb) cid
+    ps <- storePayloads api (newPayloadDbWith cfg rdb) cid
         [(view blockHeight hdr, view blockPayloadHash hdr) | hdr <- hdrs]
     p1 <- limiterPermits (_saLimiter api)
     logg Info $ "done: " <> sshow ps <> " payloads"

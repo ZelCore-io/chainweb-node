@@ -33,6 +33,7 @@ import System.LogLevel
 import Chainweb.BlockHeight
 import Chainweb.ChainId
 import Chainweb.Logger
+import Chainweb.Payload.PayloadStore (PayloadDbConfig)
 import Chainweb.Storage.Table.RocksDB
 import Chainweb.StorageTools.Http
 import Chainweb.StorageTools.RangeDb
@@ -51,9 +52,9 @@ data Service = Service
     }
 
 data Command
-    = Range Service FilePath BlockHeight
-    | Sample Service FilePath Word64 Int
-    | Contiguous Service FilePath ChainId BlockHeight BlockHeight
+    = Range Service RangeDbWriteOpts FilePath BlockHeight
+    | Sample Service RangeDbWriteOpts FilePath Word64 Int
+    | Contiguous Service RangeDbWriteOpts FilePath ChainId BlockHeight BlockHeight
     | ShowInfo FilePath
     | Diff ChainwebVersion FilePath FilePath [B8.ByteString]
     | Corrupt FilePath B8.ByteString Int
@@ -101,14 +102,14 @@ dbOption = strOption (long "db" <> metavar "DIR" <> help "the range database")
 commands :: Parser Command
 commands = hsubparser $ mconcat
     [ cmd "range" "headers and payloads of all chains up to a height, and one cut"
-        $ Range <$> serviceOptions <*> dbOption
+        $ Range <$> serviceOptions <*> rangeDbWriteOptsParser <*> dbOption
             <*> option heightReader (long "max-height" <> metavar "HEIGHT" <> help "the height of the cut")
     , cmd "sample" "payloads of a random sample of (chain, height) pairs across the history"
-        $ Sample <$> serviceOptions <*> dbOption
+        $ Sample <$> serviceOptions <*> rangeDbWriteOptsParser <*> dbOption
             <*> option auto (long "seed" <> metavar "SEED")
             <*> option auto (long "count" <> metavar "N" <> help "number of (chain, height) pairs")
     , cmd "contiguous" "payloads of one chain in a range of heights"
-        $ Contiguous <$> serviceOptions <*> dbOption
+        $ Contiguous <$> serviceOptions <*> rangeDbWriteOptsParser <*> dbOption
             <*> option (unsafeChainId <$> auto) (long "chain" <> metavar "CHAIN")
             <*> option heightReader (long "from" <> metavar "HEIGHT")
             <*> option heightReader (long "to" <> metavar "HEIGHT" <> help "inclusive")
@@ -153,14 +154,14 @@ withService (Service url v rate pause) act = do
     api <- newServiceApi url v lim
     act api
 
--- | Writes the new data to SST files before the database is closed. A reader
--- that opens the database read-only replays the write ahead log anyway; the
--- flush leaves a database that needs no replay.
+-- | Writes the new data to SST files before the database is closed, with the
+-- compression of the options. A reader that opens the database read-only
+-- replays the write ahead log anyway; the flush leaves a database that needs
+-- no replay.
 --
-writing :: FilePath -> (RocksDb -> IO RangeSummary) -> IO ()
-writing path act = withRocksDb path modernDefaultOptions $ \db -> do
-    s <- act db
-    flushRocksDb db
+writing :: RangeDbWriteOpts -> FilePath -> (PayloadDbConfig -> RocksDb -> IO RangeSummary) -> IO ()
+writing o path act = do
+    s <- withRangeDbWriting o path $ act (rangeDbPayloadDbConfig o)
     print s
 
 requireDb :: FilePath -> IO ()
@@ -170,12 +171,12 @@ requireDb path = do
 
 run :: Command -> IO ()
 run = \case
-    Range s db h -> withService s $ \api ->
-        writing db $ \rdb -> buildRangeDb logger api (RangeSpec h) rdb
-    Sample s db seed n -> withService s $ \api ->
-        writing db $ \rdb -> sampleRangeDb logger api seed n rdb
-    Contiguous s db c a b -> withService s $ \api ->
-        writing db $ \rdb -> contiguousRangeDb logger api c a b rdb
+    Range s o db h -> withService s $ \api ->
+        writing o db $ \cfg rdb -> buildRangeDb logger cfg api (RangeSpec h) rdb
+    Sample s o db seed n -> withService s $ \api ->
+        writing o db $ \cfg rdb -> sampleRangeDb logger cfg api seed n rdb
+    Contiguous s o db c a b -> withService s $ \api ->
+        writing o db $ \cfg rdb -> contiguousRangeDb logger cfg api c a b rdb
     ShowInfo db -> do
         requireDb db
         T.putStr =<< rangeDbInfo db
