@@ -83,7 +83,7 @@ import System.Random (StdGen, mkStdGen, uniformR)
 import Chainweb.BlockHeight
 import Chainweb.ChainId
 import Chainweb.StorageTools.Compare.PactSet
-import Chainweb.StorageTools.Compare.Run (HostLimiters, isPreSendFailure, limiterFor, newCompareManager)
+import Chainweb.StorageTools.Compare.Run (HostLimiters, isPreSendFailure, isRefusal, limiterFor, newCompareManager)
 import Chainweb.StorageTools.Compare.Sample (historyMaxHeight)
 import Chainweb.StorageTools.Compare.Types
 import Chainweb.StorageTools.Http
@@ -321,10 +321,10 @@ oracleAttempts = 5
 
 -- | One call to the oracle. Each attempt takes a permit of '_saLimiter'.
 -- A call that failed before it reached the oracle ('isPreSendFailure'), and
--- an answer 429 or 5xx, are tried 5 times in all, after 1, 2, 4 and 8 s. Any
--- other failure (a response timeout, a connection closed without an answer)
--- is thrown at once: the oracle may have the request, so it is never sent
--- again.
+-- a refusal ('isRefusal': 429, 503), are tried 5 times in all, after 1, 2, 4
+-- and 8 s. Any other failure (a response timeout, a connection closed without
+-- an answer) is thrown at once, and any other status is returned: the oracle
+-- may have done the work, so the call is never sent again.
 --
 oracleCall :: ServiceApi -> Method -> T.Text -> [Header] -> Maybe B.ByteString -> IO (Int, B.ByteString)
 oracleCall api m path hdrs body = do
@@ -338,7 +338,7 @@ oracleCall api m path hdrs body = do
         go attempt = try (throttled (_saLimiter api) (HTTP.httpLbs req (_saManager api))) >>= \case
             Right resp
                 | s <- statusCode (HTTP.responseStatus resp)
-                , (s == 429 || s >= 500) && attempt < oracleAttempts -> backoff attempt >> go (attempt + 1)
+                , isRefusal s && attempt < oracleAttempts -> backoff attempt >> go (attempt + 1)
                 | otherwise -> return (statusCode (HTTP.responseStatus resp), BL.toStrict (HTTP.responseBody resp))
             Left (e :: HTTP.HttpException)
                 | isPreSendFailure e, attempt < oracleAttempts -> backoff attempt >> go (attempt + 1)

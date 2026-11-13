@@ -31,6 +31,8 @@ module Chainweb.StorageTools.Compare.Run
 , runCompareClasses
 , tipProbe
 , isPreSendFailure
+, isRefusal
+, isGatewayFailure
 , newCompareManager
 , compareWorkers
 , tipRefreshInterval
@@ -222,6 +224,22 @@ isPreSendFailure = \case
     HTTP.HttpExceptionRequest _ HTTP.ConnectionTimeout -> True
     _ -> False
 
+-- | An answer by which the server refused the request before doing any work:
+-- 429 (too many requests) and 503 (unavailable). Such a request is sent
+-- again, with the delays of a call that never reached the server.
+--
+isRefusal :: Int -> Bool
+isRefusal s = s == 429 || s == 503
+
+-- | An answer of a gateway in front of the node, not of the node: 502 (bad
+-- gateway) and 504 (gateway timeout, a response timeout). It is final, like
+-- a response timeout, and counts as no answer: on the oracle the request is
+-- 'Skipped' 'NoOracleAnswer'. Any other status, 500 included, is an answer
+-- of the node and is compared.
+--
+isGatewayFailure :: Int -> Bool
+isGatewayFailure s = s == 502 || s == 504
+
 -- | The HTTP manager of @cw-compare@: the given response timeout in
 -- microseconds, and every request on a connection of its own. A pooled
 -- connection that the server closed while idle looks like a request without
@@ -235,12 +253,15 @@ newCompareManager timeout = HTTP.newTlsManagerWith HTTP.tlsManagerSettings
     , HTTP.managerRetryableException = const False
     }
 
--- | Sends a request through the limiter of the side's host. Any HTTP status
--- is an answer. A call that failed before it reached the server
--- ('isPreSendFailure') is tried '_roTransportAttempts' times (by default 5,
--- with delays of 1, 2, 4 and 8 seconds); each attempt takes a permit. Any
--- other failure is final and sent once only. A @/local@ to the oracle waits
--- '_roOracleLocalTimeout' for its answer.
+-- | Sends a request through the limiter of the side's host. A call that
+-- failed before it reached the server ('isPreSendFailure'), or that the
+-- server refused ('isRefusal': 429, 503), is tried '_roTransportAttempts'
+-- times (by default 5, with delays of 1, 2, 4 and 8 seconds); each attempt
+-- takes a permit. Everything else is final and sent once only: a response
+-- timeout, a connection closed without an answer, a gateway failure
+-- ('isGatewayFailure': 502, 504) and a refusal after the last attempt are no
+-- answer ('Left'); any other status, 500 included, is the answer. A @/local@
+-- to the oracle waits '_roOracleLocalTimeout' for its answer.
 --
 sendRaw
     :: Env
@@ -269,16 +290,21 @@ sendRaw env role method path hdrs body = go (1 :: Int)
                     , HTTP.responseTimeout = timeout
                     }
             HTTP.httpLbs req (_envManager env)
+        let again = threadDelay (_roRetryDelay opts * 2 ^ (attempt - 1)) >> go (attempt + 1)
+            noAnswer why = return $ Left $
+                "no answer from " <> _sideName side <> " for " <> T.pack url
+                <> " after " <> sshow attempt <> " attempt(s): " <> why
         case r of
-            Right resp -> return $ Right
-                (statusCode (HTTP.responseStatus resp), BL.toStrict (HTTP.responseBody resp))
+            Right resp
+                | isRefusal s, attempt < _roTransportAttempts opts -> again
+                | isRefusal s -> noAnswer ("refused with status " <> sshow s)
+                | isGatewayFailure s -> noAnswer ("gateway status " <> sshow s)
+                | otherwise -> return $ Right (s, BL.toStrict (HTTP.responseBody resp))
+              where
+                s = statusCode (HTTP.responseStatus resp)
             Left (e :: HTTP.HttpException)
-                | isPreSendFailure e, attempt < _roTransportAttempts opts -> do
-                    threadDelay (_roRetryDelay opts * 2 ^ (attempt - 1))
-                    go (attempt + 1)
-                | otherwise -> return $ Left $
-                    "no answer from " <> _sideName side <> " for " <> T.pack url
-                    <> " after " <> sshow attempt <> " attempt(s): " <> sshow e
+                | isPreSendFailure e, attempt < _roTransportAttempts opts -> again
+                | otherwise -> noAnswer (sshow e)
 
 requestHeaders :: Request -> [Header]
 requestHeaders r = (hAccept, "application/json")

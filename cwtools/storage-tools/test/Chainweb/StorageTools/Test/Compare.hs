@@ -491,6 +491,9 @@ data StubConfig = StubConfig
     , _scDropLocal :: !Bool
         -- ^ a @/local@ request that is not a tip probe gets no answer: the
         -- connection is closed after the request was read
+    , _scPayloadStatuses :: ![Int]
+        -- ^ the statuses of the first payload answers, in order, before the
+        -- payloads themselves
     }
 
 -- | Arrival time and path with query of every request a stub saw.
@@ -513,6 +516,7 @@ oracleConf = StubConfig
     , _scDataTag = ""
     , _scDelay = 0
     , _scDropLocal = False
+    , _scPayloadStatuses = []
     }
 
 -- | The same answers as the oracle at a different tip, without the orphan.
@@ -525,8 +529,8 @@ testConf = oracleConf
 
 -- | A stub service. History code (@txids@) fails at the tip, as on Pact 5.
 --
-stubApp :: Seen -> IORef Int -> StubConfig -> Application
-stubApp seen probes sc req respond = do
+stubApp :: Seen -> IORef Int -> IORef Int -> StubConfig -> Application
+stubApp seen probes payloadHits sc req respond = do
     body <- BL.toStrict <$> strictRequestBody req
     t <- getMonotonicTime
     let full = T.decodeUtf8 (rawPathInfo req <> rawQueryString req)
@@ -556,7 +560,11 @@ stubApp seen probes sc req respond = do
                 , "],\"limit\":", B8.pack (show (1 + length (_scOrphanHeaders sc))), ",\"next\":null}"
                 ]
             Nothing -> reply 400 "no minheight"
-        ["chain", "0", "payload", h] -> maybe (reply 404 "not found") (reply 200) (M.lookup h (_scPayloads sc))
+        ["chain", "0", "payload", h] -> do
+            n <- atomicModifyIORef' payloadHits (\k -> (k + 1, k))
+            case drop n (_scPayloadStatuses sc) of
+                st : _ -> reply st ("status " <> B8.pack (show st))
+                [] -> maybe (reply 404 "not found") (reply 200) (M.lookup h (_scPayloads sc))
         ["chain", "0", "pact", "api", "v1", "local"] -> case q "rewindDepth" of
             Just d
                 | "(+ 1 1)" `B.isInfixOf` body -> do
@@ -612,7 +620,8 @@ withSides rate oc tc act = do
 serve :: Seen -> Maybe StubConfig -> (Int -> IO a) -> IO a
 serve seen (Just sc) k = do
     probes <- newIORef 0
-    testWithApplication (return (stubApp seen probes sc)) k
+    payloadHits <- newIORef 0
+    testWithApplication (return (stubApp seen probes payloadHits sc)) k
 serve _ Nothing k = do
     closed <- testWithApplication (return (\_ respond -> respond (responseLBS status200 [] ""))) return
     k closed
@@ -810,6 +819,30 @@ runTests = testGroup "runCompare"
             reportCount rep ClsPayload KindSame @?= 1
             n <- probeCount <$> seenPaths so
             n @?= 1
+
+    , testCase "a refusal (429, 503) is sent again; a 500 is a final answer; a gateway 504 is final and no answer" $ do
+        let opts = defaultRunOptions { _roTransportAttempts = 5, _roRetryDelay = 10_000 }
+            payloads = length . filter ("/payload/" `T.isInfixOf`)
+            run oc tc = withStubs 1_000 oc tc $ \o t so st -> do
+                rep <- runCompareWith quietLogger opts cov o t [payloadReqFor payloadA]
+                (,,) rep <$> (payloads <$> seenPaths so) <*> (payloads <$> seenPaths st)
+        (r1, o1, t1) <- run oracleConf { _scPayloadStatuses = [503, 429] } testConf
+        (o1, t1) @?= (3, 1)
+        reportCount r1 ClsPayload KindSame @?= 1
+        (r2, o2, t2) <- run oracleConf { _scPayloadStatuses = [500] } testConf { _scPayloadStatuses = [500] }
+        (o2, t2) @?= (1, 1)
+        reportSameNon2xx r2 ClsPayload @?= 1
+        (r3, o3, _) <- run oracleConf { _scPayloadStatuses = [504] } testConf
+        o3 @?= 1
+        reportSkippedFor r3 NoOracleAnswer @?= 1
+        (r4, o4, _) <- run oracleConf { _scPayloadStatuses = replicate 5 503 } testConf
+        o4 @?= 5
+        reportSkippedFor r4 NoOracleAnswer @?= 1
+        (r5, _, t5) <- run oracleConf testConf { _scPayloadStatuses = [502] }
+        t5 @?= 1
+        reportNoAnswer r5 NoAnswerTest @?= 1
+        map isRefusal [429, 503, 500, 502, 504] @?= [True, True, False, False, False]
+        map isGatewayFailure [429, 503, 500, 502, 504] @?= [False, False, False, True, True]
 
     , testCase "only a call that never reached the server is tried again" $ do
         let failure = HTTP.HttpExceptionRequest HTTP.defaultRequest
