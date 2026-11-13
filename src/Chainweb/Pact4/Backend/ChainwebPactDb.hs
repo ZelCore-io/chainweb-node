@@ -521,7 +521,7 @@ doKeys mlim d = do
             Just () -> do
                 forM_ mlim (failIfTableDoesNotExistInDbAtHeight "doKeys" tn . fst)
                 ks <- callStore "doKeys" $ \store ->
-                          _psDistinctKeys store KeysAsStored tn (snd <$> mlim)
+                          _psDistinctKeys store (KeysAsStored (snd <$> mlim)) tn
                 forM ks $ \k -> return $! T.unpack $ fromUtf8 (Utf8 k)
 
     tn = domainTableName d

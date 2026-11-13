@@ -60,13 +60,15 @@ makePrisms ''Historical
 
 type TxId = Pact4.TxId
 
--- | Which @SELECT DISTINCT rowkey@ statement '_psDistinctKeys' runs.
+-- | Which @SELECT DISTINCT rowkey@ statement '_psDistinctKeys' runs, and its
+-- bound: only rows with @txid < bound@ count.
 data KeysQuery
-    = KeysAsStored
+    = KeysAsStored !(Maybe TxId)
     -- ^ Pact 4's statement, without @ORDER BY@: the keys in the order SQLite
-    -- returns them.
-    | KeysOrderedByKey
-    -- ^ Pact 5's statement, with @ORDER BY rowkey@.
+    -- returns them. Unbounded at the tip, bounded when rewound.
+    | KeysOrderedByKey !TxId
+    -- ^ Pact 5's statement, with @ORDER BY rowkey@. Pact 5 always reads
+    -- below a bound, so the bound is mandatory.
     deriving stock (Eq, Show)
 
 -- | Everything one block writes, in the order 3.2.1 writes it.
@@ -119,9 +121,9 @@ data PactStore = PactStore
     , _psReadHistorical :: !(Text -> ByteString -> TxId -> IO (Either SQ3.Error (Maybe (ByteString, ByteString))))
         -- ^ table, rowkey, bound: the stored rowkey and row data of the newest
         -- row with @txid < bound@
-    , _psDistinctKeys :: !(KeysQuery -> Text -> Maybe TxId -> IO (Either SQ3.Error [ByteString]))
-        -- ^ the distinct row keys, among rows with @txid < bound@ when a
-        -- bound is given
+    , _psDistinctKeys :: !(KeysQuery -> Text -> IO (Either SQ3.Error [ByteString]))
+        -- ^ the distinct row keys of the table, among the rows the query's
+        -- bound admits
     , _psTxIdsAfter :: !(Text -> TxId -> IO (Either SQ3.Error [TxId]))
         -- ^ the distinct txids greater than the given one
     , _psRowsAtTxId :: !(Text -> TxId -> IO (Either SQ3.Error [(ByteString, ByteString)]))

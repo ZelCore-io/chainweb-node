@@ -202,23 +202,17 @@ readHistorical db tableName k e = runExceptT $ do
       _ -> internalError $ "lookupHistorical: expected single-row result, got " <> sshow r
 
 -- | Pact 4 @doKeys@ ('KeysAsStored') and Pact 5 @doKeys@ ('KeysOrderedByKey').
-distinctKeys :: SQLiteEnv -> KeysQuery -> Text -> Maybe TxId -> IO (Either SQ3.Error [ByteString])
-distinctKeys db q tn mlim = runExceptT $ do
+distinctKeys :: SQLiteEnv -> KeysQuery -> Text -> IO (Either SQ3.Error [ByteString])
+distinctKeys db q tn = runExceptT $ do
     ks <- case q of
-        KeysAsStored -> do
+        KeysAsStored mlim -> do
             let blockLimitStmt = maybe "" (const " WHERE txid < ?;") mlim
             let blockLimitParam = maybe [] (\txid -> [txIdParam txid]) mlim
             qry db ("SELECT DISTINCT rowkey FROM " <> tbl (toUtf8 tn) <> blockLimitStmt) blockLimitParam [Pact4.RText]
-        KeysOrderedByKey -> case mlim of
-            Just txid ->
-                qry db
-                    ("SELECT DISTINCT rowkey FROM " <> tbl (toUtf8 tn) <> "WHERE txid < ? ORDER BY rowkey;")
-                    [txIdParam txid] [Pact4.RText]
-            -- not issued by 3.2.1, whose Pact 5 reads are always bounded
-            Nothing ->
-                qry db
-                    ("SELECT DISTINCT rowkey FROM " <> tbl (toUtf8 tn) <> " ORDER BY rowkey;")
-                    [] [Pact4.RText]
+        KeysOrderedByKey txid ->
+            qry db
+                ("SELECT DISTINCT rowkey FROM " <> tbl (toUtf8 tn) <> "WHERE txid < ? ORDER BY rowkey;")
+                [txIdParam txid] [Pact4.RText]
     forM ks $ \case
         [Pact4.SText (Utf8 k)] -> return k
         _ -> internalError "doKeys: The impossible happened."

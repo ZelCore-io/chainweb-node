@@ -70,13 +70,13 @@ tests = testGroup "PactStore SQLite"
 
     , testCase "distinctKeys KeysOrderedByKey is ascending bytewise; KeysAsStored is the set SQLite returns" $ withStore $ \sql ps -> do
         commit ps 1 ["t"] [("t", [("b", 1, "x"), ("a", 2, "x"), ("C", 3, "x"), ("a", 4, "x"), ("k10", 5, "x"), ("k9", 6, "x")])] []
-        _psDistinctKeys ps KeysOrderedByKey "t" (Just 7) >>= (@?= Right ["C", "a", "b", "k10", "k9"])
-        _psDistinctKeys ps KeysOrderedByKey "t" (Just 3) >>= (@?= Right ["a", "b"])
+        _psDistinctKeys ps (KeysOrderedByKey 7) "t" >>= (@?= Right ["C", "a", "b", "k10", "k9"])
+        _psDistinctKeys ps (KeysOrderedByKey 3) "t" >>= (@?= Right ["a", "b"])
         raw <- (\rs -> [ k | [P4SQL.SText (SQ3.Utf8 k)] <- rs ]) <$> P4SQL.qry_ sql "SELECT DISTINCT rowkey FROM [t]" [P4SQL.RText]
-        Right asStored <- _psDistinctKeys ps KeysAsStored "t" Nothing
+        Right asStored <- _psDistinctKeys ps (KeysAsStored Nothing) "t"
         asStored @?= raw
         sort asStored @?= ["C", "a", "b", "k10", "k9"]
-        Right asStoredBelow3 <- _psDistinctKeys ps KeysAsStored "t" (Just 3)
+        Right asStoredBelow3 <- _psDistinctKeys ps (KeysAsStored (Just 3)) "t"
         sort asStoredBelow3 @?= ["a", "b"]
 
     , testCase "commitBlock: rowids ascend in _bcRows order; each table's mutation row right after its rows; index and history rows written" $ withStore $ \sql ps -> do
