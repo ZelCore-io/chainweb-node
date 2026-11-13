@@ -22,6 +22,8 @@ module Chainweb.StorageTools.RangeDb
   RangeSpec(..)
 , RangeSummary(..)
 , buildRangeDb
+, buildRangeDbWith
+, canonicalTips
 , sampleRangeDb
 , sampleTargets
 , contiguousRangeDb
@@ -60,6 +62,7 @@ import Data.Bits (xor)
 import Data.Containers.ListUtils (nubOrd)
 import Data.Foldable (toList)
 import qualified Data.HashMap.Strict as HM
+import qualified Data.HashSet as HS
 import Data.IORef
 import Data.List (sortOn)
 import qualified Data.Set as S
@@ -76,11 +79,13 @@ import System.Random
 
 import Chainweb.BlockHeader
 import Chainweb.BlockHeaderDB.Internal (unsafeInsertBlockHeaderDb)
+import Chainweb.BlockHeaderDB.RestAPI.Client (branchHeadersClient)
 import Chainweb.BlockHeight
 import Chainweb.ChainId
 import Chainweb.Cut (unsafeMkCut)
 import Chainweb.Cut.CutHashes
 import Chainweb.CutDB (cutHashesTable)
+import Chainweb.CutDB.RestAPI.Client (cutGetClient)
 import Chainweb.Logger
 import Chainweb.Payload
 import Chainweb.Payload.PayloadStore
@@ -88,7 +93,9 @@ import Chainweb.Payload.PayloadStore.RocksDB
 import Chainweb.Storage.Table
 import Chainweb.Storage.Table.RocksDB
 import Chainweb.StorageTools.Http
+import Chainweb.TreeDB (BranchBounds(..), UpperBound(..))
 import Chainweb.Utils (int, sshow)
+import Chainweb.Utils.Paging (Page(..))
 import Chainweb.Version
 import Chainweb.WebBlockHeaderDB (getWebBlockHeaderDb, initWebBlockHeaderDb)
 
@@ -197,22 +204,28 @@ data RangeSummary = RangeSummary
 -- payload that the service returned does not hash to the key that was
 -- requested.
 --
--- The cut holds the header at the height of each chain. If a chain has several
--- headers at that height, the one with the lowest hash is used, and a warning
--- is logged.
+-- The cut holds the canonical header at the height of each chain, that is the
+-- ancestor at that height of the tip of the cut that the service reports (see
+-- 'canonicalTips'). Orphan headers and their payloads, at that height and
+-- below, are copied like all others.
 --
 buildRangeDb :: Logger l => l -> ServiceApi -> RangeSpec -> RocksDb -> IO RangeSummary
-buildRangeDb l api (RangeSpec maxHeight) rdb = do
+buildRangeDb l api = buildRangeDbWith l api (runServiceApi api $ cutGetClient $ _saVersion api)
+
+-- | 'buildRangeDb' with the action that gets the current cut of the source.
+-- The cut is read once, after the headers and payloads were copied.
+--
+buildRangeDbWith :: Logger l => l -> ServiceApi -> IO CutHashes -> RangeSpec -> RocksDb -> IO RangeSummary
+buildRangeDbWith l api getSrcCut (RangeSpec maxHeight) rdb = do
     p0 <- limiterPermits (_saLimiter api)
     wdb <- initWebBlockHeaderDb rdb v
     let pdb = newPayloadDb rdb
     nHeaders <- newIORef (0 :: Int)
     nPayloads <- newIORef (0 :: Int)
-    tips <- forM (sortedChains v) $ \cid -> do
+    forM_ (sortedChains v) $ \cid -> do
         logg Info $ "chain " <> sshow cid <> ": copying headers and payloads up to height " <> sshow maxHeight
         bdb <- getWebBlockHeaderDb wdb cid
         pending <- newIORef []
-        tipsRef <- newIORef []
         let flush = do
                 reqs <- reverse <$> readIORef pending
                 writeIORef pending []
@@ -221,21 +234,15 @@ buildRangeDb l api (RangeSpec maxHeight) rdb = do
         forHeaders api cid 0 maxHeight $ \hdrs -> do
             forM_ hdrs $ unsafeInsertBlockHeaderDb bdb
             modifyIORef' nHeaders (+ length hdrs)
-            modifyIORef' tipsRef (filter ((== maxHeight) . view blockHeight) hdrs <>)
             forM_ hdrs $ \hdr ->
                 modifyIORef' pending ((view blockHeight hdr, view blockPayloadHash hdr) :)
             len <- length <$> readIORef pending
             when (len >= payloadBatchSize) flush
         flush
-        candidates <- readIORef tipsRef
-        tip <- case sortOn (view blockHash) candidates of
-            [] -> throwIO $ userError $ "chain " <> show cid <> " has no header at height " <> show maxHeight
-            [t] -> return t
-            t : _ -> do
-                logg Warn $ "chain " <> sshow cid <> " has " <> sshow (length candidates)
-                    <> " headers at height " <> sshow maxHeight <> "; using " <> sshow (view blockHash t)
-                return t
-        return (cid, tip)
+    srcCut <- getSrcCut
+    tips <- canonicalTips api srcCut maxHeight
+    forM_ tips $ \(cid, hdr) ->
+        logg Info $ "chain " <> sshow cid <> ": cut at " <> sshow (view blockHash hdr)
     let cut = unsafeMkCut v (HM.fromList tips)
     casInsert (cutHashesTable rdb) (cutToCutHashes Nothing cut)
     p1 <- limiterPermits (_saLimiter api)
@@ -246,6 +253,37 @@ buildRangeDb l api (RangeSpec maxHeight) rdb = do
   where
     v = _saVersion api
     logg = logFunctionText l
+
+-- | The canonical header at the given height of each chain: the ancestor at
+-- that height of the tip of the chain in the cut. The service is asked for
+-- the branch of the tip, bounded to the height, so that a fork at that height
+-- cannot lead to a header that is not an ancestor of the cut. (The height
+-- limit of the cut endpoint is a cut height, which is only approximately a
+-- block height, and is not used.)
+--
+-- Fails if a chain is not in the cut, if the tip of a chain is below the
+-- height, or if the service has no ancestor of the tip at the height.
+--
+canonicalTips :: ServiceApi -> CutHashes -> BlockHeight -> IO [(ChainId, BlockHeader)]
+canonicalTips api srcCut h = forM (sortedChains v) $ \cid -> do
+    let failWith :: String -> IO a
+        failWith msg = throwIO $ userError $ "chain " <> show cid <> " " <> msg
+    BlockHashWithHeight tipHeight tipHash <- case HM.lookup cid (_cutHashes srcCut) of
+        Nothing -> failWith "is not in the cut of the service"
+        Just t -> return t
+    when (tipHeight < h) $
+        failWith $ "has a tip at height " <> show tipHeight <> ", below " <> show h
+    page <- runServiceApi api $ branchHeadersClient v cid (Just 1) Nothing
+        (Just $ int h) (Just $ int h)
+        (BranchBounds mempty (HS.singleton $ UpperBound tipHash))
+    case _pageItems page of
+        [] -> failWith $ "has no ancestor of its tip " <> show tipHash <> " at height " <> show h
+        hdr : _
+            | view blockHeight hdr == h -> return (cid, hdr)
+            | otherwise -> failWith $ "returned a header at height " <> show (view blockHeight hdr)
+                <> " for height " <> show h
+  where
+    v = _saVersion api
 
 -- | The (chain, height) targets of a sample: up to @count@ distinct targets
 -- drawn uniformly from all chains and from the heights between the genesis

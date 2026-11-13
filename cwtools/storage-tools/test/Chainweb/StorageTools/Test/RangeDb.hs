@@ -1,6 +1,8 @@
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE NumericUnderscores #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TypeApplications #-}
 
 -- |
 -- Module: Chainweb.StorageTools.Test.RangeDb
@@ -13,12 +15,15 @@ module Chainweb.StorageTools.Test.RangeDb
 ( tests
 ) where
 
+import Control.Exception (IOException, try)
 import Control.Lens (view)
 import Control.Monad
 
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as B8
 import qualified Data.HashMap.Strict as HM
+import Data.IORef
+import Data.List (isInfixOf)
 import qualified Data.Set as S
 import qualified Data.Text as T
 import qualified Data.Vector as V
@@ -38,9 +43,11 @@ import Test.Tasty.HUnit
 
 -- internal modules
 
+import Chainweb.BlockHash (BlockHash)
 import Chainweb.BlockHeader
 import Chainweb.BlockHeight
 import Chainweb.ChainId
+import Chainweb.Cut (_cutMap)
 import Chainweb.Cut.CutHashes
 import Chainweb.CutDB (cutHashesTable)
 import Chainweb.Graph (pairChainGraph)
@@ -100,19 +107,37 @@ mkPayload cid h = newPayloadWithOutputs
 -- | Mines blocks round robin until each chain has the given height.
 --
 mineTo :: TestBlockDb -> BlockHeight -> IO ()
-mineTo tdb target = do
+mineTo = mineToWith mkPayload
+
+-- | Mines blocks round robin until each chain has the given height, with the
+-- payloads of the given function.
+--
+mineToWith :: (ChainId -> BlockHeight -> PayloadWithOutputs) -> TestBlockDb -> BlockHeight -> IO ()
+mineToWith payload tdb target = do
     hs <- forM cids $ \cid -> (,) cid . view blockHeight <$> getParentTestBlockDb tdb cid
     unless (all ((>= target) . snd) hs) $ do
         forM_ hs $ \(cid, h) -> when (h < target) $ do
             let h' = succ h
-            void $ addTestBlockDb tdb h' (Nonce (int h')) (offsetBlockTime second) cid (mkPayload cid h')
-        mineTo tdb target
+            void $ addTestBlockDb tdb h' (Nonce (int h')) (offsetBlockTime second) cid (payload cid h')
+        mineToWith payload tdb target
 
 data Source = Source
     { _srcRocks :: !RocksDb
     , _srcDb :: !TestBlockDb
     , _srcApi :: !ServiceApi
+    , _srcCutOverride :: !(IORef (Maybe CutHashes))
+        -- ^ the cut that the source reports; by default the cut of the test
+        -- block DB
     }
+
+-- | The action that gets the cut of the source for 'buildRangeDbWith'. The
+-- loopback server has no cut DB, and the cut is the one of the test block DB
+-- unless a test sets another one.
+--
+srcCut :: Source -> IO CutHashes
+srcCut src = readIORef (_srcCutOverride src) >>= \case
+    Just c -> return c
+    Nothing -> cutToCutHashes Nothing <$> getCutTestBlockDb (_srcDb src)
 
 -- | Mines a source up to 'maxH' and serves it on a loopback socket with an
 -- ephemeral port.
@@ -142,10 +167,16 @@ withSourceTo height act = withTempRocksDb "storage-tools-source" $ \rdb -> do
     testWithApplication (return app) $ \port -> do
         lim <- newLimiter 1_000 Nothing
         api <- newServiceApi ("http://127.0.0.1:" <> T.pack (show port)) testVer lim
-        act (Source srcRocks tdb api)
+        override <- newIORef Nothing
+        act (Source srcRocks tdb api override)
 
 -- -------------------------------------------------------------------------- --
 -- Utils
+
+failsNaming :: ChainId -> Either IOException a -> Bool
+failsNaming cid = \case
+    Left e -> ("chain " <> show cid) `isInfixOf` show e
+    Right _ -> False
 
 diffReport :: DiffSummary -> String
 diffReport = show
@@ -176,14 +207,82 @@ payloadKeysOf src targets = fmap (S.fromList . concat) $ forM targets $ \(cid, h
 namespaceSize :: RocksDb -> B.ByteString -> IO Int
 namespaceSize db ns = length <$> readNamespace db ns
 
+-- | A branch of a forked source: a cut whose tips are above 'maxH', and the
+-- hashes of the headers of the branch at 'maxH'.
+--
+data Branch = Branch
+    { _brCut :: !CutHashes
+    , _brAtMaxH :: !(HM.HashMap ChainId BlockHash)
+    }
+
+-- | A source with a fork at height 'maxH' on both chains. Below that height
+-- there is one chain of blocks. Above it, there are two branches, each with a
+-- block at 'maxH' and one above it.
+--
+withForkedSource :: (Source -> Branch -> Branch -> IO a) -> IO a
+withForkedSource act = withSourceTo (maxH - 1) $ \src -> do
+    let tdb = _srcDb src
+        mine payload = do
+            mineToWith payload tdb maxH
+            atH <- fmap (view blockHash) . _cutMap <$> getCutTestBlockDb tdb
+            mineToWith payload tdb (maxH + 1)
+            c <- getCutTestBlockDb tdb
+            return $ Branch (cutToCutHashes Nothing c) atH
+    base <- getCutTestBlockDb tdb
+    brA <- mine mkPayload
+    -- the same parents, with other payloads
+    setCutTestBlockDb tdb base
+    brB <- mine $ \cid h -> mkPayload cid (h + 1_000)
+    act src brA brB
+
 -- -------------------------------------------------------------------------- --
 -- Tests
 
 tests :: TestTree
 tests = testGroup "Range DB"
-    [ testCase "range DB equals the source on header and payload namespaces" $
+    [ testCase "canonicalTips: the ancestor of each tip at the height, whichever branch has the lower hash" $
+        withForkedSource $ \src brA brB -> do
+            -- the forks are real
+            forM_ cids $ \cid -> do
+                hdrs <- headersAtHeight src cid maxH
+                assertEqual ("headers at the fork on chain " <> show cid) 2 (length hdrs)
+            forM_ [("A", brA), ("B", brB)] $ \(name, br) -> do
+                tips <- canonicalTips (_srcApi src) (_brCut br) maxH
+                assertEqual ("chains of branch " <> name) cids (fst <$> tips)
+                forM_ tips $ \(cid, hdr) -> do
+                    assertEqual ("height on chain " <> show cid) maxH (view blockHeight hdr)
+                    assertEqual ("hash on chain " <> show cid <> " of branch " <> name)
+                        (_brAtMaxH br HM.! cid) (view blockHash hdr)
+
+    , testCase "range DB of a forked source has the cut of the branch of the source's cut, and the headers of both branches" $
+        withForkedSource $ \src brA brB -> forM_ [("A", brA), ("B", brB)] $ \(name, br) ->
+            withTempRocksDb "storage-tools-range" $ \dst -> do
+                writeIORef (_srcCutOverride src) (Just $ _brCut br)
+                s <- buildRangeDbWith silent (_srcApi src) (srcCut src) (RangeSpec maxH) dst
+                -- everything up to the height, orphans included: 2 chains, maxH + 2 headers
+                assertEqual "headers" (2 * (int maxH + 2)) (_rsHeaders s)
+                assertSubset src dst
+                ch <- withTableIterator (unCasify $ cutHashesTable dst) $ \it -> iterLast it >> iterValue it
+                case ch of
+                    Nothing -> assertFailure "no cut"
+                    Just c -> assertEqual ("cut of branch " <> name)
+                        (HM.toList $ _brAtMaxH br)
+                        (HM.toList $ _bhwhHash <$> _cutHashes c)
+
+    , testCase "canonicalTips fails clearly for a tip below the height and for a chain that is not in the cut" $
+        withForkedSource $ \src brA _ -> do
+            let c = _brCut brA
+                c0 = unsafeChainId 0
+                low = c { _cutHashes = HM.adjust (\t -> t { _bhwhHeight = maxH - 1 }) c0 (_cutHashes c) }
+                missing = c { _cutHashes = HM.delete c0 (_cutHashes c) }
+            r1 <- try @IOException $ canonicalTips (_srcApi src) low maxH
+            assertBool ("tip below the height: " <> show (void r1)) $ failsNaming c0 r1
+            r2 <- try @IOException $ canonicalTips (_srcApi src) missing maxH
+            assertBool ("chain not in the cut: " <> show (void r2)) $ failsNaming c0 r2
+
+    , testCase "range DB equals the source on header and payload namespaces" $
         withSource $ \src -> withTempRocksDb "storage-tools-range" $ \dst -> do
-            s <- buildRangeDb silent (_srcApi src) (RangeSpec maxH) dst
+            s <- buildRangeDbWith silent (_srcApi src) (srcCut src) (RangeSpec maxH) dst
             d <- diffRangeDbs (_srcRocks src) dst (allNamespaces testVer)
             assertNoDiff "range DB differs from the source" d
             -- the comparison is not vacuous
@@ -196,7 +295,7 @@ tests = testGroup "Range DB"
 
     , testCase "range DB has one cut with every chain at the max height" $
         withSource $ \src -> withTempRocksDb "storage-tools-range" $ \dst -> do
-            _ <- buildRangeDb silent (_srcApi src) (RangeSpec maxH) dst
+            _ <- buildRangeDbWith silent (_srcApi src) (srcCut src) (RangeSpec maxH) dst
             n <- namespaceSize dst "CutHashes"
             assertEqual "number of cuts" 1 n
             ch <- withTableIterator (unCasify $ cutHashesTable dst) $ \it -> do
@@ -216,7 +315,7 @@ tests = testGroup "Range DB"
         withSourceTo 1_100 $ \src -> withTempRocksDb "storage-tools-range" $ \dst -> do
             top <- probeMaxHeight (_srcApi src) (unsafeChainId 1)
             assertEqual "probeMaxHeight" 1_100 top
-            s <- buildRangeDb silent (_srcApi src) (RangeSpec 1_100) dst
+            s <- buildRangeDbWith silent (_srcApi src) (srcCut src) (RangeSpec 1_100) dst
             assertEqual "headers" (2 * 1_101) (_rsHeaders s)
             assertEqual "payloads" (2 * 1_101) (_rsPayloads s)
             d <- diffRangeDbs (_srcRocks src) dst (allNamespaces testVer)
@@ -227,7 +326,7 @@ tests = testGroup "Range DB"
             let dbPath = dir </> "range-db"
             -- no flush: rangeDbInfo applies the write ahead log
             withRocksDb dbPath modernDefaultOptions $ \dst ->
-                void $ buildRangeDb silent (_srcApi src) (RangeSpec maxH) dst
+                void $ buildRangeDbWith silent (_srcApi src) (srcCut src) (RangeSpec maxH) dst
             info <- rangeDbInfo dbPath
             let ls = T.lines info
             assertBool ("highest cut in\n" <> T.unpack info) (any (T.isPrefixOf "highest cut: height ") ls)
@@ -241,7 +340,7 @@ tests = testGroup "Range DB"
 
     , testCase "corruptEntry makes diffRangeDbs report exactly that key" $
         withSource $ \src -> withTempRocksDb "storage-tools-range" $ \dst -> do
-            _ <- buildRangeDb silent (_srcApi src) (RangeSpec maxH) dst
+            _ <- buildRangeDbWith silent (_srcApi src) (srcCut src) (RangeSpec maxH) dst
             let ns = "BlockPayload2"
             entriesBefore <- readNamespace dst ns
             let n = 3
@@ -319,7 +418,7 @@ tests = testGroup "Range DB"
             let dbPath = dir </> "range-db"
                 workPath = dir </> "work"
             withRocksDb dbPath modernDefaultOptions $ \dst -> do
-                _ <- buildRangeDb silent (_srcApi src) (RangeSpec maxH) dst
+                _ <- buildRangeDbWith silent (_srcApi src) (srcCut src) (RangeSpec maxH) dst
                 flushRocksDb dst
             sizes <- measurePayloadSizes dbPath workPath
             let reported = _psNamespaces sizes
