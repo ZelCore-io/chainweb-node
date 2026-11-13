@@ -413,6 +413,7 @@ executable cw-compare
     build-depends:
         -- internal
         , chainweb
+        , chainweb-storage
         , cwtools:storage-tools
 
         -- external

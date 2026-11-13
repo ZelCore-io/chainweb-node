@@ -1,3 +1,4 @@
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 
 -- |
@@ -14,9 +15,19 @@
 -- give the same requests. With @--requests FILE@, the requests are read from
 -- a file with one JSON request per line instead.
 --
+-- The test side is a node's service API (@--test URL@), or the service API
+-- served in process from a node's database directory (@--test-db DIR@, see
+-- "Chainweb.StorageTools.Compare.InProcess"). In-process, only the
+-- @--pact-chains@ get a Pact service: the classes Pact answers (@/local@,
+-- History, preflight, @/poll@, @/spv@) are covered on those chains only, and
+-- their requests on other chains are skipped as not covered, never sent.
+--
 -- Requests and the oracle lookups that build them are rate limited per host
 -- across all threads; two sides on one host share the limit. While the pause
--- file exists, no request is made.
+-- file exists, no request is made, to either side.
+--
+-- A target whose oracle lookups fail is dropped and counted as skipped at
+-- generation; more than 1% of the targets dropped voids the run.
 --
 -- Exit codes: 0 if the run passes, 2 if it fails (a difference), 3 if it is
 -- void and must be rerun, 1 on bad arguments or a crash.
@@ -41,12 +52,15 @@ import System.LogLevel
 import Chainweb.BlockHeight
 import Chainweb.ChainId
 import Chainweb.Logger
+import Chainweb.Storage.Table.RocksDB.Tuning (defaultTuning, payloadZstdTuning)
+import Chainweb.StorageTools.Compare.InProcess
 import Chainweb.StorageTools.Compare.PactSet
 import Chainweb.StorageTools.Compare.Report
 import Chainweb.StorageTools.Compare.Requests
 import Chainweb.StorageTools.Compare.Run
 import Chainweb.StorageTools.Compare.Sample
 import Chainweb.StorageTools.Compare.Types
+import Chainweb.Utils (toText)
 import Chainweb.Version
 import Chainweb.Version.Mainnet (mainnet)
 import Chainweb.Version.Registry (findKnownVersion)
@@ -56,7 +70,7 @@ import Chainweb.Version.Registry (findKnownVersion)
 
 data Options = Options
     { _optOracle :: !T.Text
-    , _optTest :: !T.Text
+    , _optTest :: !TestSide
     , _optVersion :: !ChainwebVersion
     , _optChains :: ![ChainId]
     , _optHeights :: !(BlockHeight, BlockHeight)
@@ -64,6 +78,17 @@ data Options = Options
     , _optRate :: !Double
     , _optPauseFile :: !(Maybe FilePath)
     , _optReport :: !FilePath
+    }
+
+data TestSide
+    = TestUrl !T.Text
+    | TestDb !DbSide
+
+data DbSide = DbSide
+    { _tdDir :: !FilePath
+    , _tdPactChains :: ![ChainId]
+    , _tdZstd :: !Bool
+    , _tdLocal :: !LocalSettings
     }
 
 data Source
@@ -97,6 +122,59 @@ splitOn :: Char -> String -> [String]
 splitOn c s = case break (== c) s of
     (a, []) -> [a]
     (a, _ : rest) -> a : splitOn c rest
+
+compressionReader :: ReadM Bool
+compressionReader = eitherReader $ \case
+    "snappy" -> Right False
+    "zstd-dict" -> Right True
+    s -> Left $ "unknown payload compression, expected snappy or zstd-dict: " <> s
+
+testDbOptions :: Parser DbSide
+testDbOptions = DbSide
+    <$> strOption
+        ( long "test-db"
+        <> metavar "DIR"
+        <> help "serve the test side in process from this node database directory (the one that holds rocksDb and sqlite, or its parent); RocksDB is opened read-only, but Pact opens the SQLite files read-write: use a copy or a stopped node's files only"
+        )
+    <*> option chainsReader
+        ( long "pact-chains"
+        <> metavar "0,3,..."
+        <> help "with --test-db: the chains that get a Pact service; /local, history, preflight, poll and spv are covered on these chains only"
+        )
+    <*> option compressionReader
+        ( long "payload-compression"
+        <> metavar "snappy|zstd-dict"
+        <> value False
+        <> help "with --test-db: the payload compression the database was written with (default: snappy)"
+        )
+    <*> localSettingsOptions
+
+-- | The Pact settings of the in-process side that change @/local@ answers.
+-- They must be those of the oracle node; the report records them.
+--
+localSettingsOptions :: Parser LocalSettings
+localSettingsOptions = LocalSettings
+    <$> switch
+        ( long "allow-reads-in-local"
+        <> help "with --test-db: the oracle node's allowReadsInLocal is true (direct table reads in /local at Pact 4 heights succeed)"
+        )
+    <*> switch
+        ( long "enable-local-timeout"
+        <> help "with --test-db: the oracle node's enableLocalTimeout is true (a /local call longer than 2 s fails)"
+        )
+    <*> optional (option auto
+        ( long "block-gas-limit"
+        <> metavar "GAS"
+        <> help "with --test-db: the oracle node's gasLimitOfBlock (preflight rejects a command above it); default: the node default"
+        ))
+
+testSideOptions :: Parser TestSide
+testSideOptions = TestUrl <$> strOption
+        ( long "test"
+        <> metavar "URL"
+        <> help "base URL of the service API of the test node"
+        )
+    <|> TestDb <$> testDbOptions
 
 versionOption :: Parser ChainwebVersion
 versionOption = option (eitherReader readVersion)
@@ -155,11 +233,7 @@ options = Options
         <> metavar "URL"
         <> help "base URL of the service API of the oracle, for instance https://host:1848"
         )
-    <*> strOption
-        ( long "test"
-        <> metavar "URL"
-        <> help "base URL of the service API of the test node"
-        )
+    <*> testSideOptions
     <*> versionOption
     <*> option chainsReader
         ( long "chains"
@@ -182,7 +256,7 @@ options = Options
     <*> optional (strOption
         ( long "pause-file"
         <> metavar "FILE"
-        <> help "no request is made while this file exists"
+        <> help "no request is made, to either side (an in-process one too), while this file exists"
         ))
     <*> strOption
         ( long "report"
@@ -211,18 +285,23 @@ main = do
         <> progDesc "Compare the answers of a test node with those of the oracle"
         <> footer (unwords
             [ "Exit codes: 0 pass; 2 fail (a difference); 3 void (rerun); 1 bad arguments or a crash."
-            , "Not yet available: --test-db DIR, --pact-chains and --payload-compression (an in-process test side);"
-            , "use --test URL."
+            , "--test-db: use a copy or a stopped node's files only (Pact opens the SQLite files read-write)."
             ])
         )
     let logger = genericLogger Info (T.hPutStrLn stderr)
         v = _optVersion o
         coverage = genesisCoverage v (_optChains o) (_optHeights o)
+        pactChains = case _optTest o of
+            TestUrl _ -> Nothing
+            TestDb td -> Just (_tdPactChains td)
+        classCov = classCoverage pactChains coverage
+        settings = case _optTest o of
+            TestUrl _ -> []
+            TestDb td -> localSettingsText (_tdLocal td)
     hl <- newHostLimiters (_optRate o) (_optPauseFile o)
     oracle <- Side "oracle" (_optOracle o) <$> limiterFor hl (_optOracle o)
-    test <- Side "test" (_optTest o) <$> limiterFor hl (_optTest o)
-    (reqs, classes) <- case _optSource o of
-        RequestFile f -> (\rs -> (rs, [])) <$> readRequests f
+    (reqs, classes, gen) <- case _optSource o of
+        RequestFile f -> (\rs -> (rs, [], id)) <$> readRequests f
         Generated g -> do
             pset <- maybe (return defaultPactSet) loadPactSet (_genPactSet g)
             api <- oracleServiceApi hl v (_optOracle o)
@@ -234,12 +313,32 @@ main = do
                     , _ssBoundaries = if _versionName v == _versionName mainnet then mainnetBoundaries else []
                     , _ssBoundaryShare = boundaryShare
                     , _ssHistoryMax = historyMaxHeight v
+                    , _ssPactChains = pactChains
                     }
                 targets = sampleTargets spec
             logFunctionText logger Info $ "generating " <> T.pack (show (length targets)) <> " requests"
-            rs <- generateRequests (GenOptions (_genSameSnapshot g)) api pset (_genSeed g) targets
-            return (rs, _genClasses g)
-    rep <- reportExpectClasses classes <$> runCompare logger coverage oracle test reqs
+            (rs, skips) <- generateRequestsSkipping (GenOptions (_genSameSnapshot g)) api pset (_genSeed g) targets
+            forM_ skips $ \(GenSkip (cls, cid, h) e) -> logFunctionText logger Warn $
+                "target skipped at generation (" <> requestClassText cls <> ", chain " <> toText cid
+                <> ", height " <> T.pack (show h) <> "): " <> e
+            return (rs, _genClasses g, reportGeneration (length targets) [ c | GenSkip (c, _, _) _ <- skips ])
+    let compareWith test = runCompareClasses logger defaultRunOptions classCov oracle test reqs
+    rep0 <- case _optTest o of
+        TestUrl url -> limiterFor hl url >>= compareWith . Side "test" url
+        TestDb td -> withInProcessSide logger (inProcessSpec o td) compareWith
+    let rep = reportSettings settings $ gen $ reportExpectClasses classes rep0
     writeReport (_optReport o) rep
     T.putStr (reportSummary rep)
     exitWith (gateExitCode (reportVerdict rep))
+
+-- | The in-process test side of @--test-db@.
+--
+inProcessSpec :: Options -> DbSide -> InProcessSpec
+inProcessSpec o td = InProcessSpec
+        { _ipDbDir = _tdDir td
+        , _ipVersion = _optVersion o
+        , _ipPactChains = _tdPactChains td
+        , _ipTuning = if _tdZstd td then payloadZstdTuning else defaultTuning
+        , _ipLocal = _tdLocal td
+        , _ipPauseFile = _optPauseFile o
+        }
