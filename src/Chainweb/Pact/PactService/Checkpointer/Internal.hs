@@ -41,14 +41,11 @@ import Control.Concurrent.Async
 import Control.Concurrent.MVar
 import Control.Lens (view)
 import Control.Monad
-import Control.Monad.Catch
-import Control.Monad.IO.Class
 
 import qualified Data.ByteString.Short as BS
 #if !MIN_VERSION_base(4,20,0)
 import Data.Foldable (foldl')
 #endif
-import Data.Int
 import Data.Coerce
 import qualified Data.Map.Strict as M
 import Data.Maybe
@@ -85,18 +82,16 @@ import qualified Chainweb.Pact4.Backend.ChainwebPactDb as Pact4
 import qualified Chainweb.Pact5.Backend.ChainwebPactDb as Pact5
 
 import Chainweb.Pact.Backend.DbCache
-import Chainweb.Pact.Backend.Utils
 import Chainweb.Pact.Backend.Types
 import Chainweb.Pact.Backend.Store.SQLite (sqlitePactStore)
+import Chainweb.Pact.Backend.Store.Types (PactStore(..))
 import Chainweb.Pact.Types
 import Chainweb.Utils
-import Chainweb.Utils.Serialization
 import Chainweb.Version
 import Chainweb.Version.Guards
 import qualified Pact.Core.Builtin as Pact5
 import qualified Pact.Core.Evaluate as Pact5
 import qualified Pact.Core.Names as Pact5
-import qualified Chainweb.Pact.Backend.Utils as PactDb
 
 withCheckpointerResources
     :: (Logger logger)
@@ -162,17 +157,15 @@ readFrom res maybeParent pactVersion doRead = do
         Just parent -> succ . view blockHeight . _parentHeader $ parent
 
   modifyMVar res.cpModuleCacheVar $ \sharedModuleCache -> do
-    bracket
-      (beginSavepoint res.cpSql BatchSavepoint)
-      (\_ -> abortSavepoint res.cpSql BatchSavepoint) \() -> do
+    _psWithReadSnapshot res.cpStore $ do
       -- NB it's important to do this *after* you start the savepoint (and thus
       -- the db transaction) to make sure that the latestHeader check is up to date.
-      latestHeader <- getLatestBlock res.cpSql
+      latestHeader <- _psGetLatestBlock res.cpStore
       h <- case pactVersion of
         Pact4T
           | pact5 res.cpCwVersion res.cpChainId currentHeight -> internalError $
             "Pact 4 readFrom executed on block height after Pact 5 fork, height: " <> sshow currentHeight
-          | otherwise -> PactDb.getEndTxId "doReadFrom" res.cpSql maybeParent >>= traverse \startTxId -> do
+          | otherwise -> _psGetEndTxId res.cpStore "doReadFrom" maybeParent >>= traverse \startTxId -> do
             newDbEnv <- newMVar $ Pact4.BlockEnv
               (Pact4.mkBlockHandlerEnv res.cpCwVersion res.cpChainId currentHeight res.cpSql DoNotPersistIntraBlockWrites res.cpLogger)
               (Pact4.initBlockState defaultModuleCacheLimit startTxId)
@@ -189,7 +182,7 @@ readFrom res maybeParent pactVersion doRead = do
                 , Pact4._cpRegisterProcessedTx = \hash ->
                   Pact4.runBlockEnv newDbEnv (Pact4.indexPactTransaction $ BS.fromShort $ coerce hash)
                 , Pact4._cpLookupProcessedTx = \hs ->
-                    HashMap.mapKeys coerce <$> doLookupSuccessful res.cpSql currentHeight (coerce hs)
+                    HashMap.mapKeys coerce <$> _psDoLookupSuccessful res.cpStore currentHeight (coerce hs)
                 }
               pactDb
                 | parentIsLatestHeader = Pact4.chainwebPactDb
@@ -200,7 +193,7 @@ readFrom res maybeParent pactVersion doRead = do
 
         Pact5T
           | pact5 res.cpCwVersion res.cpChainId currentHeight ->
-            PactDb.getEndTxId "doReadFrom" res.cpSql maybeParent >>= traverse \startTxId -> do
+            _psGetEndTxId res.cpStore "doReadFrom" maybeParent >>= traverse \startTxId -> do
             let
               -- is the parent the latest header, i.e., can we get away without rewinding?
               parentIsLatestHeader = case (latestHeader, maybeParent) of
@@ -272,13 +265,8 @@ restoreAndSave
   -> IO (r, q)
 restoreAndSave res rewindParent blocks = do
     modifyMVar res.cpModuleCacheVar $ \moduleCache -> do
-      fmap fst $ generalBracket
-        (beginSavepoint res.cpSql BatchSavepoint)
-        (\_ -> \case
-          ExitCaseSuccess {} -> commitSavepoint res.cpSql BatchSavepoint
-          _ -> abortSavepoint res.cpSql BatchSavepoint
-        ) $ \_ -> do
-          startTxId <- PactDb.rewindDbTo res.cpSql rewindParent
+      _psWithBatch res.cpStore $ do
+          startTxId <- _psRewindDbTo res.cpStore rewindParent
           ((q, _, _, finalModuleCache) :> r) <- extend startTxId moduleCache
           return (finalModuleCache, (r, q))
   where
@@ -314,7 +302,7 @@ restoreAndSave res rewindParent blocks = do
                     Pact4.runBlockEnv dbMVar (Pact4.indexPactTransaction $ BS.fromShort $ coerce hash)
                   , Pact4._cpLookupProcessedTx = \hs ->
                       fmap (HashMap.mapKeys coerce) $
-                      doLookupSuccessful res.cpSql bh $
+                      _psDoLookupSuccessful res.cpStore bh $
                       coerce hs
                   }
 
@@ -388,88 +376,47 @@ restoreAndSave res rewindParent blocks = do
 
 -- | Get the checkpointer's idea of the earliest block. The block height
 -- is the height of the block of the block hash.
-getEarliestBlock :: HasCallStack => SQLiteEnv -> IO (Maybe (BlockHeight, BlockHash))
-getEarliestBlock db = do
-  r <- qry_ db qtext [RInt, RBlob] >>= mapM go
-  case r of
-    [] -> return Nothing
-    (!o:_) -> return (Just o)
-  where
-    qtext = "SELECT blockheight, hash FROM BlockHistory ORDER BY blockheight ASC LIMIT 1"
-
-    go [SInt hgt, SBlob blob] =
-        let hash = either error id $ runGetEitherS decodeBlockHash blob
-        in return (fromIntegral hgt, hash)
-    go _ = fail "Chainweb.Pact.Backend.RelationalCheckpointer.doGetEarliest: impossible. This is a bug in chainweb-node."
+getEarliestBlock :: PactStore -> IO (Maybe (BlockHeight, BlockHash))
+getEarliestBlock = _psGetEarliestBlock
 
 -- | Get the checkpointer's idea of the latest block. The block height is
 -- is the height of the block of the block hash.
 --
 -- TODO: Under which circumstances does this return 'Nothing'?
-getLatestBlock :: HasCallStack => SQLiteEnv -> IO (Maybe (BlockHeight, BlockHash))
-getLatestBlock db = do
-  r <- qry_ db qtext [RInt, RBlob] >>= mapM go
-  case r of
-    [] -> return Nothing
-    (!o:_) -> return (Just o)
-  where
-    qtext = "SELECT blockheight, hash FROM BlockHistory ORDER BY blockheight DESC LIMIT 1"
-
-    go [SInt hgt, SBlob blob] =
-        let hash = either error id $ runGetEitherS decodeBlockHash blob
-        in return (fromIntegral hgt, hash)
-    go _ = fail "Chainweb.Pact.Backend.RelationalCheckpointer.getLatest: impossible. This is a bug in chainweb-node."
+getLatestBlock :: PactStore -> IO (Maybe (BlockHeight, BlockHash))
+getLatestBlock = _psGetLatestBlock
 
 -- | Ask: is the checkpointer aware of the given block?
-lookupBlock :: SQLiteEnv -> (BlockHeight, BlockHash) -> IO Bool
-lookupBlock db (bheight, bhash) = do
-    r <- qry db qtext [SInt $ fromIntegral bheight, SBlob (runPutS (encodeBlockHash bhash))]
-                      [RInt]
-    liftIO (expectSingle "row" r) >>= \case
-        [SInt n] -> return $! n == 1
-        _ -> internalError "lookupBlock: output type mismatch"
-  where
-    qtext = "SELECT COUNT(*) FROM BlockHistory WHERE blockheight = ? AND hash = ?;"
+lookupBlock :: PactStore -> (BlockHeight, BlockHash) -> IO Bool
+lookupBlock = _psLookupBlock
 
-getBlockParent :: ChainwebVersion -> ChainId -> SQLiteEnv -> (BlockHeight, BlockHash) -> IO (Maybe BlockHash)
-getBlockParent v cid db (bh, hash)
-    | bh == genesisHeight v cid = return Nothing
-    | otherwise = do
-        blockFound <- lookupBlock db (bh, hash)
-        if not blockFound
-          then return Nothing
-          else do
-            r <- qry db qtext [SInt (fromIntegral (pred bh))] [RBlob]
-            case r of
-              [[SBlob blob]] ->
-                either (internalError . T.pack) (return . return) $! runGetEitherS decodeBlockHash blob
-              [] -> internalError "getBlockParent: block was found but its parent couldn't be found"
-              _ -> error "getBlockParent: output type mismatch"
-  where
-    qtext = "SELECT hash FROM BlockHistory WHERE blockheight = ?"
+getBlockParent :: ChainwebVersion -> ChainId -> PactStore -> (BlockHeight, BlockHash) -> IO (Maybe BlockHash)
+getBlockParent v cid store = _psGetBlockParent store v cid
 
+-- | Rethrow a SQLite error of the store as 3.2.1's 'qry' threw it.
+liftDbError :: IO (Either Error a) -> IO a
+liftDbError = liftEither
 
 -- TODO: do this in ChainwebPactDb instead?
 getBlockHistory
-  :: SQLiteEnv
+  :: PactStore
   -> BlockHeader
   -> Pact5.Domain Pact5.RowKey Pact5.RowData Pact5.CoreBuiltin Pact5.Info
   -> IO (Historical BlockTxHistory)
-getBlockHistory db blockHeader d = do
+getBlockHistory store blockHeader d = do
   historicalEndTxId <-
-      fmap fromIntegral
-      <$> PactDb.getEndTxId "getBlockHistory" db (Just $ ParentHeader blockHeader)
+      _psGetEndTxId store "getBlockHistory" (Just $ ParentHeader blockHeader)
   forM historicalEndTxId $ \endTxId -> do
     startTxId <-
       if bHeight == genesisHeight v cid
       then return 0
-      else PactDb.getEndTxId' "getBlockHistory" db (pred bHeight) (view blockParent blockHeader) >>= \case
+      else _psGetEndTxId' store "getBlockHistory" (pred bHeight) (view blockParent blockHeader) >>= \case
         NoHistory ->
           internalError $ "getBlockHistory: missing parent for: " <> sshow blockHeader
         Historical startTxId ->
-          return $ fromIntegral startTxId
+          return startTxId
 
-    let tname = Pact5.domainTableName d
+    let tname = Pact5.renderDomain d
     history <- queryHistory tname startTxId endTxId
     let (!hkeys,tmap) = foldl' procTxHist (S.empty,mempty) history
     !prev <- M.fromList . catMaybes <$> mapM (queryPrev tname startTxId) (S.toList hkeys)
@@ -487,58 +434,40 @@ getBlockHistory db blockHeader d = do
 
     -- Start index is inclusive, while ending index is not.
     -- `endingtxid` in a block is the beginning txid of the following block.
-    queryHistory :: Utf8 -> Int64 -> Int64 -> IO [(Utf8,TxId,Pact5.TxLog Pact5.RowData)]
+    queryHistory :: T.Text -> TxId -> TxId -> IO [(Utf8,TxId,Pact5.TxLog Pact5.RowData)]
     queryHistory tableName s e = do
-      let sql = "SELECT txid, rowkey, rowdata FROM [" <> tableName <>
-                "] WHERE txid >= ? AND txid < ?"
-      r <- qry db sql
-            [SInt s,SInt e]
-            [RInt,RText,RBlob]
-      forM r $ \case
-        [SInt txid, SText key, SBlob value] ->
-            (key,fromIntegral txid,)
+      r <- liftDbError $ _psRowsInTxIdRange store tableName s e
+      forM r $ \(txid, Utf8 -> key, value) ->
+            (key,txid,)
             <$> Pact5.toTxLog (_chainwebVersion blockHeader) (_chainId blockHeader) (view blockHeight blockHeader) (Pact5.renderDomain d) key value
-        err -> internalError $
-          "queryHistory: Expected single row with three columns as the \
-          \result, got: " <> T.pack (show err)
 
     -- Get last tx data, if any, for key before start index.
-    queryPrev :: Utf8 -> Int64 -> Utf8 -> IO (Maybe (RowKey,Pact5.TxLog Pact5.RowData))
+    queryPrev :: T.Text -> TxId -> Utf8 -> IO (Maybe (RowKey,Pact5.TxLog Pact5.RowData))
     queryPrev tableName s k@(Utf8 sk) = do
-      let sql = "SELECT rowdata FROM [" <> tableName <>
-                "] WHERE rowkey = ? AND txid < ? " <>
-                "ORDER BY txid DESC LIMIT 1"
-      r <- qry db sql
-        [SText k,SInt s]
-        [RBlob]
+      r <- liftDbError $ _psReadPrev store tableName sk s
       case r of
-        [] -> return Nothing
-        [[SBlob value]] ->
+        Nothing -> return Nothing
+        Just value ->
             Just . (RowKey $ T.decodeUtf8 sk,)
             <$> Pact5.toTxLog (_chainwebVersion blockHeader) (_chainId blockHeader) (view blockHeight blockHeader) (Pact5.renderDomain d) k value
-        _ -> internalError $ "queryPrev: expected 0 or 1 rows, got: " <> T.pack (show r)
 
 -- TODO: do this in ChainwebPactDb instead?
 lookupHistorical
-    :: SQLiteEnv
+    :: PactStore
     -> BlockHeader
     -> Pact5.Domain Pact5.RowKey Pact5.RowData Pact5.CoreBuiltin Pact5.Info
     -> Pact5.RowKey
     -> IO (Historical (Maybe (Pact5.TxLog Pact5.RowData)))
-lookupHistorical db blockHeader d k = do
+lookupHistorical store blockHeader d k = do
   historicalEndTxId <-
-    PactDb.getEndTxId "lookupHistorical" db (Just $ ParentHeader blockHeader)
-  forM historicalEndTxId (queryHistoryLookup . fromIntegral)
+    _psGetEndTxId store "lookupHistorical" (Just $ ParentHeader blockHeader)
+  forM historicalEndTxId queryHistoryLookup
   where
-    queryHistoryLookup :: Int64 -> IO (Maybe (Pact5.TxLog Pact5.RowData))
+    queryHistoryLookup :: TxId -> IO (Maybe (Pact5.TxLog Pact5.RowData))
     queryHistoryLookup e = do
-      let sql = "SELECT rowKey, rowdata FROM [" <> Pact5.domainTableName d <>
-                "] WHERE txid < ? AND rowkey = ? ORDER BY txid DESC LIMIT 1;"
-      r <- qry db sql
-        [SInt e, SText (toUtf8 $ Pact5.convRowKey k)]
-        [RText, RBlob]
+      r <- liftDbError $
+        _psReadHistorical store (Pact5.renderDomain d) (T.encodeUtf8 $ Pact5.convRowKey k) e
       case r of
-        [[SText key, SBlob value]] ->
+        Just (Utf8 -> key, value) ->
             Just <$> Pact5.toTxLog (_chainwebVersion blockHeader) (_chainId blockHeader) (view blockHeight blockHeader) (Pact5.renderDomain d) key value
-        [] -> pure Nothing
-        _ -> internalError $ "lookupHistorical: expected single-row result, got " <> sshow r
+        Nothing -> pure Nothing

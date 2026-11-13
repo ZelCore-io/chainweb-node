@@ -13,8 +13,10 @@
 --
 module Chainweb.Pact.Backend.Store.SQLite
     ( sqlitePactStore
+    , withSavepoint
     ) where
 
+import Control.Exception (SomeAsyncException, evaluate)
 import Control.Lens (over, view, _Left)
 import Control.Monad
 import Control.Monad.Catch
@@ -40,9 +42,9 @@ import Chainweb.BlockHeight
 import Chainweb.Pact.Backend.Store.Types
 import Chainweb.Pact.Backend.Types (SQLiteEnv)
 import Chainweb.Pact.Backend.Utils
-    (SavepointName(..), convSavepointName, expectSingle, tbl, toUtf8, withSavepoint)
+    (SavepointName(..), convSavepointName, expectSingle, tbl, toUtf8)
 import Chainweb.Pact.Types (PactException(..), internalError)
-import Chainweb.Utils (T2(..), T3(..), sshow)
+import Chainweb.Utils (T2(..), T3(..), sshow, toText)
 import Chainweb.Utils.Serialization (runGetEitherS, runPutS)
 import Chainweb.Version
 
@@ -364,6 +366,27 @@ abortSavepoint :: SQLiteEnv -> SavepointName -> IO ()
 abortSavepoint db name = do
   rollbackSavepoint db name
   commitSavepoint db name
+
+-- | Moved from "Chainweb.Pact.Backend.Utils" with the savepoint statements it
+-- runs. Used by both @initSchema@s.
+withSavepoint
+    :: SQLiteEnv
+    -> SavepointName
+    -> IO a
+    -> IO a
+withSavepoint db name action = mask $ \resetMask -> do
+    beginSavepoint db name
+    go resetMask `catches` handlers
+  where
+    go resetMask = do
+        r <- resetMask action `onException` abortSavepoint db name
+        commitSavepoint db name
+        evaluate r
+    throwErr s = internalError $ "withSavepoint (" <> toText name <> "): " <> s
+    handlers = [ Handler $ \(e :: PactException) -> throwErr (sshow e)
+               , Handler $ \(e :: SomeAsyncException) -> throwM e
+               , Handler $ \(e :: SomeException) -> throwErr ("non-pact exception: " <> sshow e)
+               ]
 
 -- | The savepoint of @restoreAndSave@.
 withBatch :: SQLiteEnv -> IO a -> IO a

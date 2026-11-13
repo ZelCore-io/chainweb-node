@@ -86,6 +86,7 @@ import Chainweb.BlockHeader.Internal
 import Chainweb.BlockHeight
 import Chainweb.Logger
 import Chainweb.Pact.Backend.Types
+import Chainweb.Pact.Backend.Store.Types (PactStore(..))
 import Chainweb.Pact.Backend.Utils
 import qualified Chainweb.Pact.PactService.Checkpointer.Internal as Checkpointer
 import Chainweb.Pact.Types
@@ -308,13 +309,14 @@ readsAtHeights = do
         ksKeys <- probe5 "keys SYS:KeySets" $ _pdbKeys pdb DKeySets
         return (rows <> keys <> kss <> [ksKeys])
 
--- | 'doLookupSuccessful' for found, unknown and at-or-above-height hashes.
+-- | '_psDoLookupSuccessful' (3.2.1's 'doLookupSuccessful') for found, unknown
+-- and at-or-above-height hashes.
 lookupTxs :: IO [Text]
-lookupTxs = withP4 $ \cp sql -> do
+lookupTxs = withP4 $ \cp _ -> do
     extend cp Nothing (zipWith p4Block p4Headers scenario)
     let hashes = ["tx-0-0", "tx-1-1", "tx-2-0", "tx-3-1", "tx-6-0", "unknown"]
     fmap concat $ forM [0, 2, 3, 7] $ \h -> do
-        r <- doLookupSuccessful sql (BlockHeight h) (V.fromList (SB.toShort <$> hashes))
+        r <- _psDoLookupSuccessful (cpStore cp) (BlockHeight h) (V.fromList (SB.toShort <$> hashes))
         return $ section ("doLookupSuccessful, current height " <> sshow h <> ", " <> T.decodeUtf8 (B8.unwords hashes))
             [ T.decodeUtf8 (SB.fromShort k) <> " -> " <> sshow bh <> " " <> sshow bhash
             | (k, T2 bh bhash) <- sortOn fst (HM.toList r)

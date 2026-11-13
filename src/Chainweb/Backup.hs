@@ -22,7 +22,6 @@ import Control.Concurrent.Async
 import Control.Monad
 import Control.Monad.Catch
 import Data.HashSet(HashSet)
-import Data.String
 import qualified Data.Text as T
 import qualified Data.Text.IO as T
 import qualified Data.Text.Lazy as TL
@@ -31,11 +30,12 @@ import System.Directory
 import System.FilePath
 import System.LogLevel
 
-import Pact.Types.SQLite
 import Servant
 
 import Chainweb.ChainId
 import Chainweb.Logger
+import Chainweb.Pact.Backend.Store.SQLite (sqlitePactStore)
+import Chainweb.Pact.Backend.Store.Types (PactStore(..))
 import Chainweb.Pact.Backend.Utils(chainDbFileName, withSqliteDb)
 import Chainweb.Utils
 
@@ -99,10 +99,8 @@ makeBackup env options = do
             logCr Info $ "backing up pact databases" <> T.pack thisBackup
             forConcurrently_ (_backupChainIds env) $ \cid -> do
                 withSqliteDb cid (_backupLogger env) (_backupPactDbDir env) False $ \db ->
-                    void $ qry db
-                        ("VACUUM main INTO ?")
-                        [SText $ fromString (thisBackup </> "0" </> "sqlite" </> chainDbFileName cid)]
-                        []
+                    _psBackupTo (sqlitePactStore db)
+                        (thisBackup </> "0" </> "sqlite" </> chainDbFileName cid)
             logCr Info $ "pact databases backed up"
 
 checkBackup :: Logger logger => BackupEnv logger -> FilePath -> IO (Maybe BackupStatus)

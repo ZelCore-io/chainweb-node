@@ -77,6 +77,8 @@ import Chainweb.BlockHash
 import Chainweb.BlockHeight
 import Chainweb.Logger
 import Chainweb.Pact.Backend.InMemDb qualified as InMemDb
+import Chainweb.Pact.Backend.Store.SQLite (sqlitePactStore, withSavepoint)
+import Chainweb.Pact.Backend.Store.Types (PactStore(..))
 import Chainweb.Pact.Backend.Types
 import Chainweb.Pact.Backend.Utils
 import Chainweb.Utils (sshow, unsafeHead, T2)
@@ -342,7 +344,7 @@ chainwebPactBlockDb env = Pact5Db
         return (r, finalHandle)
     , lookupPactTransactions =
         fmap (HM.mapKeys (RequestKey . Hash)) .
-        doLookupSuccessful (_blockHandlerDb env) (_blockHandlerBlockHeight env) .
+        _psDoLookupSuccessful (sqlitePactStore (_blockHandlerDb env)) (_blockHandlerBlockHeight env) .
         fmap (unHash . unRequestKey)
     }
 
