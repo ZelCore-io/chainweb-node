@@ -78,11 +78,11 @@ commands = hsubparser $ mconcat
     [ cmd "payload-size" "size of each table on disk, under the default and the zstd tuning"
         $ PayloadSize
             <$> versionOption
-            <*> strOption (long "db" <> metavar "DIR" <> help "the database; flush it before, the write ahead log is not read")
+            <*> strOption (long "db" <> metavar "DIR" <> help "the database, opened read-only: a copy or a snapshot only, never a production node's files. Flush it before; a write ahead log is replayed in memory only")
             <*> strOption (long "work" <> metavar "DIR" <> help "where the copies are written; removed afterwards")
     , cmd "payload-read" "latency of warm payload reads"
         $ PayloadRead
-            <$> strOption (long "db" <> metavar "DIR")
+            <$> strOption (long "db" <> metavar "DIR" <> help "the database, opened read-only: a copy or a snapshot only, never a production node's files")
             <*> option tuningReader (long "tuning" <> metavar "TUNING" <> value defaultTuning <> help "default, zstd or cold; default: default")
             <*> option auto (long "samples" <> metavar "N" <> value 1000 <> showDefault)
             <*> option auto (long "seed" <> metavar "SEED" <> value 1 <> showDefault)
@@ -90,7 +90,7 @@ commands = hsubparser $ mconcat
         coldFooter
         $ Cold
             <$> (ColdBuildSpec
-                <$> strOption (long "sqlite" <> metavar "FILE" <> help "the chain's Pact SQLite file; opened read-only")
+                <$> strOption (long "sqlite" <> metavar "FILE" <> help "the chain's Pact SQLite file, opened read-only: a copy or a snapshot only, never a production node's files. Every table is read in long statements, which on a live WAL database would hold back the node's checkpoints")
                 <*> option chainReader (long "chain" <> metavar "CHAIN")
                 <*> optional (some (strOption (long "table" <> metavar "NAME" <> help "copy only this table (repeatable; TransactionIndex included); default: all")))
                 <*> strOption (long "out" <> metavar "DIR" <> help "the cold store; must not exist")
