@@ -499,6 +499,45 @@ tests = withResource acquire release $ \getFx -> testGroup "Cold measure"
         coldRatio cs @?= 12.5
         txIndexBytesPerEntry cs @?= Just 3
 
+    , testCase "the default chain 0 ratio leaves chain 0's hot SYS tables out of both sides, as chain 0's history does" $ do
+        let cs = (_piChain19 specInputs)
+                { _csTables = M.fromList
+                    [ ("coin_coin-table", tableSizes 600 400 0)
+                    , ("SYS:Pacts", tableSizes 300 200 0)
+                    , ("TransactionIndex", tableSizes 3200 800 300)
+                    , ("SYS:Modules", tableSizes 1000 9000 100)
+                    , ("SYS:ModuleSources", tableSizes 2000 18000 100)
+                    ]
+                , _csTotalSst = 650
+                }
+        -- history: 1500 logical bytes over 650 - 300 - 100 - 100 SST bytes;
+        -- SYS:Pacts stays in, as in chain 0's history
+        historyRatio cs @?= 10
+        let walk = Chain0Walk
+                { _c0wHistory = M.fromList
+                    [ (t, (1, 1)) | t <- ["coin_coin-table", "SYS:Pacts"] ]
+                , _c0wTxIndexEntries = 1
+                }
+        -- the tables the ratio is taken over are the tables of chain 0's
+        -- history: all but the transaction index and chain0HotSysTables
+        M.keysSet (_c0wHistory walk) @?= M.keysSet
+            (M.withoutKeys (_csTables cs) (S.fromList ("TransactionIndex" : chain0HotSysTables)))
+
+    , testCase "chain 0's transaction index: no rows, no measurement or a zero cost fail" $ do
+        let walk = Chain0Walk M.empty 188095238
+            c19 = _piChain19 specInputs
+            isLeft' = either (const True) (const False)
+            withIndex ts = c19 { _csTables = M.insert "TransactionIndex" ts (_csTables c19) }
+        chain0TxIndexCost walk c19 @?= Right 42
+        assertBool "no rows in chain 0's walk" $
+            isLeft' (chain0TxIndexCost walk { _c0wTxIndexEntries = 0 } c19)
+        assertBool "no measurement on chain 19" $
+            isLeft' (chain0TxIndexCost walk c19 { _csTables = M.empty })
+        assertBool "no entries on chain 19" $
+            isLeft' (chain0TxIndexCost walk (withIndex (tableSizes 0 0 0)))
+        assertBool "0 SST bytes per entry on chain 19" $
+            isLeft' (chain0TxIndexCost walk (withIndex (TableSizes 1000 1000 32000 3000 0 0)))
+
     , testCase "projection above the estimate plus 25 GB yields verdict S" $ do
         -- spec 4.3 pessimistic: chain 0 93.7, chain 19 7.5, the other 18 45 GB
         let pin = specInputs

@@ -89,6 +89,7 @@ module Chainweb.StorageTools.Measure.Cold
 , Chain0Walk(..)
 , chain0FromWalk
 , chain0HotSysTables
+, chain0TxIndexCost
 , latencyVerdict
 , Verdict(..)
 , verdict
@@ -616,21 +617,29 @@ coldRatio cs
     | otherwise = fromIntegral (coldLogicalBytes cs) / fromIntegral (_csTotalSst cs)
 
 -- | The ratio of the history tables, the default for chain 0: logical bytes of
--- every copied versioned table over the SST bytes of the whole store less the
--- @X@ keyspace. The transaction index is out of both sides, because chain 0's
--- is charged per entry ('txIndexBytesPerEntry'), not through a ratio. The
--- by-txid lists, key ids, table ids and every index and filter block stay in
--- the denominator.
+-- the copied versioned tables over the SST bytes of the whole store less the
+-- SST bytes of the tables left out. The ratio is taken over the same tables
+-- that chain 0's history counts ('chain0FromWalk'), so two kinds of table are
+-- out of both sides:
+--
+-- * the transaction index, because chain 0's is charged per entry
+--   ('txIndexBytesPerEntry'), not through a ratio;
+-- * 'chain0HotSysTables', because chain 0 keeps them hot, inside
+--   'specChain0HotBytes'.
+--
+-- The by-txid lists, key ids, table ids and every index and filter block stay
+-- in the denominator.
 --
 historyRatio :: ColdSizes -> Double
 historyRatio cs
     | sst <= 0 = 0
     | otherwise = fromIntegral logical / sst
   where
-    history = M.delete transactionIndexTable (_csTables cs)
+    leftOut = S.fromList (transactionIndexTable : chain0HotSysTables)
+    history = M.withoutKeys (_csTables cs) leftOut
     logical = sum (tableLogicalBytes <$> history)
-    xSst = maybe 0 _tsSstBytes (M.lookup transactionIndexTable (_csTables cs))
-    sst = fromIntegral (_csTotalSst cs) - fromIntegral xSst :: Double
+    leftOutSst = sum (_tsSstBytes <$> M.restrictKeys (_csTables cs) leftOut)
+    sst = fromIntegral (_csTotalSst cs) - fromIntegral leftOutSst :: Double
 
 -- | SST bytes per transaction-index entry: the @X@ keyspace after the forced
 -- compaction over the number of entries. 'Nothing' if the transaction index
@@ -707,10 +716,13 @@ coldReadNewest db c tid key bound = R.withReadOptions mempty $ \ro -> I.withIter
 -- The expected answer is SQLite's @SELECT rowdata ... WHERE rowkey = ? AND
 -- txid < ? ORDER BY txid DESC LIMIT 1@. The warm pass opens the store with
 -- 'coldStoreTuning', reads every sample once untimed and once timed. The cold
--- pass opens it afresh with direct reads and an 8 MiB block cache and reads
--- each distinct (table, key) once, with the bound of its first sample, so that
--- no cold read hits a block an earlier one loaded. Every answer is compared
--- with SQLite's.
+-- pass opens it afresh with direct reads (no OS page cache) and an 8 MiB block
+-- cache and reads each distinct (table, key) once, with the bound of its first
+-- sample, so that no cold read repeats an earlier one. It can still hit what
+-- an earlier read loaded: different keys can share a data block, and each
+-- file's index and filter blocks are loaded once and stay in memory. The cold
+-- figures are therefore a lower bound for a read that finds nothing in memory.
+-- Every answer is compared with SQLite's.
 --
 measureColdReads :: FilePath -> FilePath -> Int -> Word64 -> IO ColdLatency
 measureColdReads sqlitePath coldDir n seed = do
@@ -960,10 +972,33 @@ data Chain0Walk = Chain0Walk
 -- | @SYS:*@ tables inside spec 4.3's chain-0 "system tables, unchanged"
 -- (2.4 GB, part of 'specChain0HotBytes'): the report's projection keeps them
 -- hot as they are. Chain 0's cold logical bytes leave them out, so that they
--- are not counted twice. Chains 3 and 19 copy them like any versioned table.
+-- are not counted twice, and so does 'historyRatio', the ratio applied to
+-- them. Chains 3 and 19 copy them like any versioned table, and their stores
+-- are measured whole.
 --
 chain0HotSysTables :: [Text]
 chain0HotSysTables = ["SYS:Modules", "SYS:ModuleSources"]
+
+-- | The cost per transaction-index entry at which chain 0's index is
+-- projected: chain 19's 'txIndexBytesPerEntry'. Fails, instead of projecting
+-- the index as zero bytes, if chain 0's walk counts no index rows, if chain 19
+-- has no index measurement, or if that measurement is not a positive number.
+--
+chain0TxIndexCost :: Chain0Walk -> ColdSizes -> Either String Double
+chain0TxIndexCost walk c19
+    | _c0wTxIndexEntries walk == 0 = Left
+        "chain 0's walk counts no TransactionIndex rows; the walk must include the transaction index"
+    | otherwise = case txIndexBytesPerEntry c19 of
+        Nothing -> Left
+            "chain 19 has no TransactionIndex measurement; run cw-measure cold on all tables"
+        Just x
+            | isNaN x || isInfinite x || x <= 0 -> Left $
+                "chain 19's TransactionIndex costs " <> show x <> " SST bytes per entry ("
+                <> show (maybe 0 _tsSstBytes ti) <> " bytes, " <> show (maybe 0 _tsVersions ti)
+                <> " entries); expected a positive cost"
+            | otherwise -> Right x
+  where
+    ti = M.lookup transactionIndexTable (_csTables c19)
 
 -- | Chain 0 from the report's SQLite walk (@cw0.json@: @trees@, each with
 -- @type@, @table@, @cells@, @key_bytes@, @val_bytes@).
@@ -1091,7 +1126,7 @@ renderColdSizes cs = T.unlines $
         <> ", ratio " <> T.pack (printf "%.2f" (coldRatio cs))
     , "hot: kept tables " <> gbT (_csHotKeptBytes cs) <> ", anchors " <> gbT (_csHotAnchorBytes cs)
     , "projected chain: " <> gbT (chainProjectedBytes cs)
-    , "history ratio (X out of both sides): " <> T.pack (printf "%.2f" (historyRatio cs))
+    , "history ratio (X, SYS:Modules and SYS:ModuleSources out of both sides): " <> T.pack (printf "%.2f" (historyRatio cs))
         <> ", X bytes per entry: " <> maybe "n/a" (T.pack . printf "%.1f") (txIndexBytesPerEntry cs)
     , "keyspaces: " <> T.intercalate ", " [ k <> " " <> gbT v | (k, v) <- M.toList (_csKeyspaceSst cs) ]
     ] <>

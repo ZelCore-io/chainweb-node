@@ -105,7 +105,7 @@ commands = hsubparser $ mconcat
             <*> strOption (long "chain19" <> metavar "FILE" <> help "JSON of cw-measure cold on chain 19")
             <*> strOption (long "chain0-walk" <> metavar "FILE" <> help "the report's SQLite walk of chain 0 (cw0.json)")
             <*> option auto (long "others-today-bytes" <> metavar "N" <> help "summed size of the SQLite files of the 17 chains other than 0, 3 and 19")
-            <*> optional (option auto (long "chain0-ratio" <> metavar "X" <> help "real-engine ratio for chain 0's history tables; default: chain 19's history ratio, the transaction index out of both sides"))
+            <*> optional (option auto (long "chain0-ratio" <> metavar "X" <> help "real-engine ratio for chain 0's history tables; default: chain 19's history ratio, with the transaction index, SYS:Modules and SYS:ModuleSources out of both sides as in chain 0's history"))
             <*> option auto (long "chain0-hot-bytes" <> metavar "N" <> value specChain0HotBytes <> showDefault <> help "chain 0's anchors and system tables (spec 4.3)")
             <*> optional (strOption (long "json" <> metavar "FILE" <> help "write the projection as JSON"))
     ]
@@ -157,12 +157,12 @@ main = do
             (c3, l3) <- readCold (_paChain3 pa)
             (c19, l19) <- readCold (_paChain19 pa)
             walk <- either fail return . chain0FromWalk =<< BL.readFile (_paChain0Walk pa)
-            perEntry <- maybe
-                (fail $ _paChain19 pa <> ": no TransactionIndex measurement; run cw-measure cold on all tables")
-                return (txIndexBytesPerEntry c19)
+            perEntry <- either
+                (\e -> fail $ e <> " (--chain0-walk " <> _paChain0Walk pa <> ", --chain19 " <> _paChain19 pa <> ")")
+                return (chain0TxIndexCost walk c19)
             let (ratio, source) = case _paChain0Ratio pa of
                     Just r -> (r, "given" :: T.Text)
-                    Nothing -> (historyRatio c19, "chain 19 history tables, X out of both sides")
+                    Nothing -> (historyRatio c19, "chain 19 history tables; X, SYS:Modules and SYS:ModuleSources out of both sides")
                 inputsAt r = ProjectionInputs
                     { _piChain0Logical = _c0wHistory walk
                     , _piChain0TxIndexEntries = _c0wTxIndexEntries walk
