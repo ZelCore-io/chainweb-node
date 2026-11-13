@@ -3,6 +3,10 @@
   keys nope: error: PactInternalError: callDb (doKeys): user error (Database error: ErrorError)
   read t2 x: ok: Just (RowData {_rdVersion = RDV1, _rdData = ObjectMap {_objectMap = fromList [(FieldKey "v",RDLiteral (LInteger {_lInteger = 11}))]}})
   keys t2: ok: ["x","y"]
+  read T2 x: ok: Just (RowData {_rdVersion = RDV1, _rdData = ObjectMap {_objectMap = fromList [(FieldKey "v",RDLiteral (LInteger {_lInteger = 11}))]}})
+  keys T2: ok: ["x","y"]
+  read t1 nokey: ok: Nothing
+  keys t1: ok: ["B","C","a","b","k10","k9","zz"]
 == Pact 4 rewound, block height 1 (t2 is created at 2)
   read t2 x: error: PactInternalError: callDb (doReadRow): user error (Database error: ErrorError)
   keys t2: error: PactInternalError: callDb (doKeys): user error (Database error: ErrorError)
@@ -14,11 +18,19 @@
 == Pact 4 rewound, block height 3
   read t2 x: ok: Just (RowData {_rdVersion = RDV1, _rdData = ObjectMap {_objectMap = fromList [(FieldKey "v",RDLiteral (LInteger {_lInteger = 7}))]}})
   keys t2: ok: ["x"]
+  read T2 x: ok: Just (RowData {_rdVersion = RDV1, _rdData = ObjectMap {_objectMap = fromList [(FieldKey "v",RDLiteral (LInteger {_lInteger = 7}))]}})
+  keys T2: ok: ["x"]
+  read t1 nokey: ok: Nothing
+  keys t1: ok: ["a","b","C"]
 == Pact 5 tip, block height 7
   read nope a: pact 5 error value: PEExecutionError (DbOpFailure (NoSuchTable (TableName {_tableName = "nope", _tableModuleName = ModuleName {_mnName = "m", _mnNamespace = Nothing}}))) [] 0
   keys nope: pact 5 error value: PEExecutionError (DbOpFailure (NoSuchTable (TableName {_tableName = "nope", _tableModuleName = ModuleName {_mnName = "m", _mnNamespace = Nothing}}))) [] 0
   read t2 x: ok: Just (RowData {_unRowData = fromList [(Field {_field = "v"},PLiteral (LInteger 11))]})
   keys t2: ok: ["x","y"]
+  read T2 x: ok: Just (RowData {_unRowData = fromList [(Field {_field = "v"},PLiteral (LInteger 11))]})
+  keys T2: ok: ["x","y"]
+  read t1 nokey: ok: Nothing
+  keys t1: ok: ["B","C","a","b","k10","k9","zz"]
 == Pact 5 rewound, block height 1 (t2 is created at 2)
   read t2 x: pact 5 error value: PEExecutionError (DbOpFailure (NoSuchTable (TableName {_tableName = "t2", _tableModuleName = ModuleName {_mnName = "m", _mnNamespace = Nothing}}))) [] 0
   keys t2: pact 5 error value: PEExecutionError (DbOpFailure (NoSuchTable (TableName {_tableName = "t2", _tableModuleName = ModuleName {_mnName = "m", _mnNamespace = Nothing}}))) [] 0
@@ -30,3 +42,7 @@
 == Pact 5 rewound, block height 3
   read t2 x: ok: Just (RowData {_unRowData = fromList [(Field {_field = "v"},PLiteral (LInteger 7))]})
   keys t2: ok: ["x"]
+  read T2 x: ok: Just (RowData {_unRowData = fromList [(Field {_field = "v"},PLiteral (LInteger 7))]})
+  keys T2: ok: ["x"]
+  read t1 nokey: ok: Nothing
+  keys t1: ok: ["C","a","b"]

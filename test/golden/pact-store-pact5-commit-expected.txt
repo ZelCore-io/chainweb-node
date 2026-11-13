@@ -38,6 +38,9 @@
   6 | 5 | X'1515151515151515151515151515151515151515151515151515151515151515' | 12
   7 | 6 | X'1616161616161616161616161616161616161616161616161616161616161616' | 13
 == table SYS:KeySets (rowid, rowkey, txid, rowdata)
+  1 | ks1 | 1 | 004B828166706B2D6B73318100
+  2 | ks2 | 7 | 004B828166706B2D6B73328100
+  3 | ks1 | 9 | 004B828166706B2D6B73318100
 == table SYS:ModuleSources (rowid, rowkey, txid, rowdata)
 == table SYS:Modules (rowid, rowkey, txid, rowdata)
 == table SYS:Namespaces (rowid, rowkey, txid, rowdata)
@@ -61,14 +64,17 @@
   2 | 'm_t2' | 2
 == table VersionedTableMutation (rowid, tablename, blockheight)
   1 | 'm_t1' | 0
-  2 | 'm_t1' | 1
-  3 | 'm_t2' | 2
-  4 | 'm_t1' | 2
-  5 | 'm_t2' | 3
-  6 | 'm_t1' | 3
-  7 | 'm_t1' | 4
-  8 | 'm_t2' | 5
-  9 | 'm_t1' | 6
+  2 | 'SYS:KeySets' | 1
+  3 | 'm_t1' | 1
+  4 | 'm_t2' | 2
+  5 | 'm_t1' | 2
+  6 | 'SYS:KeySets' | 3
+  7 | 'm_t2' | 3
+  8 | 'm_t1' | 3
+  9 | 'SYS:KeySets' | 4
+  10 | 'm_t1' | 4
+  11 | 'm_t2' | 5
+  12 | 'm_t1' | 6
 == table m_t1 (rowid, rowkey, txid, rowdata)
   1 | a | 0 | 0048A161768200820101
   2 | C | 3 | 0048A161768200820104

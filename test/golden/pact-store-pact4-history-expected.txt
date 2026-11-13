@@ -1,4 +1,4 @@
-== tip, parent height 2, block height 3 (Pact42 sort off)
+== tip (chain has blocks 0 to 2), parent height 2, block height 3 (Pact42 sort off)
   keys t1: ok: ["a","b","C"]
   keys t2: ok: ["x"]
   txids t1 > 0: [1,2,3,6]
@@ -10,7 +10,7 @@
   getTxLog t1 6: ok: [TxLog {_txDomain = "t1", _txKey = "a", _txValue = RowData {_rdVersion = RDV1, _rdData = ObjectMap {_objectMap = fromList [(FieldKey "v",RDLiteral (LInteger {_lInteger = 8}))]}}}]
   keys t1 after a pending write of new: ok: ["a","new","b","C"]
   txids t1 > 0 after a pending write of new: ok: [1,2,3,6,7]
-== tip, parent height 6, block height 7 (Pact42 sort on)
+== tip (chain has blocks 0 to 6), parent height 6, block height 7 (Pact42 sort on)
   keys t1: ok: ["B","C","a","b","k10","k9","zz"]
   keys t2: ok: ["x","y"]
   txids t1 > 0: [1,2,3,6,7,8,9,12]
@@ -26,7 +26,7 @@
   getTxLog t1 12: ok: [TxLog {_txDomain = "t1", _txKey = "B", _txValue = RowData {_rdVersion = RDV1, _rdData = ObjectMap {_objectMap = fromList [(FieldKey "v",RDLiteral (LInteger {_lInteger = 15}))]}}}]
   keys t1 after a pending write of new: ok: ["B","C","a","b","k10","k9","new","zz"]
   txids t1 > 0 after a pending write of new: ok: [1,2,3,6,7,8,9,12,13]
-== rewound, parent height 2, block height 3 (Pact42 sort off)
+== rewound (chain has blocks 0 to 6), parent height 2, block height 3 (Pact42 sort off)
   keys t1: ok: ["a","b","C"]
   keys t2: ok: ["x"]
   txids t1 > 0: [1,2,3,6,7,8,9,12]
@@ -42,7 +42,7 @@
   getTxLog t1 12: ok: [TxLog {_txDomain = "t1", _txKey = "B", _txValue = RowData {_rdVersion = RDV1, _rdData = ObjectMap {_objectMap = fromList [(FieldKey "v",RDLiteral (LInteger {_lInteger = 15}))]}}}]
   keys t1 after a pending write of new: ok: ["a","new","b","C"]
   txids t1 > 0 after a pending write of new: ok: [1,2,3,6,7,8,9,12]
-== rewound, parent height 5, block height 6 (Pact42 sort on)
+== rewound (chain has blocks 0 to 6), parent height 5, block height 6 (Pact42 sort on)
   keys t1: ok: ["C","a","b","k10","k9","zz"]
   keys t2: ok: ["x","y"]
   txids t1 > 0: [1,2,3,6,7,8,9,12]
