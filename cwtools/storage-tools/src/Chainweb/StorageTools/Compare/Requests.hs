@@ -367,22 +367,29 @@ chainPrefix api cid = apiPrefix (_saVersion api) <> "/chain/" <> toText cid
 -- current cut, in ascending order of height. Two lookups: the cut, and a
 -- branch query from the cut's hash.
 --
+-- @hi@ is clamped to the chain's height in the cut: a 3.2.1 branch query
+-- whose maxheight is above its upper bound is empty, not cut at the tip
+-- (Minor 1 of the P0 review). Above the cut there are no headers, and no
+-- branch query is made.
+--
 canonicalHeaders :: ServiceApi -> ChainId -> Word64 -> Word64 -> IO [HeaderInfo]
-canonicalHeaders api cid lo hi = do
+canonicalHeaders api cid lo hi0 = do
     cut <- oracleValue api methodGet (apiPrefix (_saVersion api) <> "/cut") [(hAccept, "application/json")] Nothing
-    top <- maybe (genError "the oracle's cut does not decode") return (parseMaybe cutHash cut)
-    page <- oracleValue api methodPost
-        (chainPrefix api cid <> "/header/branch?minheight=" <> tshow lo <> "&maxheight=" <> tshow hi)
-        [ (hAccept, "application/json;blockheader-encoding=object"), (hContentType, "application/json") ]
-        (Just (encodeStrict (object [ "lower" .= ([] :: [T.Text]), "upper" .= [top] ])))
-    hs <- maybe (genError "the oracle's branch does not decode") return (parseMaybe items page)
-    return $ sortOn _hiHeight [ h | h <- hs, _hiHeight h >= lo, _hiHeight h <= hi ]
+    (top, tipHeight) <- maybe (genError "the oracle's cut does not decode") return (parseMaybe cutEntry cut)
+    let hi = min hi0 tipHeight
+    if lo > hi then return [] else do
+        page <- oracleValue api methodPost
+            (chainPrefix api cid <> "/header/branch?minheight=" <> tshow lo <> "&maxheight=" <> tshow hi)
+            [ (hAccept, "application/json;blockheader-encoding=object"), (hContentType, "application/json") ]
+            (Just (encodeStrict (object [ "lower" .= ([] :: [T.Text]), "upper" .= [top] ])))
+        hs <- maybe (genError "the oracle's branch does not decode") return (parseMaybe items page)
+        return $ sortOn _hiHeight [ h | h <- hs, _hiHeight h >= lo, _hiHeight h <= hi ]
   where
-    cutHash :: Value -> Parser T.Text
-    cutHash = withObject "cut" $ \o -> do
+    cutEntry :: Value -> Parser (T.Text, Word64)
+    cutEntry = withObject "cut" $ \o -> do
         m <- o .: "hashes"
         e <- withObject "hashes" (\x -> x .: K.fromText (toText cid)) m
-        withObject "block hash with height" (.: "hash") e
+        withObject "block hash with height" (\x -> (,) <$> x .: "hash" <*> x .: "height") e
     items :: Value -> Parser [HeaderInfo]
     items = withObject "page" $ \o -> o .: "items" >>= mapM (withObject "header" $ \x -> HeaderInfo
         <$> x .: "height"
@@ -460,7 +467,8 @@ blockFacts api cid hs = do
 
 -- | The first block from the sampled height up that has transactions: in
 -- 'txScanWindow' blocks, then in windows of 'txScanStep' blocks, up to
--- 'txScanMax' blocks in all or the oracle's tip. Throws 'NoTxWithin' if
+-- 'txScanMax' blocks in all or the oracle's tip ('canonicalHeaders' stops at
+-- the height of the oracle's cut). Throws 'NoTxWithin' if
 -- there is none (ruling C3 on Task 6), so a poll or SPV request always has a
 -- request key of a real transaction.
 --

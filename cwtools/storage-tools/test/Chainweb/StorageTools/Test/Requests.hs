@@ -98,6 +98,7 @@ tests = testGroup "Requests"
     , testCase "a request file holds only the read requests of the 7 classes, pinned ones with {rewindDepth} and a target" requestFileAllowlist
     , testCase "a class whose every compared answer is the same non-2xx is at best PartialPass" sameNon2xxOnly
     , testCase "a Pact set entry that expects success needs a Same success in each class, or the run is at best PartialPass" hollowEntries
+    , testCase "lookups whose window crosses the oracle's tip stop at the height of its cut" nearTip
     ]
 
 cid0, cid3, cid10 :: ChainId
@@ -228,9 +229,11 @@ oracleAppWith txsAt arrivals req respond = do
                 [ K.fromText (tshow c) .= object [ "hash" .= hashAt stubTip, "height" .= stubTip ] | c <- [0 .. 19 :: Int] ]
             , "height" .= (20 * stubTip)
             ]
+        -- as in 3.2.1: a maxheight above the upper bound (the cut's header at
+        -- 'stubTip') gives an empty branch, not one cut at the tip
         ["chain", _, "header", "branch"]
             | Just lo <- q "minheight", Just hi <- q "maxheight" ->
-                let items = [ headerObj h | h <- reverse [lo .. min hi stubTip] ]
+                let items = if hi > stubTip then [] else [ headerObj h | h <- reverse [lo .. hi] ]
                 in json $ object [ "items" .= items, "limit" .= length items, "next" .= Null ]
         ["chain", _, "payload", "outputs", "batch"]
             | Just hs <- decodeStrict body >>= parseMaybe (withObject "batch" (.: "heights")) ->
@@ -820,3 +823,23 @@ hollowEntries = do
         decode (encode r) @?= Just r
         p <- gen api 1 ClsPayload 300
         _reqEntry p @?= Nothing
+
+-- | Minor 1 of the P0 review: a branch query whose maxheight is above the
+-- cut's header is empty on 3.2.1, so a lookup window is clamped to the
+-- chain's height in the cut.
+--
+nearTip :: Assertion
+nearTip = withOracle $ \_ _ api _ -> do
+    forM_ [1 .. 30] $ \s -> do
+        p <- gen api s ClsPayload (stubTip - 1)
+        assertBool ("payload target at most the tip: " <> show (_reqTarget p)) (_reqTarget p <= Just (BlockHeight stubTip))
+        h <- gen api s ClsHeader (stubTip - 2)
+        assertBool ("header target at most the tip: " <> show (_reqTarget h)) (_reqTarget h <= Just (BlockHeight stubTip))
+    -- heights 998 and 1000 hold no transaction, 999 does
+    poll <- gen api 1 ClsPoll (stubTip - 2)
+    _reqTarget poll @?= Just (BlockHeight (stubTip - 1))
+    -- at the tip itself, without a transaction above it: no tx up to the tip
+    r <- try @RequestGenError (gen api 1 ClsSpv stubTip)
+    case r of
+        Left (NoTxWithin lo hi) -> (lo, hi) @?= (stubTip, stubTip)
+        x -> assertFailure ("expected NoTxWithin at the tip: " <> show x)
