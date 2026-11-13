@@ -41,11 +41,13 @@ import Chainweb.Pact.Backend.Store.SQLite
 import Chainweb.Pact.Backend.Store.Types
 import Chainweb.Pact.Backend.Types (SQLiteEnv)
 import Chainweb.Pact.Backend.Utils
-    ( chainwebPragmas, doLookupSuccessful, getEndTxId, getEndTxId', rewindDbTo
-    , withSQLiteConnection, withTempSQLiteConnection )
+    ( chainwebPragmas, withSQLiteConnection, withTempSQLiteConnection )
 import qualified Chainweb.Pact.PactService.Checkpointer.Internal as Cp
 import qualified Chainweb.Pact4.Backend.ChainwebPactDb as Pact4
 import qualified Chainweb.Test.Pact.Store.Characterization as C
+import Chainweb.Test.Pact.Store.Reference
+    ( doLookupSuccessful, getEndTxId, getEndTxId', rewindDbTo )
+import qualified Chainweb.Test.Pact.Store.Reference as Ref
 import Chainweb.Test.Utils (withTempDir)
 import Chainweb.Version (PactVersionT(..))
 import Chainweb.Utils.Serialization (runGetEitherS)
@@ -169,10 +171,10 @@ tests = testGroup "PactStore SQLite"
     , testGroup "differential: each store field against the 3.2.1 function it replaces"
         [ testCase "block queries on an empty database" $ withStore $ \sql ps -> do
             let p = (0, mkHash 1)
-            same "getEarliestBlock" (_psGetEarliestBlock ps) (Cp.getEarliestBlock sql)
-            same "getLatestBlock" (_psGetLatestBlock ps) (Cp.getLatestBlock sql)
-            same "lookupBlock" (_psLookupBlock ps p) (Cp.lookupBlock sql p)
-            same "getBlockParent" (_psGetBlockParent ps C.v4 C.cid p) (Cp.getBlockParent C.v4 C.cid sql p)
+            same "getEarliestBlock" (_psGetEarliestBlock ps) (Ref.getEarliestBlock sql)
+            same "getLatestBlock" (_psGetLatestBlock ps) (Ref.getLatestBlock sql)
+            same "lookupBlock" (_psLookupBlock ps p) (Ref.lookupBlock sql p)
+            same "getBlockParent" (_psGetBlockParent ps C.v4 C.cid p) (Ref.getBlockParent C.v4 C.cid sql p)
             same "getEndTxId" (_psGetEndTxId ps "msg" Nothing) (getEndTxId "msg" sql Nothing)
             same "getEndTxId'" (_psGetEndTxId' ps "msg" 0 (mkHash 1)) (getEndTxId' "msg" sql 0 (mkHash 1))
 
@@ -185,12 +187,12 @@ tests = testGroup "PactStore SQLite"
                 notInDb =
                     [ (3, mkHash 99), (3, view blockHash (C.p4Header 4))
                     , (7, view blockHash (C.p4Header 7)), (0, mkHash 99) ]
-            same "getEarliestBlock" (_psGetEarliestBlock ps) (Cp.getEarliestBlock sql)
-            same "getLatestBlock" (_psGetLatestBlock ps) (Cp.getLatestBlock sql)
+            same "getEarliestBlock" (_psGetEarliestBlock ps) (Ref.getEarliestBlock sql)
+            same "getLatestBlock" (_psGetLatestBlock ps) (Ref.getLatestBlock sql)
             forM_ (inDb <> notInDb) $ \p -> do
-                same ("lookupBlock " <> show p) (_psLookupBlock ps p) (Cp.lookupBlock sql p)
+                same ("lookupBlock " <> show p) (_psLookupBlock ps p) (Ref.lookupBlock sql p)
                 same ("getBlockParent " <> show p)
-                    (_psGetBlockParent ps C.v4 C.cid p) (Cp.getBlockParent C.v4 C.cid sql p)
+                    (_psGetBlockParent ps C.v4 C.cid p) (Ref.getBlockParent C.v4 C.cid sql p)
             -- _psGetEndTxId: the tip, every parent, a parent that is not in the db
             let parents = Nothing : [ Just (ParentHeader h) | h <- take 8 C.p4Headers ]
                          <> [ Just (ParentHeader ((C.p4Header 3) { _blockHash = mkHash 99 })) ]
