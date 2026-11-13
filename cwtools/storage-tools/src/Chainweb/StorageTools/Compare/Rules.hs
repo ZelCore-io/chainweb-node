@@ -20,8 +20,9 @@
 -- * Not covered: requests for a chain or height the test side does not hold
 --   are 'Skipped' and counted, never passed.
 -- * Orphan payloads ('AllowOrphanPayload'): found on the oracle, not found on
---   the test side, and no canonical header of either side at the target
---   height references the payload hash.
+--   the test side, no canonical header of either side at the target height
+--   references the payload hash, and the oracle holds a non-canonical header
+--   at that height that does.
 -- * @/spv@ target ('AllowSpvTarget'): the proofs differ in bytes but have the
 --   same target chain, subject and root.
 --
@@ -37,7 +38,7 @@ module Chainweb.StorageTools.Compare.Rules
   -- * Orphan payloads
 , payloadHashOfPath
 , apiPrefixOfPath
-, CanonicalHeader(..)
+, HeaderRef(..)
 , orphanVerdict
 
   -- * SPV proofs
@@ -78,10 +79,15 @@ preJudge :: Coverage -> Request -> Maybe Verdict
 preJudge cov r
     | not (isCovered cov (_reqChain r) (_reqTarget r)) = Just (Skipped NotCovered)
     | isPinnedClass (_reqClass r)
-    , not (hasDepthPlaceholder r) || isNothing (_reqTarget r) = Just (Skipped Unpinned)
+    , not (hasDepthPlaceholder r) || isNothing (_reqTarget r) || isNothing (apiPrefixOfPath (_reqPath r))
+        = Just (Skipped Unpinned)
     | otherwise = Nothing
 
 -- | Judges the answers of the oracle (first) and of the test side (second).
+--
+-- A pinned pair in which neither answer has block metadata (an error both
+-- sides returned without it) is compared byte for byte: there is no
+-- evidence of tip skew, so nothing is allowed to differ.
 --
 judge :: Coverage -> Request -> Answer -> Answer -> Judgement
 judge cov r a b = case preJudge cov r of
@@ -188,43 +194,53 @@ apiPrefixOfPath p = case pathSegments p of
     "chainweb" : api : v : _ -> Just ("/chainweb/" <> api <> "/" <> v)
     _ -> Nothing
 
--- | The canonical header of a side at a height, as found through the cut of
--- that side.
+-- | A block header by its hash and payload hash, as the header endpoints
+-- return them.
 --
-data CanonicalHeader = CanonicalHeader
-    { _chHash :: !T.Text
-    , _chPayloadHash :: !T.Text
+data HeaderRef = HeaderRef
+    { _hrHash :: !T.Text
+    , _hrPayloadHash :: !T.Text
     }
     deriving (Show, Eq)
 
--- | The verdict on a payload that the oracle has and the test side lacks,
--- from the canonical headers of both sides at the target height. Allowed only
--- if both lookups succeeded and neither header references the payload.
+-- | The verdict on a payload that the oracle has and the test side lacks.
+-- Allowed only if every lookup succeeded, neither canonical header at the
+-- target height references the payload, and the oracle holds a
+-- non-canonical header at that height that does (positive evidence of an
+-- orphan). Anything else is a difference.
 --
 orphanVerdict
     :: ChainId
     -> BlockHeight
     -> BlockPayloadHash
-    -> Either T.Text CanonicalHeader
-        -- ^ oracle
-    -> Either T.Text CanonicalHeader
-        -- ^ test side
+    -> Either T.Text [HeaderRef]
+        -- ^ every header of the oracle at the height, canonical or not
+    -> Either T.Text HeaderRef
+        -- ^ the canonical header of the oracle at the height
+    -> Either T.Text HeaderRef
+        -- ^ the canonical header of the test side at the height
     -> Verdict
-orphanVerdict cid h ph eo et = case (eo, et) of
-    (Left e, _) -> Differ $ "found on the oracle only; the orphan check failed on the oracle: " <> e
-    (_, Left e) -> Differ $ "found on the oracle only; the orphan check failed on the test side: " <> e
-    (Right o, Right t)
-        | _chPayloadHash o == pht -> Differ $ referenced "oracle" o
-        | _chPayloadHash t == pht -> Differ $ referenced "test side" t
-        | otherwise -> Allowed AllowOrphanPayload $
-            "payload " <> pht <> " found on the oracle only; the canonical header at height "
-            <> sshow h <> " of chain " <> toText cid <> " is " <> _chHash o
-            <> " (payload " <> _chPayloadHash o <> ") on the oracle and " <> _chHash t
-            <> " (payload " <> _chPayloadHash t <> ") on the test side"
+orphanVerdict cid h ph eh eo et = case (eh, eo, et) of
+    (_, Left e, _) -> Differ $ "found on the oracle only; the canonical header lookup failed on the oracle: " <> e
+    (_, _, Left e) -> Differ $ "found on the oracle only; the canonical header lookup failed on the test side: " <> e
+    (Left e, _, _) -> Differ $ "found on the oracle only; the lookup of the headers at height "
+        <> sshow h <> " failed on the oracle: " <> e
+    (Right hs, Right o, Right t)
+        | _hrPayloadHash o == pht -> Differ $ referenced "oracle" o
+        | _hrPayloadHash t == pht -> Differ $ referenced "test side" t
+        | otherwise -> case [ x | x <- hs, _hrPayloadHash x == pht, _hrHash x /= _hrHash o, _hrHash x /= _hrHash t ] of
+            [] -> Differ $ "found on the oracle only, but no non-canonical header of the oracle at height "
+                <> sshow h <> " of chain " <> toText cid <> " carries payload " <> pht
+            x : _ -> Allowed AllowOrphanPayload $
+                "payload " <> pht <> " found on the oracle only; it is the payload of the non-canonical header "
+                <> _hrHash x <> " of the oracle at height " <> sshow h <> " of chain " <> toText cid
+                <> "; the canonical header there is " <> _hrHash o
+                <> " (payload " <> _hrPayloadHash o <> ") on the oracle and " <> _hrHash t
+                <> " (payload " <> _hrPayloadHash t <> ") on the test side"
   where
     pht = toText ph
     referenced side c =
-        "found on the oracle only, but the canonical header " <> _chHash c <> " at height "
+        "found on the oracle only, but the canonical header " <> _hrHash c <> " at height "
         <> sshow h <> " of chain " <> toText cid <> " on the " <> side <> " references it"
 
 -- -------------------------------------------------------------------------- --

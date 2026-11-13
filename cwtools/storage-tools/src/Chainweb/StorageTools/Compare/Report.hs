@@ -15,6 +15,7 @@
 module Chainweb.StorageTools.Compare.Report
 ( -- * Outcomes
   Outcome(..)
+, NoAnswer(..)
 , effectiveVerdict
 
   -- * Report
@@ -40,6 +41,7 @@ module Chainweb.StorageTools.Compare.Report
 , reportPinned
 , reportPinUnstable
 , reportUnpinnedSent
+, reportNoAnswer
 , reportCompared
 , maxDiffSamples
 , maxBodyBytes
@@ -57,12 +59,14 @@ module Chainweb.StorageTools.Compare.Report
 
 import Data.Aeson
 import qualified Data.Aeson.Key as K
+import qualified Data.Aeson.KeyMap as KM
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.Map.Strict as M
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
 import qualified Data.Text.Encoding.Error as T
+import Data.Word (Word64)
 
 import System.Exit (ExitCode(..))
 
@@ -85,7 +89,26 @@ data Outcome = Outcome
     , _outAttempts :: !Int
         -- ^ how often the request was sent to the sides; 0 if it was decided
         -- before anything was sent
+    , _outDepths :: !(Maybe (Word64, Word64))
+        -- ^ the rewind depths used on the oracle and on the test side, for a
+        -- pinned request that was sent
+    , _outNoAnswer :: !(Maybe NoAnswer)
+        -- ^ which side gave no HTTP answer, after all attempts
     }
+
+-- | A transport failure: no HTTP answer after all attempts. On the test side
+-- only, the request is a difference ('Differ') and the oracle's answer is
+-- kept. On the oracle, or on both sides, it is 'Skipped' 'NoOracleAnswer' and
+-- counts toward 'Void'.
+--
+data NoAnswer = NoAnswerTest | NoAnswerOracle | NoAnswerBoth
+    deriving (Show, Eq, Ord, Enum, Bounded)
+
+noAnswerText :: NoAnswer -> T.Text
+noAnswerText = \case
+    NoAnswerTest -> "test-side-only"
+    NoAnswerOracle -> "oracle-only"
+    NoAnswerBoth -> "both-sides"
 
 -- | An 'Allowed' verdict without evidence counts as 'Differ'.
 --
@@ -120,6 +143,7 @@ data DiffSample = DiffSample
         -- ^ length of the full body
     , _dsTestBytes :: !Int
     , _dsAttempts :: !Int
+    , _dsDepths :: !(Maybe (Word64, Word64))
     }
 
 data AllowedSample = AllowedSample
@@ -127,6 +151,7 @@ data AllowedSample = AllowedSample
     , _asRequest :: !Request
     , _asRule :: !AllowRule
     , _asEvidence :: !T.Text
+    , _asDepths :: !(Maybe (Word64, Word64))
     }
 
 data Report = Report
@@ -146,6 +171,7 @@ data Report = Report
     , _repPinUnstable :: !Int
     , _repUnpinnedSent :: !Int
         -- ^ 'Unpinned' requests that were sent (a tip probe or the request)
+    , _repNoAnswer :: !(M.Map NoAnswer Int)
     }
 
 -- | The number of differences kept with their bodies.
@@ -159,17 +185,17 @@ maxBodyBytes :: Int
 maxBodyBytes = 4_096
 
 emptyReport :: Report
-emptyReport = Report mempty mempty mempty mempty mempty 0 mempty 0 0 0
+emptyReport = Report mempty mempty mempty mempty mempty 0 mempty 0 0 0 mempty
 
 -- | Adds the outcome of a request. The result does not depend on the order
 -- in which outcomes are added.
 --
 addOutcome :: Report -> Outcome -> Report
-addOutcome rep o = case v of
+addOutcome rep0 o = case v of
     Same -> (counted KindSame rep)
         { _repSameNon2xx = if is2xx then _repSameNon2xx rep else M.insertWith (+) cls 1 (_repSameNon2xx rep) }
     Allowed rule ev -> (counted KindAllowed rep)
-        { _repAllowed = M.insert idx (AllowedSample idx req rule ev) (_repAllowed rep) }
+        { _repAllowed = M.insert idx (AllowedSample idx req rule ev (_outDepths o)) (_repAllowed rep) }
     Differ detail -> (counted KindDiffer rep)
         { _repDiffCount = _repDiffCount rep + 1
         , _repDiffs = keepLowest $ M.insert idx (sample detail) (_repDiffs rep)
@@ -180,6 +206,8 @@ addOutcome rep o = case v of
         , _repUnpinnedSent = _repUnpinnedSent rep + if reason == Unpinned && sent then 1 else 0
         }
   where
+    rep = rep0
+        { _repNoAnswer = maybe id (\na -> M.insertWith (+) na 1) (_outNoAnswer o) (_repNoAnswer rep0) }
     v = effectiveVerdict (_outVerdict o)
     idx = _outIndex o
     req = _outRequest o
@@ -209,6 +237,7 @@ addOutcome rep o = case v of
         , _dsOracleBytes = maybe 0 (B.length . _ansBody) (_outOracle o)
         , _dsTestBytes = maybe 0 (B.length . _ansBody) (_outTest o)
         , _dsAttempts = _outAttempts o
+        , _dsDepths = _outDepths o
         }
 
     truncateAnswer a = a { _ansBody = B.take maxBodyBytes (_ansBody a) }
@@ -273,6 +302,11 @@ reportPinUnstable = _repPinUnstable
 reportUnpinnedSent :: Report -> Int
 reportUnpinnedSent = _repUnpinnedSent
 
+-- | Requests for which a side gave no HTTP answer after all attempts.
+--
+reportNoAnswer :: Report -> NoAnswer -> Int
+reportNoAnswer rep na = M.findWithDefault 0 na (_repNoAnswer rep)
+
 -- | The number of requests whose answers were judged: same, allowed or
 -- different.
 --
@@ -323,7 +357,9 @@ reportVerdict rep
 --   compared: a hollow class must not pass ('NotCovered' requests never
 --   count here);
 -- * 'PinUnstable' and 'Unpinned' requests that were sent are together more
---   than 1% of the pinned requests that were sent.
+--   than 1% of the pinned requests that were sent;
+-- * 'NoOracleAnswer' requests (no HTTP answer from the oracle, or from
+--   neither side) are more than 1% of the requests that were sent.
 --
 reportVoidReasons :: Report -> [T.Text]
 reportVoidReasons rep = concat
@@ -339,8 +375,14 @@ reportVoidReasons rep = concat
       | pinned > 0
       , 100 * (pu + up) > pinned
       ]
+    , [ sh noa <> " requests without an answer from the oracle of " <> sh sent <> " sent, more than 1%"
+      | sent > 0
+      , 100 * noa > sent
+      ]
     ]
   where
+    sent = reportSentTotal rep
+    noa = reportSkippedFor rep NoOracleAnswer
     pinned = _repPinned rep
     pu = _repPinUnstable rep
     up = _repUnpinnedSent rep
@@ -363,14 +405,42 @@ gateExitCode = \case
 lenient :: B.ByteString -> T.Text
 lenient = T.decodeUtf8With T.lenientDecode
 
-requestLine :: Request -> T.Text
-requestLine r = T.unwords
+-- | A request on one line: class, chain, target, method, path, the rewind
+-- depth used on each side, and the first 'excerptBytes' bytes of the body
+-- (of the Pact code, for a @/local@ command).
+--
+requestLine :: Request -> Maybe (Word64, Word64) -> T.Text
+requestLine r ds = T.unwords $
     [ requestClassText (_reqClass r)
     , "chain " <> T.pack (show (_reqChain r))
     , maybe "no target" (\h -> "at " <> T.pack (show h)) (_reqTarget r)
     , lenient (_reqMethod r)
     , _reqPath r
     ]
+    <> [ "(depth oracle " <> T.pack (show dO) <> ", test " <> T.pack (show dT) <> ")" | Just (dO, dT) <- [ds] ]
+    <> [ "body: " <> bodyExcerpt b | Just b <- [_reqBody r] ]
+
+-- | The bytes of a request body shown in the text summary.
+--
+excerptBytes :: Int
+excerptBytes = 120
+
+-- | The Pact code of a command (@cmd@, then @payload.exec.code@), or the
+-- body itself, cut to 'excerptBytes' bytes.
+--
+bodyExcerpt :: B.ByteString -> T.Text
+bodyExcerpt b = cut $ maybe b T.encodeUtf8 (decodeStrict' b >>= code)
+  where
+    cut x = lenient (B.take excerptBytes x) <> if B.length x > excerptBytes then "..." else ""
+    code :: Value -> Maybe T.Text
+    code v = do
+        Object o <- pure v
+        String cmd <- KM.lookup "cmd" o
+        Object c <- decodeStrict' (T.encodeUtf8 cmd)
+        Object pl <- KM.lookup "payload" c
+        Object ex <- KM.lookup "exec" pl
+        String t <- KM.lookup "code" ex
+        return t
 
 -- | A text summary: the gate verdict, counts per class and verdict, allowed
 -- differences per rule with their evidence, skipped requests per reason, and
@@ -387,6 +457,8 @@ reportSummary rep = T.unlines $
         <> ", pinned requests sent: " <> sh (_repPinned rep)
         <> ", pin unstable: " <> sh (_repPinUnstable rep)
         <> ", unpinned after sending: " <> sh (_repUnpinnedSent rep)
+    , "no HTTP answer (" <> T.intercalate ", " (map noAnswerText [minBound .. maxBound]) <> "): "
+        <> T.intercalate " / " [ sh (reportNoAnswer rep na) | na <- [minBound .. maxBound] ]
     , ""
     , "per class: same 2xx / same non-2xx / allowed / differ / skipped (" <> T.intercalate ", " (map skipReasonText [minBound .. maxBound]) <> ") / sent"
     ]
@@ -404,7 +476,7 @@ reportSummary rep = T.unlines $
        ]
     <> [ "", "allowed per rule:" ]
     <> [ "  " <> allowRuleText r <> ": " <> sh (reportAllowedFor rep r) | r <- [minBound .. maxBound] ]
-    <> [ "    #" <> sh (_asIndex a) <> " " <> requestLine (_asRequest a) <> ": " <> _asEvidence a
+    <> [ "    #" <> sh (_asIndex a) <> " " <> requestLine (_asRequest a) (_asDepths a) <> ": " <> _asEvidence a
        | a <- reportAllowedSamples rep
        ]
     <> [ "", "skipped per reason:" ]
@@ -416,7 +488,7 @@ reportSummary rep = T.unlines $
     sh = T.pack . show
 
     diffLines d =
-        [ "  #" <> sh (_dsIndex d) <> " " <> requestLine (_dsRequest d)
+        [ "  #" <> sh (_dsIndex d) <> " " <> requestLine (_dsRequest d) (_dsDepths d)
         , "    " <> _dsDetail d
         , "    oracle: " <> answerLine (_dsOracle d) (_dsOracleBytes d)
         , "    test:   " <> answerLine (_dsTest d) (_dsTestBytes d)
@@ -435,6 +507,8 @@ instance ToJSON Report where
         , "pinnedSent" .= _repPinned rep
         , "pinUnstable" .= _repPinUnstable rep
         , "unpinnedSent" .= _repUnpinnedSent rep
+        , "noAnswer" .= object
+            [ K.fromText (noAnswerText na) .= reportNoAnswer rep na | na <- [minBound .. maxBound] ]
         , "perClass" .= object
             [ K.fromText (requestClassText c) .= object
                 ( [ K.fromText (verdictKindText k) .= reportCount rep c k | k <- [minBound .. maxBound] ]
@@ -455,6 +529,7 @@ instance ToJSON Report where
                 , "request" .= _asRequest a
                 , "rule" .= allowRuleText (_asRule a)
                 , "evidence" .= _asEvidence a
+                , "depths" .= depthsJson (_asDepths a)
                 ]
             | a <- reportAllowedSamples rep
             ]
@@ -466,6 +541,7 @@ instance ToJSON Report where
                 , "request" .= _dsRequest d
                 , "detail" .= _dsDetail d
                 , "attempts" .= _dsAttempts d
+                , "depths" .= depthsJson (_dsDepths d)
                 , "oracle" .= answerJson (_dsOracle d) (_dsOracleBytes d)
                 , "test" .= answerJson (_dsTest d) (_dsTestBytes d)
                 ]
@@ -473,6 +549,8 @@ instance ToJSON Report where
             ]
         ]
       where
+        depthsJson Nothing = Null
+        depthsJson (Just (dO, dT)) = object [ "oracle" .= dO, "test" .= dT ]
         answerJson Nothing _ = Null
         answerJson (Just a) n = object
             [ "status" .= _ansStatus a

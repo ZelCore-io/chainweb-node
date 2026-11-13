@@ -13,7 +13,8 @@ module Chainweb.StorageTools.Test.Compare
 ( tests
 ) where
 
-import Data.Aeson (decode, encode)
+import Data.Aeson (Value(..), decode, decodeStrict, encode, object, withObject, (.:), (.=))
+import Data.Aeson.Types (Parser, parseMaybe)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as B8
 import qualified Data.ByteString.Lazy as BL
@@ -182,6 +183,47 @@ rulesTests = testGroup "rules"
             (judge cov keysReq (pinned p1 "[\"a\",\"b\"]") (pinned p1 "[\"b\",\"a\"]"))
     , testCase "status" $
         assertBool "status" $ isDiffer (judge cov headerReq (Answer 200 "x" Nothing) (Answer 500 "x" Nothing))
+    , testCase "pinned answers without block metadata on both sides: bytes compared strictly" $ do
+        judge cov localReq (Answer 400 "e" Nothing) (Answer 400 "e" Nothing) @?= Final Same
+        assertBool "body" $ isDiffer (judge cov localReq (Answer 400 "e" Nothing) (Answer 400 "f" Nothing))
+        assertBool "status" $ isDiffer (judge cov localReq (Answer 400 "e" Nothing) (Answer 500 "e" Nothing))
+    , testCase "orphanVerdict: failed lookups and references on one side are differences" $ do
+        let o = HeaderRef (hashText 'U') (toText payloadC)
+            t = HeaderRef (hashText 'W') (toText payloadC)
+            orphan = HeaderRef (hashText 'V') (toText payloadO)
+            ov = orphanVerdict cid0 100 payloadO
+            isD = \case
+                Differ _ -> True
+                _ -> False
+        assertBool "headers lookup failed" $ isD (ov (Left "x") (Right o) (Right t))
+        assertBool "oracle canonical lookup failed" $ isD (ov (Right [orphan]) (Left "x") (Right t))
+        assertBool "test canonical lookup failed" $ isD (ov (Right [orphan]) (Right o) (Left "x"))
+        assertBool "all lookups failed" $ isD (ov (Left "x") (Left "y") (Left "z"))
+        assertBool "referenced on the oracle only" $
+            isD (ov (Right [orphan]) (Right o { _hrPayloadHash = toText payloadO }) (Right t))
+        assertBool "referenced on the test side only" $
+            isD (ov (Right [orphan]) (Right o) (Right t { _hrPayloadHash = toText payloadO }))
+        assertBool "no non-canonical header carries it" $ isD (ov (Right [o]) (Right o) (Right t))
+        assertBool "no header at all" $ isD (ov (Right []) (Right o) (Right t))
+        case ov (Right [o, orphan]) (Right o) (Right t) of
+            Allowed AllowOrphanPayload ev -> assertBool "evidence names the orphan" (hashText 'V' `T.isInfixOf` ev)
+            v -> assertFailure ("expected Allowed, got " <> show v)
+    , testCase "pinned class without an API prefix: unpinned, never sent" $
+        judge cov localReq { _reqPath = "/local?rewindDepth=" <> depthPlaceholder } (pinned p1 "x") (pinned p1 "x")
+            @?= Final (Skipped Unpinned)
+    , testCase "tipProbe: (+ 1 1) at depth 0, the network and chain of the prefix" $ do
+        let (path, body) = tipProbe apiPrefix cid3 1_700_000_000
+            cmdP :: Value -> Parser T.Text
+            cmdP = withObject "command" (.: "cmd")
+            fieldsP :: Value -> Parser (T.Text, T.Text, T.Text)
+            fieldsP = withObject "payload" $ \c -> do
+                n <- c .: "networkId"
+                code <- c .: "payload" >>= withObject "rpc" (\x -> x .: "exec" >>= withObject "exec" (.: "code"))
+                ch <- c .: "meta" >>= withObject "meta" (.: "chainId")
+                return (n, code, ch)
+        path @?= apiPrefix <> "/chain/3/pact/api/v1/local?rewindDepth=0"
+        let fields = decodeStrict body >>= parseMaybe cmdP >>= decodeStrict . T.encodeUtf8 >>= parseMaybe fieldsP
+        fields @?= Just ("test", "(+ 1 1)", "3")
     , testCase "pinned class without depth placeholder or target: unpinned" $ do
         let noDepth = localReq { _reqPath = apiPrefix <> "/chain/0/pact/api/v1/local" }
         judge cov noDepth (pinned p1 "x") (pinned p1 "x") @?= Final (Skipped Unpinned)
@@ -275,8 +317,13 @@ sampleTests = testGroup "sampling"
 -- -------------------------------------------------------------------------- --
 -- Report
 
+-- | An outcome without depths or transport failure.
+--
+out :: Int -> Request -> Verdict -> Maybe Answer -> Maybe Answer -> Int -> Outcome
+out i r v a b n = Outcome i r v a b n Nothing Nothing
+
 outcome :: Int -> Request -> Verdict -> Outcome
-outcome i r v = Outcome i r v Nothing Nothing 1
+outcome i r v = out i r v Nothing Nothing 1
 
 reportTests :: TestTree
 reportTests = testGroup "report"
@@ -295,11 +342,11 @@ reportTests = testGroup "report"
         reportVerdict (run 3) @?= Void
         reportPinned (run 3) @?= 200
     , testCase "a run that compared nothing is void" $
-        reportVerdict (addOutcome emptyReport (Outcome 0 uncoveredReq (Skipped NotCovered) Nothing Nothing 0)) @?= Void
+        reportVerdict (addOutcome emptyReport (out 0 uncoveredReq (Skipped NotCovered) Nothing Nothing 0)) @?= Void
     , testCase "every History request ends Unpinned and every payload request is Same: Void, not Pass" $ do
         let rep = foldl addOutcome emptyReport $
-                [ Outcome i (historyReqAt 100) (Skipped Unpinned) Nothing Nothing 1 | i <- [0 .. 9] ]
-                <> [ Outcome i payloadReq Same (Just (ok "p")) (Just (ok "p")) 1 | i <- [10 .. 109] ]
+                [ out i (historyReqAt 100) (Skipped Unpinned) Nothing Nothing 1 | i <- [0 .. 9] ]
+                <> [ out i payloadReq Same (Just (ok "p")) (Just (ok "p")) 1 | i <- [10 .. 109] ]
         reportVerdict rep @?= Void
         assertBool "a reason names the hollow class" $
             any (\r -> requestClassText ClsHistory `T.isPrefixOf` r && "none compared" `T.isInfixOf` r) (reportVoidReasons rep)
@@ -308,7 +355,7 @@ reportTests = testGroup "report"
         reportSent rep ClsHistory @?= 10
     , testCase "Unpinned after sending counts toward the 1% threshold; Unpinned before sending does not" $ do
         let run k attempts = foldl addOutcome emptyReport
-                [ Outcome i localReq (if i < k then Skipped Unpinned else Same) Nothing Nothing (if i < k then attempts else 1)
+                [ out i localReq (if i < k then Skipped Unpinned else Same) Nothing Nothing (if i < k then attempts else 1)
                 | i <- [0 .. 199]
                 ]
         reportVerdict (run 2 1) @?= Pass
@@ -316,41 +363,76 @@ reportTests = testGroup "report"
         reportVerdict (run 3 0) @?= Pass
     , testCase "1% split between PinUnstable and Unpinned after sending: Void" $ do
         let rep = foldl addOutcome emptyReport $
-                [ Outcome 0 localReq (Skipped PinUnstable) Nothing Nothing 6
-                , Outcome 1 localReq (Skipped Unpinned) Nothing Nothing 1
-                , Outcome 2 localReq (Skipped Unpinned) Nothing Nothing 1
+                [ out 0 localReq (Skipped PinUnstable) Nothing Nothing 6
+                , out 1 localReq (Skipped Unpinned) Nothing Nothing 1
+                , out 2 localReq (Skipped Unpinned) Nothing Nothing 1
                 ]
-                <> [ Outcome i localReq Same Nothing Nothing 1 | i <- [3 .. 199] ]
+                <> [ out i localReq Same Nothing Nothing 1 | i <- [3 .. 199] ]
         reportVerdict rep @?= Void
     , testCase "a class whose sent requests were all skipped voids the run, below the 1% threshold too" $ do
         let rep = foldl addOutcome emptyReport $
-                Outcome 0 (historyReqAt 100) (Skipped PinUnstable) Nothing Nothing 6
-                : [ Outcome i localReq Same Nothing Nothing 1 | i <- [1 .. 200] ]
+                out 0 (historyReqAt 100) (Skipped PinUnstable) Nothing Nothing 6
+                : [ out i localReq Same Nothing Nothing 1 | i <- [1 .. 200] ]
         reportVerdict rep @?= Void
     , testCase "a class with requests in coverage but none compared voids the run, even if none was sent" $ do
         let rep = foldl addOutcome emptyReport $
-                [ Outcome i (historyReqAt 100) (Skipped Unpinned) Nothing Nothing 0 | i <- [0 .. 4] ]
-                <> [ Outcome i payloadReq Same Nothing Nothing 1 | i <- [5 .. 104] ]
+                [ out i (historyReqAt 100) (Skipped Unpinned) Nothing Nothing 0 | i <- [0 .. 4] ]
+                <> [ out i payloadReq Same Nothing Nothing 1 | i <- [5 .. 104] ]
         reportVerdict rep @?= Void
     , testCase "NotCovered never voids a run" $ do
         let rep = foldl addOutcome emptyReport $
-                [ Outcome i (historyReqAt 100) { _reqChain = cid3 } (Skipped NotCovered) Nothing Nothing 0 | i <- [0 .. 49] ]
-                <> [ Outcome i payloadReq Same Nothing Nothing 1 | i <- [50 .. 59] ]
+                [ out i (historyReqAt 100) { _reqChain = cid3 } (Skipped NotCovered) Nothing Nothing 0 | i <- [0 .. 49] ]
+                <> [ out i payloadReq Same Nothing Nothing 1 | i <- [50 .. 59] ]
         reportVerdict rep @?= Pass
         reportSkippedIn rep ClsHistory NotCovered @?= 50
         reportSkippedFor rep NotCovered @?= 50
         reportSent rep ClsHistory @?= 0
     , testCase "Same is split into 2xx and non-2xx per class, in the summary and the JSON" $ do
         let rep = foldl addOutcome emptyReport
-                [ Outcome 0 payloadReq Same (Just (ok "p")) (Just (ok "p")) 1
-                , Outcome 1 payloadReq Same (Just notFound) (Just notFound) 1
-                , Outcome 2 payloadReq Same (Just notFound) (Just notFound) 1
+                [ out 0 payloadReq Same (Just (ok "p")) (Just (ok "p")) 1
+                , out 1 payloadReq Same (Just notFound) (Just notFound) 1
+                , out 2 payloadReq Same (Just notFound) (Just notFound) 1
                 ]
         reportSame2xx rep ClsPayload @?= 1
         reportSameNon2xx rep ClsPayload @?= 2
         let line = "  " <> requestClassText ClsPayload <> ": 1 / 2 / 0 / 0 / 0 ("
         assertBool "summary" $ line `T.isInfixOf` reportSummary rep
         assertBool "json" $ "\"sameNon2xx\":2" `B.isInfixOf` BL.toStrict (encode rep)
+    , testCase "no answer from the oracle above 1% of the requests sent voids the run" $ do
+        let run k = foldl addOutcome emptyReport
+                [ if i < k
+                    then Outcome i payloadReq (Skipped NoOracleAnswer) Nothing Nothing 1 Nothing (Just NoAnswerOracle)
+                    else out i payloadReq Same Nothing Nothing 1
+                | i <- [0 .. 199]
+                ]
+        reportVerdict (run 2) @?= Pass
+        reportVerdict (run 3) @?= Void
+        reportNoAnswer (run 3) NoAnswerOracle @?= 3
+    , testCase "transport failures are counted per side, in the summary and the JSON" $ do
+        let rep = foldl addOutcome emptyReport
+                [ Outcome 0 payloadReq (Differ "no answer") (Just (ok "p")) Nothing 1 Nothing (Just NoAnswerTest)
+                , Outcome 1 payloadReq (Skipped NoOracleAnswer) Nothing Nothing 1 Nothing (Just NoAnswerOracle)
+                , Outcome 2 payloadReq (Skipped NoOracleAnswer) Nothing Nothing 1 Nothing (Just NoAnswerBoth)
+                , Outcome 3 payloadReq (Skipped NoOracleAnswer) Nothing Nothing 1 Nothing (Just NoAnswerBoth)
+                ]
+        map (reportNoAnswer rep) [NoAnswerTest, NoAnswerOracle, NoAnswerBoth] @?= [1, 1, 2]
+        reportVerdict rep @?= Fail
+        assertBool "summary" $ "1 / 1 / 2" `T.isInfixOf` reportSummary rep
+        assertBool "json" $ "\"both-sides\":2" `B.isInfixOf` BL.toStrict (encode rep)
+    , testCase "a difference line shows the depth on each side and the first 120 bytes of the Pact code" $ do
+        let code = "(coin.details \"k:00\") " <> T.replicate 200 "x"
+            cmd = T.decodeUtf8 $ BL.toStrict $ encode $ object
+                [ "payload" .= object [ "exec" .= object [ "code" .= code ] ] ]
+            req = localReq { _reqBody = Just (BL.toStrict (encode (object [ "cmd" .= cmd, "hash" .= ("h" :: T.Text) ]))) }
+            rep = addOutcome emptyReport
+                (Outcome 7 req (Differ "d") (Just (ok "a")) (Just (ok "b")) 1 (Just (900, 890)) Nothing)
+            summary = reportSummary rep
+        assertBool "depths" $ "(depth oracle 900, test 890)" `T.isInfixOf` summary
+        assertBool "code" $ ("body: " <> T.take 120 code <> "...") `T.isInfixOf` summary
+        assertBool "cut at 120 bytes" $ not (T.take 121 code `T.isInfixOf` summary)
+        assertBool "a plain body as is" $ "body: {\"code\":\"(coin.details" `T.isInfixOf`
+            reportSummary (addOutcome emptyReport (out 0 localReq (Differ "d") Nothing Nothing 1))
+        assertBool "json" $ "\"depths\":{\"oracle\":900,\"test\":890}" `B.isInfixOf` BL.toStrict (encode rep)
     , testCase "exit codes: 0 Pass, 2 Fail, 3 Void" $ do
         gateExitCode Pass @?= ExitSuccess
         gateExitCode Fail @?= ExitFailure 2
@@ -358,7 +440,7 @@ reportTests = testGroup "report"
     , testCase "the first 50 differences by request index are kept, bodies cut to 4 KB" $ do
         let big = Answer 200 (B.replicate 10_000 0x61) Nothing
             rep = foldl addOutcome emptyReport
-                [ Outcome i payloadReq (Differ "d") (Just big) (Just notFound) 1 | i <- reverse [0 .. 59] ]
+                [ out i payloadReq (Differ "d") (Just big) (Just notFound) 1 | i <- reverse [0 .. 59] ]
         reportDiffCount rep @?= 60
         map _dsIndex (reportDiffSamples rep) @?= [0 .. 49]
         map (fmap (B.length . _ansBody) . _dsOracle) (reportDiffSamples rep) @?= replicate 50 (Just 4_096)
@@ -380,6 +462,13 @@ data StubConfig = StubConfig
         -- ^ the payload hash of the canonical header at every height
     , _scLocalMeta :: !Bool
         -- ^ whether @/local@ answers carry block metadata
+    , _scOrphanHeaders :: ![(Char, BlockPayloadHash)]
+        -- ^ non-canonical headers at every height: hash character and
+        -- payload hash
+    , _scProbeFailures :: !Int
+        -- ^ the first tip probes answer 500 without block metadata
+    , _scDataTag :: !B.ByteString
+        -- ^ added to the data of every @/local@ answer if not empty
     }
 
 -- | Arrival time and path with query of every request a stub saw.
@@ -397,6 +486,9 @@ oracleConf = StubConfig
         ]
     , _scCanonicalPayload = payloadC
     , _scLocalMeta = True
+    , _scOrphanHeaders = [('V', payloadO)]
+    , _scProbeFailures = 0
+    , _scDataTag = ""
     }
 
 -- | The same answers as the oracle at a different tip, without the orphan.
@@ -407,8 +499,10 @@ testConf = oracleConf
     , _scPayloads = M.delete (toText payloadO) (_scPayloads oracleConf)
     }
 
-stubApp :: Seen -> StubConfig -> Application
-stubApp seen sc req respond = do
+-- | A stub service. History code (@txids@) fails at the tip, as on Pact 5.
+--
+stubApp :: Seen -> IORef Int -> StubConfig -> Application
+stubApp seen probes sc req respond = do
     body <- BL.toStrict <$> strictRequestBody req
     t <- getMonotonicTime
     let full = T.decodeUtf8 (rawPathInfo req <> rawQueryString req)
@@ -416,6 +510,10 @@ stubApp seen sc req respond = do
             [(n, "")] -> Just (n :: Integer)
             _ -> Nothing
         reply s b = respond $ responseLBS (mkStatus s "") [] (BL.fromStrict b)
+        dat = if B.null (_scDataTag sc) then body else "[" <> body <> ",\"" <> _scDataTag sc <> "\"]"
+        local d
+            | _scLocalMeta sc = reply 200 (localBody (_scTip sc - fromIntegral d) (_scParent sc) dat)
+            | otherwise = reply 200 "{\"result\":{\"status\":\"success\",\"data\":1},\"metaData\":null}"
     atomicModifyIORef' seen (\xs -> ((t, full) : xs, ()))
     case drop 3 (pathInfo req) of
         ["cut"] -> reply 200 $ mconcat
@@ -424,20 +522,32 @@ stubApp seen sc req respond = do
             ]
         ["chain", "0", "header", "branch"] -> case q "minheight" of
             Just h -> reply 200 $ mconcat
-                [ "{\"items\":[{\"height\":", B8.pack (show h)
-                , ",\"hash\":\"", T.encodeUtf8 (hashText 'U')
-                , "\",\"payloadHash\":\"", T.encodeUtf8 (toText (_scCanonicalPayload sc))
-                , "\"}],\"limit\":1,\"next\":null}"
+                [ "{\"items\":[", headerJson h 'U' (_scCanonicalPayload sc), "],\"limit\":1,\"next\":null}" ]
+            Nothing -> reply 400 "no minheight"
+        ["chain", "0", "header"] -> case q "minheight" of
+            Just h -> reply 200 $ mconcat
+                [ "{\"items\":["
+                , B.intercalate "," [ headerJson h c ph | (c, ph) <- ('U', _scCanonicalPayload sc) : _scOrphanHeaders sc ]
+                , "],\"limit\":", B8.pack (show (1 + length (_scOrphanHeaders sc))), ",\"next\":null}"
                 ]
             Nothing -> reply 400 "no minheight"
-        ["chain", "0", "header"] -> reply 200 "{\"items\":[],\"limit\":0,\"next\":null}"
         ["chain", "0", "payload", h] -> maybe (reply 404 "not found") (reply 200) (M.lookup h (_scPayloads sc))
         ["chain", "0", "pact", "api", "v1", "local"] -> case q "rewindDepth" of
             Just d
-                | _scLocalMeta sc -> reply 200 (localBody (_scTip sc - fromIntegral d) (_scParent sc) body)
-                | otherwise -> reply 200 "{\"result\":{\"status\":\"success\",\"data\":1},\"metaData\":null}"
+                | "(+ 1 1)" `B.isInfixOf` body -> do
+                    n <- atomicModifyIORef' probes (\k -> (k + 1, k))
+                    if n < _scProbeFailures sc then reply 500 "probe failed" else local d
+                | d == 0, "txids" `B.isInfixOf` body -> reply 500 "history functions are not available at the tip"
+                | otherwise -> local d
             Nothing -> reply 400 "no rewindDepth"
         _ -> reply 404 "no route"
+
+headerJson :: Integer -> Char -> BlockPayloadHash -> B.ByteString
+headerJson h c ph = mconcat
+    [ "{\"height\":", B8.pack (show h)
+    , ",\"hash\":\"", T.encodeUtf8 (hashText c)
+    , "\",\"payloadHash\":\"", T.encodeUtf8 (toText ph), "\"}"
+    ]
 
 quietLogger :: GenericLogger
 quietLogger = genericLogger Error (\_ -> return ())
@@ -448,17 +558,48 @@ withStubs
     -> StubConfig
     -> (Side -> Side -> Seen -> Seen -> IO a)
     -> IO a
-withStubs rate oc tc act = do
+withStubs rate oc tc = withSides rate (Just oc) (Just tc)
+
+-- | Like 'withStubs'; a side without a configuration is a closed port on
+-- 127.0.0.1, so that every call to it fails without an HTTP answer.
+--
+withSides
+    :: Double
+    -> Maybe StubConfig
+    -> Maybe StubConfig
+    -> (Side -> Side -> Seen -> Seen -> IO a)
+    -> IO a
+withSides rate oc tc act = do
     so <- newIORef []
     st <- newIORef []
     hl <- newHostLimiters rate Nothing
-    testWithApplication (return (stubApp so oc)) $ \po ->
-        testWithApplication (return (stubApp st tc)) $ \pt -> do
+    serve so oc $ \po ->
+        serve st tc $ \pt -> do
             let uo = "http://127.0.0.1:" <> T.pack (show po)
                 ut = "http://127.0.0.1:" <> T.pack (show pt)
             lo <- limiterFor hl uo
             lt <- limiterFor hl ut
             act (Side "oracle" uo lo) (Side "test" ut lt) so st
+
+-- | Serves a stub on a free port, or finds a closed port.
+--
+serve :: Seen -> Maybe StubConfig -> (Int -> IO a) -> IO a
+serve seen (Just sc) k = do
+    probes <- newIORef 0
+    testWithApplication (return (stubApp seen probes sc)) k
+serve _ Nothing k = do
+    closed <- testWithApplication (return (\_ respond -> respond (responseLBS status200 [] ""))) return
+    k closed
+
+-- | Short transport retries, so that tests with a closed port stay fast.
+--
+fastOptions :: RunOptions
+fastOptions = defaultRunOptions { _roTransportAttempts = 2, _roRetryDelay = 10_000, _roProbeAttempts = 3 }
+
+-- | Tip probes, the @/local@ requests at depth 0.
+--
+probeCount :: [T.Text] -> Int
+probeCount = length . filter ("rewindDepth=0" `T.isSuffixOf`)
 
 seenPaths :: Seen -> IO [T.Text]
 seenPaths s = map snd <$> readIORef s
@@ -523,6 +664,77 @@ runTests = testGroup "runCompare"
             pst <- seenPaths st
             assertBool "cut looked up on both sides" $
                 any ("/cut" `T.isSuffixOf`) pso && any ("/cut" `T.isSuffixOf`) pst
+
+    , testCase "an orphan that no non-canonical header of the oracle carries: Fail" $
+        withStubs 1_000 oracleConf { _scOrphanHeaders = [('V', payloadA)] } testConf $ \o t _ _ -> do
+            rep <- runCompare quietLogger cov o t [payloadReqFor payloadO]
+            reportVerdict rep @?= Fail
+            reportAllowedFor rep AllowOrphanPayload @?= 0
+
+    , testCase "no answer from the test side only: a difference that keeps the oracle body" $
+        withSides 1_000 (Just oracleConf) Nothing $ \o t _ _ -> do
+            rep <- runCompareWith quietLogger fastOptions cov o t [payloadReqFor payloadA, localReqAt 100]
+            reportVerdict rep @?= Fail
+            map (fmap _ansBody . _dsOracle) (reportDiffSamples rep) @?= [Just "payload-A", Nothing]
+            map (fmap _ansBody . _dsTest) (reportDiffSamples rep) @?= [Nothing, Nothing]
+            reportNoAnswer rep NoAnswerTest @?= 2
+            reportDiffCount rep @?= 2
+
+    , testCase "no answer from the oracle only: Void, not Fail" $
+        withSides 1_000 Nothing (Just testConf) $ \o t _ _ -> do
+            rep <- runCompareWith quietLogger fastOptions cov o t [payloadReqFor payloadA, localReqAt 100]
+            reportDiffCount rep @?= 0
+            reportVerdict rep @?= Void
+            reportSkippedFor rep NoOracleAnswer @?= 2
+            reportNoAnswer rep NoAnswerOracle @?= 2
+
+    , testCase "no answer from either side: Void, not Fail" $
+        withSides 1_000 Nothing Nothing $ \o t _ _ -> do
+            rep <- runCompareWith quietLogger fastOptions cov o t [payloadReqFor payloadA, localReqAt 100]
+            reportDiffCount rep @?= 0
+            reportVerdict rep @?= Void
+            reportNoAnswer rep NoAnswerBoth @?= 2
+
+    , testCase "the oracle's tip probe never gives block metadata: Unpinned after sending, Void" $
+        withStubs 1_000 oracleConf { _scProbeFailures = maxBound } testConf $ \o t so _ -> do
+            rep <- runCompareWith quietLogger fastOptions cov o t [localReqAt 100, payloadReqFor payloadA]
+            reportSkippedIn rep ClsLocal Unpinned @?= 1
+            reportUnpinnedSent rep @?= 1
+            reportVerdict rep @?= Void
+            n <- probeCount <$> seenPaths so
+            n @?= 3
+
+    , testCase "the test side's tip probe never gives block metadata: Fail" $
+        withStubs 1_000 oracleConf testConf { _scProbeFailures = maxBound } $ \o t _ _ -> do
+            rep <- runCompareWith quietLogger fastOptions cov o t [localReqAt 100, payloadReqFor payloadA]
+            reportVerdict rep @?= Fail
+            map _dsIndex (reportDiffSamples rep) @?= [0]
+
+    , testCase "neither tip probe gives block metadata: Void" $
+        withStubs 1_000 oracleConf { _scProbeFailures = maxBound } testConf { _scProbeFailures = maxBound } $ \o t _ _ -> do
+            rep <- runCompareWith quietLogger fastOptions cov o t [localReqAt 100, payloadReqFor payloadA]
+            reportDiffCount rep @?= 0
+            reportVerdict rep @?= Void
+
+    , testCase "a failed tip probe is tried again on its own: Pass after two failures" $
+        withStubs 1_000 oracleConf { _scProbeFailures = 2 } testConf $ \o t so _ -> do
+            rep <- runCompareWith quietLogger fastOptions cov o t [localReqAt 100]
+            reportVerdict rep @?= Pass
+            n <- probeCount <$> seenPaths so
+            n @?= 3
+
+    , testCase "a History request whose code fails at the tip is pinned by the class-neutral probe and compared" $
+        withStubs 1_000 oracleConf testConf $ \o t _ _ -> do
+            rep <- runCompare quietLogger cov o t [historyReqAt 100]
+            reportVerdict rep @?= Pass
+            reportSame2xx rep ClsHistory @?= 1
+
+    , testCase "a pinned difference names the depth used on each side" $
+        withStubs 1_000 oracleConf testConf { _scDataTag = "x" } $ \o t _ _ -> do
+            rep <- runCompare quietLogger cov o t [localReqAt 100]
+            reportVerdict rep @?= Fail
+            map _dsDepths (reportDiffSamples rep) @?= [Just (900, 890)]
+            assertBool "summary" $ "(depth oracle 900, test 890)" `T.isInfixOf` reportSummary rep
 
     , testCase "pins that never agree: 5 retries, then Skipped PinUnstable" $
         withStubs 1_000 oracleConf testConf { _scParent = 'E' } $ \o t so st -> do

@@ -234,8 +234,13 @@ data SkipReason
     | PinUnstable
         -- ^ the pins of the two answers did not agree after all retries
     | Unpinned
-        -- ^ a request of a pinned class without a target height or depth
-        -- placeholder, or whose tip probe failed identically on both sides
+        -- ^ a request of a pinned class without a target height, depth
+        -- placeholder or API prefix (never sent); or one that could not be
+        -- pinned on the oracle: its tip probe gave no block metadata, or the
+        -- target is above its tip
+    | NoOracleAnswer
+        -- ^ the oracle gave no HTTP answer to the request or to its tip
+        -- probe after all attempts, whatever the test side did
     deriving (Show, Eq, Ord, Enum, Bounded)
 
 skipReasonText :: SkipReason -> T.Text
@@ -243,6 +248,7 @@ skipReasonText = \case
     NotCovered -> "not-covered"
     PinUnstable -> "pin-unstable"
     Unpinned -> "unpinned"
+    NoOracleAnswer -> "no-oracle-answer"
 
 data Verdict
     = Same
