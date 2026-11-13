@@ -3,6 +3,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE ViewPatterns #-}
 
 -- |
 -- Module: Chainweb.Test.Pact.Store.SQLite
@@ -11,6 +12,7 @@
 --
 module Chainweb.Test.Pact.Store.SQLite (tests) where
 
+import Control.Concurrent.MVar (newMVar)
 import Control.Exception (ErrorCall(..), IOException, SomeException, throwIO, try)
 import Control.Lens (view)
 import Control.Monad
@@ -30,6 +32,7 @@ import qualified Data.Vector as V
 import qualified Database.SQLite3.Direct as SQ3
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.Resource (runResourceT)
+import System.LogLevel (LogLevel(..))
 import Test.Tasty
 import Test.Tasty.HUnit
 
@@ -42,15 +45,16 @@ import qualified Pact.Types.SQLite as P4SQL
 import Chainweb.BlockHash
 import Chainweb.BlockHeader.Internal
 import Chainweb.BlockHeight
-import Chainweb.Logger (GenericLogger)
-import Chainweb.Pact.Types (BlockTxHistory(..))
+import Chainweb.Logger (GenericLogger, genericLogger)
+import Chainweb.Pact.Types (BlockTxHistory(..), PactException(..), defaultModuleCacheLimit)
 import Chainweb.Pact.Backend.Store.SQLite
 import Chainweb.Pact.Backend.Store.Types
 import qualified Chainweb.Pact.Backend.InMemDb as InMemDb
 import Chainweb.Pact.Backend.Types
-    ( BlockHandle(..), SQLiteEnv, SQLitePendingData(..), SQLiteRowDelta(..), emptySQLitePendingData )
+    ( BlockHandle(..), IntraBlockPersistence(..), SQLiteEnv, SQLitePendingData(..), SQLiteRowDelta(..)
+    , emptySQLitePendingData )
 import Chainweb.Pact.Backend.Utils
-    ( chainwebPragmas, withSQLiteConnection, withTempSQLiteConnection )
+    ( chainwebPragmas, toUtf8, withSQLiteConnection, withTempSQLiteConnection )
 import qualified Chainweb.Pact.PactService.Checkpointer.Internal as Cp
 import qualified Chainweb.Pact4.Backend.ChainwebPactDb as Pact4
 import qualified Chainweb.Pact5.Backend.ChainwebPactDb as Pact5
@@ -369,6 +373,38 @@ tests = testGroup "PactStore SQLite"
                 -- order, so a store that sorts by (txid, rowkey) gives
                 -- different log lists
                 assertBool "a txid whose rows are not in key order" (not (null multi))
+
+        , testCase "Pact 4 duplicate-table check: _psTableInCatalog and createUserTable against 3.2.1's inDb" $ withStore $ \sql ps -> do
+            -- t and v created at height 1, u at height 3
+            commit ps 1 ["t", "v"] [] []
+            commit ps 3 ["u"] [] []
+            -- SQLite refuses a second table whose name differs from v only in
+            -- case, so plant its catalog row. Nothing in this connection
+            -- reloads the schema afterwards.
+            forM_
+                [ "PRAGMA writable_schema=ON"
+                , "INSERT INTO sqlite_master (type, name, tbl_name, rootpage, sql) SELECT type, 'V', 'V', rootpage, sql FROM sqlite_master WHERE name = 'v'"
+                , "PRAGMA writable_schema=OFF"
+                ] $ P4SQL.exec_ sql
+            query sql 1 "SELECT name FROM sqlite_master WHERE type='table' AND lower(name) = 'v' ORDER BY name"
+                >>= (@?= [["V"], ["v"]])
+            -- exact, case variant, absent, and the two case variants
+            let names = ["t", "T", "u", "U", "zz", "v", "V"]
+            forM_ [ (lc, t) | lc <- [False, True], t <- names ] $ \(lc, t) ->
+                same ("_psTableInCatalog " <> show (lc, t))
+                    (_psTableInCatalog ps lc t) (Right <$> refInDb sql Nothing lc t)
+            rs <- forM [ (mbh, lc, t) | mbh <- [Nothing, Just 2, Just 4], lc <- [False, True], t <- names ] $ \(mbh, lc, t) -> do
+                new <- createUserTableIsDuplicate ps mbh lc t
+                old <- refInDb sql mbh lc t
+                assertEqual ("createUserTable " <> show (mbh, lc, t)) old new
+                return ((mbh, lc, t), new)
+            -- the cases separate lower-case matching, the creation height at
+            -- a rewound height, and two case variants under lower-case matching
+            fmap (`lookup` rs)
+                [ (Nothing, False, "T"), (Nothing, True, "T")
+                , (Just 2, False, "u"), (Just 4, False, "u")
+                , (Nothing, False, "v"), (Nothing, True, "v"), (Just 4, True, "V") ]
+                @?= fmap Just [False, True, False, True, True, False, False]
         ]
     ]
 
@@ -422,6 +458,56 @@ p5Writes = foldr
     (\(k, i, v) -> InMemDb.insert (P5.DUserTables (C.tn5 "t")) (P5.RowKey k)
         (InMemDb.WriteEntry (P5.TxId (fromIntegral i)) v (P5.RowData mempty)))
     InMemDb.empty
+
+-- | Whether Pact 4's @createUserTable@, at the tip or rewound to the height,
+-- raises 'PactDuplicateTableError' for the table of module @m@.
+createUserTableIsDuplicate :: PactStore -> Maybe BlockHeight -> Bool -> Text -> IO Bool
+createUserTableIsDuplicate ps mbh lc t = do
+    let logger = genericLogger Error (\_ -> return ())
+        henv = (Pact4.mkBlockHandlerEnv C.v4 C.cid 10 ps DoNotPersistIntraBlockWrites logger)
+            { Pact4._blockHandlerLowerCaseTables = lc }
+        pdb :: P4.PactDb (Pact4.BlockEnv GenericLogger)
+        pdb = maybe Pact4.chainwebPactDb (\bh -> Pact4.rewoundPactDb bh 0) mbh
+    mv <- newMVar (Pact4.BlockEnv henv (Pact4.initBlockState defaultModuleCacheLimit 0))
+    r <- try @PactException $ P4._createUserTable pdb (P4.TableName t) (P4.ModuleName "m" Nothing) mv
+    case r of
+        Right () -> return False
+        Left (PactDuplicateTableError _) -> return True
+        Left e -> assertFailure ("createUserTable " <> show t <> ": " <> show e)
+
+-- | Frozen 3.2.1 @inDb@ of Pact 4's @doCreateUserTable@, with
+-- @tableExistsInDbAtHeight@, over the database instead of 'callDb'. With
+-- 'Nothing' it is the catalog expression alone.
+refInDb :: SQLiteEnv -> Maybe BlockHeight -> Bool -> Text -> IO Bool
+refInDb db mbh lcTables t = do
+      r <- P4SQL.qry db (tableLookupStmt lcTables) [P4SQL.SText (toUtf8 t)] [P4SQL.RText]
+      case r of
+        [[P4SQL.SText (SQ3.Utf8 (T.decodeUtf8 -> rname))]] ->
+          case mbh of
+              -- if lowercase matching, no need to check equality
+              -- (wasn't needed before either but leaving alone for replay)
+              Nothing -> return (lcTables || rname == t)
+              Just bh -> do
+                  existsInDb <- tableExistsInDbAtHeight t bh
+                  return $ existsInDb && (lcTables || rname == t)
+        _ -> return False
+  where
+    tableExistsInDbAtHeight tableName bh = do
+      let knownTbls =
+            ["SYS:Pacts", "SYS:Modules", "SYS:KeySets", "SYS:Namespaces", "SYS:ModuleSources"]
+      if tableName `elem` knownTbls
+      then return True
+      else do
+        let tableExistsStmt =
+              -- table names are case-sensitive
+              "SELECT tablename FROM VersionedTableCreation WHERE createBlockheight < ? AND lower(tablename) = lower(?)"
+        P4SQL.qry db tableExistsStmt [P4SQL.SInt $ max 0 (fromIntegral bh), P4SQL.SText (toUtf8 tableName)] [P4SQL.RText] >>= \case
+          [] -> return False
+          _ -> return True
+    tableLookupStmt False =
+      "SELECT name FROM sqlite_master WHERE type='table' and name=?;"
+    tableLookupStmt True =
+      "SELECT name FROM sqlite_master WHERE type='table' and lower(name)=lower(?);"
 
 -- | Run both actions and compare their results.
 same :: (Eq a, Show a) => String -> IO a -> IO a -> Assertion
