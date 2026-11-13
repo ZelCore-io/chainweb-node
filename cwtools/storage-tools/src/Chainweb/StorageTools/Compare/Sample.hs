@@ -1,3 +1,4 @@
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE NumericUnderscores #-}
 
 -- |
@@ -10,8 +11,9 @@
 -- probability '_ssBoundaryShare', a height within 'boundaryDistance' heights of
 -- a boundary, and otherwise a height uniformly from the covered heights. A
 -- class whose covered windows have no height near a boundary always draws
--- uniformly. History targets are drawn only below 'historyMaxHeight', because
--- Pact 5 has no history functions (spec 10.1).
+-- uniformly. History targets are drawn only up to '_ssHistoryMax', the last
+-- Pact 4 height of the version ('historyMaxHeight'), because Pact 5 has no
+-- history functions (spec 10.1).
 --
 module Chainweb.StorageTools.Compare.Sample
 ( SampleSpec(..)
@@ -22,6 +24,9 @@ module Chainweb.StorageTools.Compare.Sample
 , sampleTargets
 ) where
 
+import Control.Lens (at, (^?), _Just)
+
+import qualified Data.HashSet as HS
 import Data.List (sortOn)
 import qualified Data.Map.Strict as M
 import Data.Word
@@ -33,6 +38,7 @@ import System.Random (StdGen, mkStdGen, uniformR)
 import Chainweb.BlockHeight
 import Chainweb.ChainId
 import Chainweb.StorageTools.Compare.Types
+import Chainweb.Version (ChainwebVersion, Fork(Pact5Fork), ForkHeight(..), chainIds, versionForks)
 
 data SampleSpec = SampleSpec
     { _ssSeed :: !Word64
@@ -43,6 +49,9 @@ data SampleSpec = SampleSpec
     , _ssBoundaries :: ![BlockHeight]
     , _ssBoundaryShare :: !Double
         -- ^ the share of targets within 'boundaryDistance' of a boundary
+    , _ssHistoryMax :: !(Maybe BlockHeight)
+        -- ^ the highest height of a History target, from 'historyMaxHeight';
+        -- 'Nothing': no History target is drawn
     }
 
 -- | The fork boundaries of mainnet: the coin v2 upgrade, the genesis of the
@@ -63,10 +72,21 @@ boundaryShare = 0.2
 boundaryDistance :: Word64
 boundaryDistance = 5
 
--- | The highest Pact 4 height on mainnet; history targets stay at or below it.
+-- | The highest height at which a version runs Pact 4 on every chain: its
+-- Pact 5 fork height minus 1, the lowest across chains. History targets stay
+-- at or below it; 5,555,697 on mainnet.
 --
-historyMaxHeight :: Word64
-historyMaxHeight = 5_555_697
+-- 'Nothing' if some chain has no Pact 4 height, or its Pact 5 fork height is
+-- not known in advance (a fork number) or not listed: no History target is
+-- drawn then. A version that never forks to Pact 5 has no cap.
+--
+historyMaxHeight :: ChainwebVersion -> Maybe BlockHeight
+historyMaxHeight v = minimum . (maxBound :) <$> traverse lastPact4 (HS.toList (chainIds v))
+  where
+    lastPact4 cid = case v ^? versionForks . at Pact5Fork . _Just . atChain cid of
+        Just (ForkAtBlockHeight h) | h > 0 -> Just (h - 1)
+        Just ForkNever -> Just maxBound
+        _ -> Nothing
 
 -- | A chain and an inclusive, non-empty range of heights.
 --
@@ -99,9 +119,10 @@ clip lo' hi' ws =
     , lo <= hi
     ]
 
-classWindows :: RequestClass -> [Window] -> [Window]
-classWindows ClsHistory = clip 0 historyMaxHeight
-classWindows _ = id
+classWindows :: SampleSpec -> RequestClass -> [Window] -> [Window]
+classWindows spec = \case
+    ClsHistory -> maybe (const []) (clip 0 . getBlockHeight) (_ssHistoryMax spec)
+    _ -> id
 
 nearBoundaries :: [BlockHeight] -> [Window] -> [Window]
 nearBoundaries bs ws =
@@ -133,7 +154,7 @@ sampleTargets spec = go (mkStdGen (fromIntegral (_ssSeed spec))) (_ssCount spec)
     pools =
         [ (cls, regular, nearBoundaries (_ssBoundaries spec) regular)
         | cls <- _ssClasses spec
-        , let regular = classWindows cls covered
+        , let regular = classWindows spec cls covered
         , not (null regular)
         ]
     nPools = length pools

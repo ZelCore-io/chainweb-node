@@ -50,6 +50,7 @@ import Chainweb.StorageTools.Compare.Sample
 import Chainweb.StorageTools.Compare.Types
 import Chainweb.StorageTools.Http
 import Chainweb.Utils (HasTextRepresentation, fromJuste, fromText, toText)
+import Chainweb.Version.Mainnet (mainnet)
 
 tests :: TestTree
 tests = testGroup "Compare"
@@ -256,6 +257,7 @@ sampleCov = Coverage $ M.fromList [(cid0, [(0, 150_000)]), (cid3, [(0, 6_100_000
 
 specFor :: Word64 -> SampleSpec
 specFor seed = SampleSpec seed 10_000 allRequestClasses sampleCov mainnetBoundaries boundaryShare
+    (historyMaxHeight mainnet)
 
 spec1, spec2 :: SampleSpec
 spec1 = specFor 1
@@ -312,6 +314,15 @@ sampleTests = testGroup "sampling"
         assertBool "history below Pact 5" $ all (\(k, _, h) -> k /= ClsHistory || h < 5_555_698) ts
         assertBool "both classes drawn" $
             any (\(k, _, _) -> k == ClsHistory) ts && any (\(k, _, _) -> k == ClsPayload) ts
+    , testCase "the History cap is the Pact 5 fork height minus 1: 5,555,697 on mainnet" $
+        historyMaxHeight mainnet @?= Just 5_555_697
+    , testCase "History targets follow the cap of the spec; without one, none is drawn" $ do
+        let capped = sampleTargets spec1 { _ssHistoryMax = Just 1_000 }
+            none = sampleTargets spec1 { _ssHistoryMax = Nothing }
+        assertBool "capped" $ all (\(k, _, h) -> k /= ClsHistory || h <= 1_000) capped
+        assertBool "History still drawn" $ any (\(k, _, _) -> k == ClsHistory) capped
+        assertBool "no History" $ all (\(k, _, _) -> k /= ClsHistory) none
+        length none @?= 10_000
     ]
 
 -- -------------------------------------------------------------------------- --
