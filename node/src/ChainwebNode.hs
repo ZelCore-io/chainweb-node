@@ -325,11 +325,14 @@ node conf logger = do
         if _configOnlySyncPact cwConf || _configReadOnlyReplay cwConf
         then
             if _cutPruneChainDatabase (_configCuts cwConf) == GcNone
-            then withReadOnlyRocksDb <$ logFunctionText logger Info "Opening RocksDB in read-only mode"
-            else withRocksDb <$ logFunctionText logger Info "Opening RocksDB in read-write mode, if this wasn't intended, ensure that cuts.pruneChainDatabase is set to none"
+            then withReadOnlyRocksDbTuned <$ logFunctionText logger Info "Opening RocksDB in read-only mode"
+            else withRocksDbTuned <$ logFunctionText logger Info "Opening RocksDB in read-write mode, if this wasn't intended, ensure that cuts.pruneChainDatabase is set to none"
         else
-            return withRocksDb
-    withRocksDb' rocksDbDir modernDefaultOptions $ \rocksDb -> do
+            return withRocksDbTuned
+    let compression = _configPayloadCompression cwConf
+    when (compression /= PayloadSnappy) $
+        logFunctionText logger Info $ "RocksDB compression: " <> toText compression
+    withRocksDb' rocksDbDir modernDefaultOptions (payloadCompressionTuning compression) $ \rocksDb -> do
         logFunctionText logger Info $ "opened rocksdb in directory " <> sshow rocksDbDir
         logFunctionText logger Debug $ "backup config: " <> sshow (_configBackup cwConf)
         withChainweb cwConf logger rocksDb pactDbDir dbBackupsDir (_nodeConfigResetChainDbs conf) $ \case

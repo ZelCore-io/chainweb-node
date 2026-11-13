@@ -92,6 +92,7 @@ module Chainweb.Test.Utils
 , withPayloadServer
 , withRocksResource
 , testPayloadDbConfig
+, testStorageTuning
 
 -- * QuickCheck Properties
 , prop_iso
@@ -231,7 +232,7 @@ import Chainweb.Test.Pact5.Utils (getTestLogLevel)
 import Chainweb.Test.P2P.Peer.BootstrapConfig
     (testBootstrapCertificate, testBootstrapKey, testBootstrapPeerConfig)
 import Chainweb.Test.Utils.BlockHeader
-import Chainweb.Test.Utils.Storage (testPayloadDbConfig)
+import Chainweb.Test.Utils.Storage (testPayloadDbConfig, testStorageTuning)
 import Chainweb.Time
 import Chainweb.TreeDB
 import Chainweb.Utils
@@ -242,6 +243,7 @@ import Chainweb.Version.Utils
 
 import Chainweb.Storage.Table
 import Chainweb.Storage.Table.RocksDB
+import Chainweb.Storage.Table.RocksDB.Tuning (applyTuning)
 
 import qualified Database.RocksDB.Internal as R
 
@@ -330,6 +332,8 @@ withRocksResource = view _2 . snd <$> allocate create destroy
       sysdir <- getCanonicalTemporaryDirectory
       dir <- createTempDirectory sysdir "chainweb-rocksdb-tmp"
       opts@(R.Options' opts_ptr _ _) <- R.mkOpts modernDefaultOptions
+      tuning <- testStorageTuning
+      applyTuning tuning opts_ptr
       rocks <- openRocksDb dir opts_ptr
       return (dir, rocks, opts)
     destroy (dir, rocks, opts) =

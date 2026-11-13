@@ -36,7 +36,7 @@ import Chainweb.Version.Registry
 -- chainweb-test-tools modules
 
 import Chainweb.Test.Utils
-    (independentSequentialTestGroup, toyChainId, withToyDB)
+    (independentSequentialTestGroup, testStorageTuning, toyChainId, withToyDB)
 
 -- internal modules
 
@@ -103,7 +103,8 @@ main :: IO ()
 main = do
     registerVersion RecapDevelopment
     registerVersion Development
-    withTempRocksDb "chainweb-tests" $ \rdb ->
+    tuning <- testStorageTuning
+    withTempRocksDbTuned "chainweb-tests" tuning $ \rdb ->
         runResourceT $ do
             (h0, db) <- withToyDB rdb toyChainId
             liftIO

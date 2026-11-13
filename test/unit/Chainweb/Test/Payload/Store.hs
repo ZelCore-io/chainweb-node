@@ -24,12 +24,17 @@ import qualified Data.ByteString as B
 import qualified Data.ByteString.Base16 as B16
 import qualified Data.ByteString.Char8 as B8
 import qualified Data.ByteString.Lazy as BL
+import qualified Data.List as L
+import qualified Data.Map.Strict as M
 import qualified Data.Vector as V
 
 import qualified Database.RocksDB.Iterator as I
 import qualified Database.RocksDB.ReadOptions as R
 
-import Options.Applicative (defaultPrefs, execParserPure, getParseResult, info)
+import Options.Applicative
+    (ParserResult(..), defaultPrefs, execParserPure, getParseResult, info, renderFailure)
+
+import System.IO.Temp (withSystemTempDirectory)
 
 import Test.Tasty
 import Test.Tasty.HUnit
@@ -43,6 +48,7 @@ import Chainweb.Payload
 import Chainweb.Payload.PayloadStore
 import Chainweb.Payload.PayloadStore.RocksDB
 import Chainweb.Storage.Table.RocksDB
+import Chainweb.Storage.Table.RocksDB.Tuning
 import Chainweb.Storage.Table
 import Chainweb.Test.Utils (golden)
 import Chainweb.Version.Mainnet
@@ -58,6 +64,12 @@ tests = testGroup "Payload store"
     , testCase "addPayload is all-or-nothing" allOrNothingTest
     , testCase "storeMerkleTrees: default True; --store-merkle-trees true and false parse, any other value fails; JSON round trip"
         storeMerkleTreesConfigTest
+    , testCase "zstd-dict: payloads added then flushed live only in ZSTD SSTs with max_dict_bytes=65536"
+        zstdDictFilesTest
+    , testCase "mixed files: Snappy half, zstd half, reopened under each setting: every payload byte-equal"
+        mixedFilesTest
+    , testCase "--payload-compression parses snappy and zstd-dict; any other value fails naming both"
+        payloadCompressionOptionTest
     ]
 
 -- -------------------------------------------------------------------------- --
@@ -191,3 +203,84 @@ storeMerkleTreesConfigTest = do
             Object o -> KM.lookup "storeMerkleTrees" o @?= Just (Bool b)
             v -> assertFailure $ "not an object: " <> show v
         (_configStoreMerkleTrees <$> eitherDecode (encode c)) @?= Right b
+
+-- -------------------------------------------------------------------------- --
+-- Payload compression
+
+-- | Payload @i@ at height @i@, with ten transactions and ten outputs that
+-- differ per payload.
+--
+addIndexedPayloads :: PayloadDb RocksDbTable -> [Int] -> IO ()
+addIndexedPayloads pdb is = forM_ is $ \i -> do
+    let item n j = B8.pack $ "{\"" <> n <> "\":" <> show i <> ",\"j\":" <> show j
+            <> ",\"data\":\"" <> concat (replicate 20 (show (i * j))) <> "\"}"
+        (txTree, txs) = newBlockTransactions
+            (MinerData $ item "miner" (0 :: Int))
+            (V.fromList [Transaction (item "tx" j) | j <- [0 .. 9 :: Int]])
+        (outTree, outs) = newBlockOutputs
+            (CoinbaseOutput $ item "coinbase" (0 :: Int))
+            (V.fromList [TransactionOutput (item "out" j) | j <- [0 .. 9 :: Int]])
+    addPayload pdb (fromIntegral i) txs txTree outs outTree
+
+withPayloadRocksDb :: FilePath -> PayloadCompression -> (RocksDb -> IO a) -> IO a
+withPayloadRocksDb dir c = withRocksDbTuned dir modernDefaultOptions (payloadCompressionTuning c)
+
+zstdDictFilesTest :: Assertion
+zstdDictFilesTest = withSystemTempDirectory "payload-store-zstd" $ \dir -> do
+    withPayloadRocksDb dir PayloadZstdDict $ \rdb -> do
+        addIndexedPayloads (newPayloadDb rdb) [0 .. 199]
+        flushRocksDb rdb
+    info' <- sstCompressionInfo dir
+    assertBool "no SST files" (not (M.null info'))
+    forM_ (M.toList info') $ \(f, (c, o)) -> do
+        assertEqual ("compression of " <> f) "ZSTD" c
+        assertBool ("compression options of " <> f <> ": " <> show o)
+            ("max_dict_bytes=65536;" `B.isInfixOf` o)
+
+-- | Node-level twin of the engine-level @mixedCompressionReadTest@ of
+-- chainweb-storage.
+--
+mixedFilesTest :: Assertion
+mixedFilesTest = withSystemTempDirectory "payload-store-mixed" $ \dir -> do
+    withPayloadRocksDb dir PayloadSnappy $ \rdb -> do
+        addIndexedPayloads (newPayloadDb rdb) [0 .. 99]
+        flushRocksDb rdb
+    withPayloadRocksDb dir PayloadZstdDict $ \rdb -> do
+        addIndexedPayloads (newPayloadDb rdb) [100 .. 199]
+        flushRocksDb rdb
+    info' <- sstCompressionInfo dir
+    assertEqual ("compression of the SST files: " <> show info')
+        ["Snappy", "ZSTD"] (L.sort $ L.nub $ fst <$> M.elems info')
+
+    expected <- withTempRocksDb "payload-store-mixed-reference" $ \ref -> do
+        addIndexedPayloads (newPayloadDb ref) [0 .. 199]
+        rawEntries ref
+    length expected @?= 1200
+    forM_ [PayloadSnappy, PayloadZstdDict] $ \c ->
+        withPayloadRocksDb dir c $ \rdb -> do
+            es <- rawEntries rdb
+            assertBool ("entries differ, reopened with " <> show c) (es == expected)
+
+payloadCompressionOptionTest :: Assertion
+payloadCompressionOptionTest = do
+    let def = defaultChainwebConfiguration Mainnet01
+    _configPayloadCompression def @?= PayloadSnappy
+    assertBool "snappy tuning" (payloadCompressionTuning PayloadSnappy == defaultTuning)
+    assertBool "zstd-dict tuning" (payloadCompressionTuning PayloadZstdDict == payloadZstdTuning)
+
+    let parsed args c = _configPayloadCompression . ($ c) <$> parseArgs args
+    parsed ["--payload-compression", "snappy"] def { _configPayloadCompression = PayloadZstdDict }
+        @?= Just PayloadSnappy
+    parsed ["--payload-compression", "zstd-dict"] def @?= Just PayloadZstdDict
+    parsed [] def @?= Just PayloadSnappy
+    forM_ ["zstd", "Snappy", "lz4", ""] $ \v ->
+        case execParserPure defaultPrefs (info pChainwebConfiguration mempty) ["--payload-compression", v] of
+            Failure f -> do
+                let (msg, _) = renderFailure f "chainweb-node"
+                assertBool ("message does not name snappy: " <> msg) ("snappy" `L.isInfixOf` msg)
+                assertBool ("message does not name zstd-dict: " <> msg) ("zstd-dict" `L.isInfixOf` msg)
+            _ -> assertFailure $ "parsed: " <> show v
+
+    forM_ [minBound .. maxBound] $ \c -> do
+        let cfg = def { _configPayloadCompression = c }
+        (_configPayloadCompression <$> eitherDecode (encode cfg)) @?= Right c

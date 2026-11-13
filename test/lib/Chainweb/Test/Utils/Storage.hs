@@ -10,6 +10,8 @@
 -- @CHAINWEB_TEST_STORAGE@, a comma separated list of:
 --
 -- * @no-merkle-trees@: payload stores do not write the Merkle trees.
+-- * @zstd-dict@: RocksDB instances are opened with the tuning of
+--   @--payload-compression zstd-dict@.
 --
 -- Unset or empty, the tests use the defaults of chainweb-node 3.2.1. An
 -- unknown item is an error, so that a typo does not silently test the
@@ -19,6 +21,7 @@ module Chainweb.Test.Utils.Storage
 ( TestStorageOption(..)
 , testStorageOptions
 , testPayloadDbConfig
+, testStorageTuning
 ) where
 
 import qualified Data.Text as T
@@ -27,13 +30,16 @@ import System.Environment (lookupEnv)
 
 -- internal modules
 
+import Chainweb.Chainweb.Configuration (PayloadCompression(..), payloadCompressionTuning)
 import Chainweb.Payload.PayloadStore
+import Chainweb.Storage.Table.RocksDB.Tuning (RocksDbTuning)
 
 -- -------------------------------------------------------------------------- --
 -- Test Storage Options
 
 data TestStorageOption
     = TestNoMerkleTrees
+    | TestZstdDict
     deriving (Show, Eq)
 
 testStorageOptions :: IO [TestStorageOption]
@@ -45,8 +51,9 @@ testStorageOptions = lookupEnv "CHAINWEB_TEST_STORAGE" >>= \case
   where
     parseItem = \case
         "no-merkle-trees" -> return TestNoMerkleTrees
+        "zstd-dict" -> return TestZstdDict
         x -> ioError $ userError $ "CHAINWEB_TEST_STORAGE: unknown item "
-            <> show x <> "; known items: no-merkle-trees"
+            <> show x <> "; known items: no-merkle-trees, zstd-dict"
 
 -- | The payload store configuration for the tests.
 --
@@ -58,3 +65,14 @@ testPayloadDbConfig = do
             then DoNotStoreMerkleTrees
             else StoreMerkleTrees
         }
+
+-- | The RocksDB tuning for the tests, to be applied before a database is
+-- opened: that of @--payload-compression zstd-dict@ with @zstd-dict@,
+-- otherwise that of the default @snappy@, which changes no option.
+--
+testStorageTuning :: IO RocksDbTuning
+testStorageTuning = do
+    opts <- testStorageOptions
+    return $ payloadCompressionTuning $ if TestZstdDict `elem` opts
+        then PayloadZstdDict
+        else PayloadSnappy
