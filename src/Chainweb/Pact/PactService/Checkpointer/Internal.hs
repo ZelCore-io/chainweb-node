@@ -87,6 +87,7 @@ import qualified Chainweb.Pact5.Backend.ChainwebPactDb as Pact5
 import Chainweb.Pact.Backend.DbCache
 import Chainweb.Pact.Backend.Utils
 import Chainweb.Pact.Backend.Types
+import Chainweb.Pact.Backend.Store.SQLite (sqlitePactStore)
 import Chainweb.Pact.Types
 import Chainweb.Utils
 import Chainweb.Utils.Serialization
@@ -136,6 +137,7 @@ initCheckpointerResources dbCacheLimit sql p loggr v cid = do
         , cpCwVersion = v
         , cpChainId = cid
         , cpSql = sql
+        , cpStore = sqlitePactStore sql
         , cpIntraBlockPersistence = p
         , cpModuleCacheVar = moduleCacheVar
         }

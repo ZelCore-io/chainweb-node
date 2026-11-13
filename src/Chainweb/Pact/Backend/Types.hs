@@ -55,10 +55,10 @@ import Data.Map (Map)
 import Data.HashSet (HashSet)
 import Data.HashMap.Strict (HashMap)
 import Data.List.NonEmpty (NonEmpty)
-import Control.DeepSeq (NFData)
 import GHC.Generics
 
 import qualified Chainweb.Pact.Backend.InMemDb as InMemDb
+import Chainweb.Pact.Backend.Store.Types (PactStore, Historical(..), _Historical, _NoHistory)
 
 import qualified Pact.Types.Persistence as Pact4
 import qualified Pact.Types.Names as Pact4
@@ -74,6 +74,7 @@ data Checkpointer logger
     , cpCwVersion :: ChainwebVersion
     , cpChainId :: ChainId
     , cpSql :: SQLiteEnv
+    , cpStore :: PactStore
     , cpIntraBlockPersistence :: IntraBlockPersistence
     , cpModuleCacheVar :: MVar (DbCache Pact4.PersistModuleData)
     }
@@ -160,15 +161,5 @@ emptyPact4BlockHandle txid = BlockHandle txid (emptySQLitePendingData mempty)
 
 emptyPact5BlockHandle :: Pact4.TxId -> BlockHandle Pact5
 emptyPact5BlockHandle txid = BlockHandle txid (emptySQLitePendingData InMemDb.empty)
-
--- | The result of a historical lookup which might fail to even find the
--- header the history is being queried for.
-data Historical a
-    = Historical a
-    | NoHistory
-    deriving stock (Eq, Foldable, Functor, Generic, Traversable, Show)
-    deriving anyclass NFData
-
-makePrisms ''Historical
 
 type family PactDbFor logger (pv :: PactVersion)
