@@ -71,6 +71,7 @@ import qualified Chainweb.Test.Pact4.SPV (tests)
 import qualified Chainweb.Test.Pact4.SQLite (tests)
 import qualified Chainweb.Test.Pact4.TTL (tests)
 import qualified Chainweb.Test.Pact4.TransactionTests (tests)
+import qualified Chainweb.Test.Pact.Store.Characterization (tests)
 import qualified Chainweb.Test.Pact4.VerifierPluginTest (tests)
 import qualified Chainweb.Test.Pact5.CheckpointerTest
 import qualified Chainweb.Test.Pact5.HyperlanePluginTests
@@ -126,6 +127,7 @@ pactTestSuite rdb = testGroup "Chainweb-Pact Tests"
     [ Chainweb.Test.Pact4.PactExec.tests -- OK: but need fixes (old broken tests)
     , Chainweb.Test.Pact4.DbCacheTest.tests
     , Chainweb.Test.Pact4.Checkpointer.tests
+    , Chainweb.Test.Pact.Store.Characterization.tests
 
     , Chainweb.Test.Pact4.PactMultiChainTest.tests rdb -- BROKEN few tests
 

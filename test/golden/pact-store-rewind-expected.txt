@@ -1,0 +1,142 @@
+== before rewindTo parent height 1
+  == schema
+    index | SYS:KeySets_ix | SYS:KeySets
+    index | SYS:ModuleSources_ix | SYS:ModuleSources
+    index | SYS:Modules_ix | SYS:Modules
+    index | SYS:Namespaces_ix | SYS:Namespaces
+    index | SYS:Pacts_ix | SYS:Pacts
+    index | sqlite_autoindex_BlockHistory_1 | BlockHistory
+    index | sqlite_autoindex_SYS:KeySets_1 | SYS:KeySets
+    index | sqlite_autoindex_SYS:ModuleSources_1 | SYS:ModuleSources
+    index | sqlite_autoindex_SYS:Modules_1 | SYS:Modules
+    index | sqlite_autoindex_SYS:Namespaces_1 | SYS:Namespaces
+    index | sqlite_autoindex_SYS:Pacts_1 | SYS:Pacts
+    index | sqlite_autoindex_TransactionIndex_1 | TransactionIndex
+    index | sqlite_autoindex_VersionedTableCreation_1 | VersionedTableCreation
+    index | sqlite_autoindex_VersionedTableMutation_1 | VersionedTableMutation
+    index | sqlite_autoindex_t1_1 | t1
+    index | sqlite_autoindex_t2_1 | t2
+    index | t1_ix | t1
+    index | t2_ix | t2
+    index | transactionIndexByBH | TransactionIndex
+    table | BlockHistory | BlockHistory
+    table | SYS:KeySets | SYS:KeySets
+    table | SYS:ModuleSources | SYS:ModuleSources
+    table | SYS:Modules | SYS:Modules
+    table | SYS:Namespaces | SYS:Namespaces
+    table | SYS:Pacts | SYS:Pacts
+    table | TransactionIndex | TransactionIndex
+    table | VersionedTableCreation | VersionedTableCreation
+    table | VersionedTableMutation | VersionedTableMutation
+    table | t1 | t1
+    table | t2 | t2
+  == table BlockHistory (rowid, blockheight, hash, endingtxid)
+    1 | 0 | X'1010101010101010101010101010101010101010101010101010101010101010' | 1
+    2 | 1 | X'1111111111111111111111111111111111111111111111111111111111111111' | 4
+    3 | 2 | X'1212121212121212121212121212121212121212121212121212121212121212' | 7
+    4 | 3 | X'1313131313131313131313131313131313131313131313131313131313131313' | 9
+    5 | 4 | X'1414141414141414141414141414141414141414141414141414141414141414' | 10
+    6 | 5 | X'1515151515151515151515151515151515151515151515151515151515151515' | 12
+    7 | 6 | X'1616161616161616161616161616161616161616161616161616161616161616' | 13
+  == table SYS:KeySets (rowid, rowkey, txid, rowdata)
+  == table SYS:ModuleSources (rowid, rowkey, txid, rowdata)
+  == table SYS:Modules (rowid, rowkey, txid, rowdata)
+  == table SYS:Namespaces (rowid, rowkey, txid, rowdata)
+  == table SYS:Pacts (rowid, rowkey, txid, rowdata)
+  == table TransactionIndex (rowid, txhash, blockheight)
+    1 | X'74782D302D30' | 0
+    2 | X'74782D312D30' | 1
+    3 | X'74782D312D31' | 1
+    4 | X'74782D312D32' | 1
+    5 | X'74782D322D32' | 2
+    6 | X'74782D322D31' | 2
+    7 | X'74782D322D30' | 2
+    8 | X'74782D332D31' | 3
+    9 | X'74782D332D30' | 3
+    10 | X'74782D342D30' | 4
+    11 | X'74782D352D31' | 5
+    12 | X'74782D352D30' | 5
+    13 | X'74782D362D30' | 6
+  == table VersionedTableCreation (rowid, tablename, createBlockheight)
+    1 | 't1' | 0
+    2 | 't2' | 2
+  == table VersionedTableMutation (rowid, tablename, blockheight)
+    1 | 't1' | 0
+    2 | 't1' | 1
+    3 | 't2' | 2
+    4 | 't1' | 2
+    5 | 't2' | 3
+    6 | 't1' | 3
+    7 | 't1' | 4
+    8 | 't2' | 5
+    9 | 't1' | 6
+  == table t1 (rowid, rowkey, txid, rowdata)
+    1 | a | 0 | 7B222464223A7B2276223A7B22696E74223A317D7D2C222476223A317D
+    2 | C | 3 | 7B222464223A7B2276223A7B22696E74223A347D7D2C222476223A317D
+    3 | b | 3 | 7B222464223A7B2276223A7B22696E74223A357D7D2C222476223A317D
+    4 | b | 2 | 7B222464223A7B2276223A7B22696E74223A337D7D2C222476223A317D
+    5 | b | 1 | 7B222464223A7B2276223A7B22696E74223A327D7D2C222476223A317D
+    6 | a | 6 | 7B222464223A7B2276223A7B22696E74223A387D7D2C222476223A317D
+    7 | zz | 7 | 7B222464223A7B2276223A7B22696E74223A397D7D2C222476223A317D
+    8 | k10 | 8 | 7B222464223A7B2276223A7B22696E74223A31307D7D2C222476223A317D
+    9 | k9 | 9 | 7B222464223A7B2276223A7B22696E74223A31327D7D2C222476223A317D
+    10 | B | 12 | 7B222464223A7B2276223A7B22696E74223A31357D7D2C222476223A317D
+  == table t2 (rowid, rowkey, txid, rowdata)
+    1 | x | 5 | 7B222464223A7B2276223A7B22696E74223A377D7D2C222476223A317D
+    2 | x | 4 | 7B222464223A7B2276223A7B22696E74223A367D7D2C222476223A317D
+    3 | x | 8 | 7B222464223A7B2276223A7B22696E74223A31317D7D2C222476223A317D
+    4 | y | 11 | 7B222464223A7B2276223A7B22696E74223A31347D7D2C222476223A317D
+    5 | y | 10 | 7B222464223A7B2276223A7B22696E74223A31337D7D2C222476223A317D
+== after rewindTo parent height 1
+  == schema
+    index | SYS:KeySets_ix | SYS:KeySets
+    index | SYS:ModuleSources_ix | SYS:ModuleSources
+    index | SYS:Modules_ix | SYS:Modules
+    index | SYS:Namespaces_ix | SYS:Namespaces
+    index | SYS:Pacts_ix | SYS:Pacts
+    index | sqlite_autoindex_BlockHistory_1 | BlockHistory
+    index | sqlite_autoindex_SYS:KeySets_1 | SYS:KeySets
+    index | sqlite_autoindex_SYS:ModuleSources_1 | SYS:ModuleSources
+    index | sqlite_autoindex_SYS:Modules_1 | SYS:Modules
+    index | sqlite_autoindex_SYS:Namespaces_1 | SYS:Namespaces
+    index | sqlite_autoindex_SYS:Pacts_1 | SYS:Pacts
+    index | sqlite_autoindex_TransactionIndex_1 | TransactionIndex
+    index | sqlite_autoindex_VersionedTableCreation_1 | VersionedTableCreation
+    index | sqlite_autoindex_VersionedTableMutation_1 | VersionedTableMutation
+    index | sqlite_autoindex_t1_1 | t1
+    index | t1_ix | t1
+    index | transactionIndexByBH | TransactionIndex
+    table | BlockHistory | BlockHistory
+    table | SYS:KeySets | SYS:KeySets
+    table | SYS:ModuleSources | SYS:ModuleSources
+    table | SYS:Modules | SYS:Modules
+    table | SYS:Namespaces | SYS:Namespaces
+    table | SYS:Pacts | SYS:Pacts
+    table | TransactionIndex | TransactionIndex
+    table | VersionedTableCreation | VersionedTableCreation
+    table | VersionedTableMutation | VersionedTableMutation
+    table | t1 | t1
+  == table BlockHistory (rowid, blockheight, hash, endingtxid)
+    1 | 0 | X'1010101010101010101010101010101010101010101010101010101010101010' | 1
+    2 | 1 | X'1111111111111111111111111111111111111111111111111111111111111111' | 4
+  == table SYS:KeySets (rowid, rowkey, txid, rowdata)
+  == table SYS:ModuleSources (rowid, rowkey, txid, rowdata)
+  == table SYS:Modules (rowid, rowkey, txid, rowdata)
+  == table SYS:Namespaces (rowid, rowkey, txid, rowdata)
+  == table SYS:Pacts (rowid, rowkey, txid, rowdata)
+  == table TransactionIndex (rowid, txhash, blockheight)
+    1 | X'74782D302D30' | 0
+    2 | X'74782D312D30' | 1
+    3 | X'74782D312D31' | 1
+    4 | X'74782D312D32' | 1
+  == table VersionedTableCreation (rowid, tablename, createBlockheight)
+    1 | 't1' | 0
+  == table VersionedTableMutation (rowid, tablename, blockheight)
+    1 | 't1' | 0
+    2 | 't1' | 1
+  == table t1 (rowid, rowkey, txid, rowdata)
+    1 | a | 0 | 7B222464223A7B2276223A7B22696E74223A317D7D2C222476223A317D
+    2 | C | 3 | 7B222464223A7B2276223A7B22696E74223A347D7D2C222476223A317D
+    3 | b | 3 | 7B222464223A7B2276223A7B22696E74223A357D7D2C222476223A317D
+    4 | b | 2 | 7B222464223A7B2276223A7B22696E74223A337D7D2C222476223A317D
+    5 | b | 1 | 7B222464223A7B2276223A7B22696E74223A327D7D2C222476223A317D

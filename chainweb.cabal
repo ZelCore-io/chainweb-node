@@ -642,6 +642,7 @@ test-suite chainweb-tests
         Chainweb.Test.MinerReward
         Chainweb.Test.Mining
         Chainweb.Test.Misc
+        Chainweb.Test.Pact.Store.Characterization
         Chainweb.Test.Pact4.Checkpointer
         Chainweb.Test.Pact4.DbCacheTest
         Chainweb.Test.Pact4.GrandHash
