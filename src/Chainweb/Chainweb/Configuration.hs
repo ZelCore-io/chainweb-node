@@ -462,10 +462,10 @@ data ChainwebConfiguration = ChainwebConfiguration
     , _configAllowReadsInLocal :: !Bool
     , _configFullHistoricPactState :: !Bool
     , _configStoreMerkleTrees :: !Bool
-    , _configPayloadCompression :: !PayloadCompression
-        -- ^ compression of the RocksDB instance; it applies to new files only
         -- ^ write the Merkle trees of block payloads. Nothing reads them: SPV
         -- proofs rebuild the trees from the payloads.
+    , _configPayloadCompression :: !PayloadCompression
+        -- ^ compression of the RocksDB instance; it applies to new files only
     , _configBackup :: !BackupConfig
     , _configServiceApi :: !ServiceApiConfig
     , _configReadOnlyReplay :: !Bool
