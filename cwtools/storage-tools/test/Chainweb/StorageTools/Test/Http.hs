@@ -12,6 +12,7 @@ module Chainweb.StorageTools.Test.Http
 
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async
+import Control.Exception (finally)
 import Control.Monad
 
 import GHC.Clock (getMonotonicTime)
@@ -58,4 +59,26 @@ tests = testGroup "Limiter"
             removeFile pauseFile
             r1 <- timeout 1_000_000 (wait a)
             assertEqual "permit within 1 s of removing the pause file" (Just ()) r1
+
+    , testCase "a pause file that appears while permits flow stops them within 1 s; they resume within 1 s of removal" $
+        withSystemTempDirectory "limiter-pause" $ \dir -> do
+            let pauseFile = dir </> "PAUSE"
+            lim <- newLimiter 200 (Just pauseFile)
+            worker <- async $ forever $ throttled lim (return ())
+            flip finally (cancel worker) $ do
+                threadDelay 300_000
+                n0 <- limiterPermits lim
+                assertBool ("permits flow without the pause file, got " <> show n0) (n0 >= 20)
+
+                writeFile pauseFile "pause"
+                threadDelay 1_000_000
+                n1 <- limiterPermits lim
+                threadDelay 500_000
+                n2 <- limiterPermits lim
+                assertEqual "no permit more than 1 s after the pause file appeared" n1 n2
+
+                removeFile pauseFile
+                threadDelay 1_000_000
+                n3 <- limiterPermits lim
+                assertBool ("permits resume within 1 s of removing the pause file, " <> show (n2, n3)) (n3 > n2)
     ]

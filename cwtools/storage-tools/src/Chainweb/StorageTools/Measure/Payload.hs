@@ -109,10 +109,12 @@ measuredNamespaces = payloadNamespaces <> legacyPayloadNamespaces <> metadataNam
 -- reports the logical size of the namespace and the size of the SST files
 -- after a flush and after 'compactAllForced'.
 --
--- The source is opened read-only. Data that is only in the write ahead log of
--- the source may not be seen by this, so flush a database that was just written
--- ('flushRocksDb'). The copies are written below @workPath@ one at a time and
--- are removed after they were measured.
+-- The source is opened read-only. RocksDB's read-only open replays the write
+-- ahead log of the source into memtables, so data that is not flushed yet is
+-- seen. Flushing a database that was just written ('flushRocksDb') is still
+-- good practice: the source then has all its data in SST files. The copies are
+-- written below @workPath@ one at a time and are removed after they were
+-- measured.
 --
 measurePayloadSizes :: FilePath -> FilePath -> IO PayloadSizes
 measurePayloadSizes dbPath workPath = do

@@ -153,8 +153,9 @@ withService (Service url v rate pause) act = do
     api <- newServiceApi url v lim
     act api
 
--- | Writes the new data to disk, so that readers that skip the write ahead
--- log see it.
+-- | Writes the new data to SST files before the database is closed. A reader
+-- that opens the database read-only replays the write ahead log anyway; the
+-- flush leaves a database that needs no replay.
 --
 writing :: FilePath -> (RocksDb -> IO RangeSummary) -> IO ()
 writing path act = withRocksDb path modernDefaultOptions $ \db -> do
