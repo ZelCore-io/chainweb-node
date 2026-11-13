@@ -18,7 +18,7 @@ module Chainweb.StorageTools.Test.InProcess
 ) where
 
 import Control.Concurrent (threadDelay)
-import Control.Concurrent.Async (async, cancel)
+import Control.Concurrent.Async (async, cancel, poll, wait)
 import Control.Exception (bracket, throwIO)
 import Control.Lens (view)
 import Control.Monad
@@ -27,7 +27,8 @@ import Control.Monad.Trans.Resource (ResourceT, allocate, runResourceT)
 
 import Data.Aeson
 import qualified Data.Aeson.Key as K
-import Data.Aeson.Types (parseMaybe)
+import qualified Data.Aeson.KeyMap as KM
+import Data.Aeson.Types (Parser, parseMaybe)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.HashMap.Strict as HM
@@ -35,9 +36,11 @@ import qualified Data.HashSet as HS
 import Data.Int (Int64)
 import Data.List (sort)
 import qualified Data.Map.Strict as M
+import Data.Maybe (fromMaybe, isNothing)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
 import qualified Data.Vector as V
+import Data.Word (Word64)
 
 import qualified Database.SQLite3 as SQ
 
@@ -82,8 +85,12 @@ import Chainweb.Storage.Table.RocksDB.Tuning (defaultTuning)
 import Chainweb.StorageTools.Compare.InProcess
 import Chainweb.StorageTools.Compare.Report
 import Chainweb.StorageTools.Compare.Rules (answerPin)
-import Chainweb.StorageTools.Compare.Run (runCompare, tipProbe)
+import Chainweb.StorageTools.Compare.PactSet (PactEntry(..), PactSet(..), defaultPactSet)
+import Chainweb.StorageTools.Compare.Requests (GenSkip(..), defaultGenOptions, generateRequestsSkipping, requestsFor)
+import Chainweb.StorageTools.Compare.Run (defaultRunOptions, runCompare, runCompareClasses, tipProbe)
+import Chainweb.StorageTools.Compare.Sample (SampleSpec(..), genesisCoverage, historyMaxHeight, sampleTargets)
 import Chainweb.StorageTools.Compare.Types
+import Chainweb.StorageTools.Http (ServiceApi, limiterPermits, newLimiter, newServiceApi)
 import Chainweb.Sync.WebBlockHeaderStore (newWebBlockHeaderStore, newWebPayloadStore)
 import Chainweb.Test.Cut (testMineWithPayloadHash)
 import Chainweb.Test.Pact5.CmdBuilder
@@ -102,8 +109,9 @@ import Chainweb.WebPactExecutionService
 fxVersion :: ChainwebVersion
 fxVersion = instantCpmTransitionTestVersion pairChainGraph
 
-cid0 :: ChainId
+cid0, cid1 :: ChainId
 cid0 = unsafeChainId 0
+cid1 = unsafeChainId 1
 
 fxChains :: [ChainId]
 fxChains = sort (HS.toList (chainIds fxVersion))
@@ -395,6 +403,8 @@ specFor dir = InProcessSpec
     , _ipVersion = fxVersion
     , _ipPactChains = fxChains
     , _ipTuning = defaultTuning
+    , _ipLocal = defaultLocalSettings
+    , _ipPauseFile = Nothing
     }
 
 -- | POSTs a body to a side and returns the status and the body.
@@ -438,11 +448,258 @@ listing dir = do
         else (\s -> [(e, s)]) <$> getFileSize (dir </> e)
 
 -- -------------------------------------------------------------------------- --
+-- End to end: the request generator against two in-process sides
+
+-- | The @/local@ settings of both sides in the end-to-end tests: reads allowed,
+-- as on the mainnet oracle.
+--
+e2eSettings :: LocalSettings
+e2eSettings = defaultLocalSettings { _lsAllowReadsInLocal = True }
+
+e2eSpec :: FilePath -> InProcessSpec
+e2eSpec dir = (specFor dir) { _ipLocal = e2eSettings }
+
+-- | Two in-process sides on copies of the fixture, the first one the oracle.
+-- @prep@ changes the copy of the test side before it starts, @modTest@ its
+-- spec.
+--
+withSides
+    :: Fixture
+    -> String
+    -> (FilePath -> IO ())
+    -> (InProcessSpec -> InProcessSpec)
+    -> (Side -> Side -> IO a)
+    -> IO a
+withSides fx name prep modTest act = do
+    a <- copyDb fx (name <> "-a")
+    b <- copyDb fx (name <> "-b")
+    prep b
+    withInProcessSide quietLogger (e2eSpec a) $ \sa ->
+        withInProcessSide quietLogger (modTest (e2eSpec b)) $ \sb -> act sa sb
+
+oracleApi :: Side -> IO ServiceApi
+oracleApi s = newServiceApi (_sideBaseUrl s) fxVersion (_sideLimiter s)
+
+-- | The requests 'requestsFor' generates for a target, one per seed.
+--
+generated :: ServiceApi -> [Word64] -> (RequestClass, ChainId, BlockHeight) -> IO [Request]
+generated = generatedWith defaultPactSet
+
+generatedWith :: PactSet -> ServiceApi -> [Word64] -> (RequestClass, ChainId, BlockHeight) -> IO [Request]
+generatedWith pset api seeds target = forM seeds $ \seed -> requestsFor api pset seed target
+
+-- | The History entries whose answers do not depend on the Pact tip of the
+-- side: @txlog@ reads one txid. @txids@ and @keylog@ list every txid from the
+-- given one up to the side's Pact tip, past the target block (3.2.1 bounds
+-- them below only), so two sides with different Pact tips answer them
+-- differently at the same block.
+--
+tipFreePactSet :: PactSet
+tipFreePactSet = PactSet
+    [ e | e <- _pactEntries defaultPactSet, ClsHistory `notElem` _peClasses e || _peName e == "txlog" ]
+
+fullCoverage :: Coverage
+fullCoverage = genesisCoverage fxVersion fxChains (0, finalHeight)
+
+-- | Targets and seeds that give every form of every class: Pact 4 heights
+-- (below 20) and Pact 5 heights, on both chains.
+--
+everyClassTargets :: [((RequestClass, ChainId, BlockHeight), [Word64])]
+everyClassTargets =
+    [ ((ClsPayload, cid0, firstTransferHeight), [1 .. 24])
+    , ((ClsHeader, cid0, localTarget), [1 .. 8])
+    , ((ClsLocal, cid0, 8), [1 .. 12])
+    , ((ClsLocal, cid1, 21), [1 .. 6])
+    , ((ClsHistory, cid0, 8), [1 .. 8])
+    , ((ClsHistory, cid1, 12), [1 .. 4])
+    , ((ClsPoll, cid0, firstTransferHeight), [1 .. 4])
+    , ((ClsSpv, cid0, firstTransferHeight), [1 .. 4])
+    , ((ClsPreflight, cid0, 8), [1 .. 4])
+    , ((ClsPreflight, cid1, 21), [1 .. 2])
+    ]
+
+bodyOf :: Request -> B.ByteString
+bodyOf = fromMaybe "" . _reqBody
+
+-- | The number of request keys a @/poll@ request asks for, and the number its
+-- answer holds.
+--
+pollCounts :: Request -> B.ByteString -> (Maybe Int, Maybe Int)
+pollCounts r answer =
+    ( decodeStrict (bodyOf r) >>= parseMaybe (withObject "poll" $ \o -> length <$> (o .: "requestKeys" :: Parser [Value]))
+    , decodeStrict answer >>= parseMaybe (withObject "answer" (return . KM.size))
+    )
+
+endToEnd :: IO Fixture -> TestTree
+endToEnd getFx = testGroup "EndToEnd"
+    [ testCase "same DB on both sides: every class Same (History on the Pact 4 range), report Pass" $ do
+        fx <- getFx
+        withSides fx "e2e-same" (\_ -> return ()) id $ \sa sb -> do
+            api <- oracleApi sa
+            reqs <- concat <$> mapM (\(t, seeds) -> generated api seeds t) everyClassTargets
+            let has cls p = any (\r -> _reqClass r == cls && p r) reqs
+                path = _reqPath
+            forM_
+                [ ("payload single without height", has ClsPayload $ \r -> _reqMethod r == "GET" && not ("height=" `T.isInfixOf` path r))
+                , ("payload single with height", has ClsPayload $ \r -> _reqMethod r == "GET" && "?height=" `T.isInfixOf` path r)
+                , ("payload batch by hash", has ClsPayload $ \r -> _reqMethod r == "POST" && "[" `B.isPrefixOf` bodyOf r)
+                , ("payload batch with heights", has ClsPayload $ \r -> _reqMethod r == "POST" && "\"heights\"" `B.isInfixOf` bodyOf r)
+                , ("header by hash", has ClsHeader $ \r -> _reqMethod r == "GET" && "/header/" `T.isInfixOf` path r)
+                , ("header branch", has ClsHeader $ \r -> "/header/branch" `T.isInfixOf` path r)
+                , ("history at a Pact 4 height", has ClsHistory $ \r -> maybe False (< 20) (_reqTarget r))
+                ] $ \(what, ok) -> assertBool what ok
+            rep <- reportExpectClasses allRequestClasses
+                <$> runCompareClasses quietLogger defaultRunOptions (const fullCoverage) sa sb reqs
+            let summary = T.unpack (reportSummary rep)
+            assertEqual ("no difference: " <> summary) 0 (reportDiffCount rep)
+            forM_ allRequestClasses $ \cls ->
+                assertBool ("same 2xx for " <> show cls <> ": " <> summary) (reportSame2xx rep cls > 0)
+            -- History reads real state: no Pact failure (gas, or reads not allowed)
+            assertEqual ("Pact failures in History: " <> summary) 0 (reportPactFailures rep ClsHistory)
+            reportVerdict rep @?= Pass
+            -- /poll: the known keys are answered, the unknown ones are not
+            mgr <- HTTP.newManager HTTP.defaultManagerSettings
+            forM_ [ r | r <- reqs, _reqClass r == ClsPoll ] $ \r -> do
+                (st, answer) <- post mgr sa (_reqPath r) (bodyOf r)
+                st @?= 200
+                case pollCounts r answer of
+                    (Just asked, Just answered) -> do
+                        assertBool "a known key is answered" (answered > 0)
+                        assertBool "an unknown key is not" (answered < asked)
+                    x -> assertFailure ("poll: " <> show x)
+
+    , testCase "one SQLite rowdata byte changed on the test copy: a /local or history request Differs" $ do
+        fx <- getFx
+        let change b = changeBalanceByte (b </> "sqlite" </> chainDbFileName cid0) "sender00"
+        withSides fx "e2e-byte" change id $ \sa sb -> do
+            api <- oracleApi sa
+            reqs <- concat <$> sequence
+                [ generated api [1 .. 8] (ClsPayload, cid0, 8)
+                , generated api [1 .. 8] (ClsHeader, cid0, 8)
+                , generated api [1 .. 12] (ClsLocal, cid0, 8)
+                , generated api [1 .. 12] (ClsHistory, cid0, 8)
+                ]
+            rep <- runCompareClasses quietLogger defaultRunOptions (const fullCoverage) sa sb reqs
+            reportCount rep ClsPayload KindDiffer @?= 0
+            reportCount rep ClsHeader KindDiffer @?= 0
+            assertBool ("a /local or history request Differs: " <> T.unpack (reportSummary rep)) $
+                reportCount rep ClsLocal KindDiffer + reportCount rep ClsHistory KindDiffer > 0
+            reportVerdict rep @?= Fail
+
+    , testCase "/local at rewindDepth 0 answers at the Pact tip when headers extend past it: generated requests are Same at each side's depth" $ do
+        fx <- getFx
+        let behind b = do
+                removePathForcibly (b </> "sqlite")
+                copyTree (_fxSnapshotSqlite fx) (b </> "sqlite")
+        withSides fx "e2e-tip" behind id $ \sa sb -> do
+            mgr <- HTTP.newManager HTTP.defaultManagerSettings
+            cutHeightOf mgr sb cid0 >>= (@?= Just finalHeight)
+            tips <- (,) <$> localTip mgr sa <*> localTip mgr sb
+            case tips of
+                (Just pa, Just pb) -> _pinHeight pb @?= _pinHeight pa - (finalHeight - snapshotHeight)
+                _ -> assertFailure ("no pin: " <> show tips)
+            api <- oracleApi sa
+            reqs <- concat <$> sequence
+                [ generated api [1 .. 6] (ClsLocal, cid0, localTarget)
+                , generatedWith tipFreePactSet api [1 .. 4] (ClsHistory, cid0, 12)
+                , generated api [1 .. 2] (ClsPreflight, cid0, 8)
+                ]
+            rep <- runCompareClasses quietLogger defaultRunOptions (const fullCoverage) sa sb reqs
+            assertEqual ("no difference: " <> T.unpack (reportSummary rep)) 0 (reportDiffCount rep)
+            forM_ [ClsLocal, ClsHistory, ClsPreflight] $ \cls ->
+                assertEqual ("all Same: " <> show cls) (length [ () | r <- reqs, _reqClass r == cls ])
+                    (reportSame2xx rep cls + reportSameNon2xx rep cls)
+            assertBool "a Same 2xx for /local" (reportSame2xx rep ClsLocal > 0)
+            reportVerdict rep @?= Pass
+
+    , testCase "uncovered chain is Skipped NotCovered, never sent to the test side" $ do
+        fx <- getFx
+        withSides fx "e2e-uncovered" (\_ -> return ()) (\s -> s { _ipPactChains = [cid0] }) $ \sa sb0 -> do
+            lim <- newLimiter inProcessRate Nothing
+            let sb = sb0 { _sideLimiter = lim }
+                pactTargets =
+                    [ (ClsLocal, localTarget), (ClsHistory, 8), (ClsPoll, firstTransferHeight)
+                    , (ClsSpv, firstTransferHeight), (ClsPreflight, 8) ]
+            api <- oracleApi sa
+            reqs <- concat <$> sequence
+                ( generated api [1] (ClsPayload, cid1, firstTransferHeight)
+                : [ generated api [1] (cls, cid1, h) | (cls, h) <- pactTargets ]
+                )
+            rep <- runCompareClasses quietLogger defaultRunOptions
+                (classCoverage (Just [cid0]) fullCoverage) sa sb reqs
+            forM_ pactTargets $ \(cls, _) -> do
+                assertEqual ("not covered: " <> show cls) 1 (reportSkippedIn rep cls NotCovered)
+                assertEqual ("not sent: " <> show cls) 0 (reportSent rep cls)
+            reportSame2xx rep ClsPayload @?= 1
+            -- one permit of the test side: the payload request
+            limiterPermits lim >>= (@?= 1)
+            -- the sampler draws the Pact classes on the Pact chains only
+            let targets = sampleTargets SampleSpec
+                    { _ssSeed = 7
+                    , _ssCount = 400
+                    , _ssClasses = allRequestClasses
+                    , _ssCoverage = fullCoverage
+                    , _ssBoundaries = []
+                    , _ssBoundaryShare = 0
+                    , _ssHistoryMax = historyMaxHeight fxVersion
+                    , _ssPactChains = Just [cid0]
+                    }
+            assertBool "no Pact class on chain 1" $
+                null [ () | (cls, c, _) <- targets, isPactClass cls, c == cid1 ]
+            assertBool "headers and payloads on chain 1" $
+                not (null [ () | (cls, c, _) <- targets, not (isPactClass cls), c == cid1 ])
+
+    , testCase "the pause file pauses the in-process side too" $ do
+        fx <- getFx
+        pauseDir <- createTempDirectory (_fxRoot fx) "pause"
+        let pause = pauseDir </> "pause"
+        writeFile pause ""
+        withSides fx "e2e-pause" (\_ -> return ()) (\s -> s { _ipPauseFile = Just pause }) $ \sa sb -> do
+            api <- oracleApi sa
+            reqs <- generated api [1] (ClsHeader, cid0, localTarget)
+            run <- async (runCompare quietLogger coverage sa sb reqs)
+            threadDelay 1_500_000
+            limiterPermits (_sideLimiter sb) >>= (@?= 0)
+            poll run >>= assertBool "still paused" . isNothing
+            removeFile pause
+            rep <- wait run
+            reportVerdict rep @?= Pass
+
+    , testCase "a failed lookup drops the target, counted as generation-skipped; above 1% the run is Void" $ do
+        fx <- getFx
+        withSides fx "e2e-genskip" (\_ -> return ()) id $ \sa sb -> do
+            api <- oracleApi sa
+            let above = (ClsLocal, cid0, finalHeight + 5)
+                targets = [(ClsHeader, cid0, localTarget), above]
+            (reqs, skips) <- generateRequestsSkipping defaultGenOptions api defaultPactSet 1 targets
+            map _reqClass reqs @?= [ClsHeader]
+            map _gsTarget skips @?= [above]
+            rep0 <- runCompareClasses quietLogger defaultRunOptions (const fullCoverage) sa sb reqs
+            let rep = reportSettings (localSettingsText e2eSettings)
+                    $ reportGeneration (length targets) [ c | GenSkip (c, _, _) _ <- skips ] rep0
+            reportGenSkipped rep ClsLocal @?= 1
+            reportVerdict rep @?= Void
+            assertBool "a void reason names it" $
+                any ("skipped at generation" `T.isInfixOf`) (reportVoidReasons rep)
+            -- exactly 1% is not above 1%; 2% is
+            reportVerdict (reportGeneration 100 [ClsLocal] rep0) @?= Pass
+            reportVerdict (reportGeneration 100 [ClsLocal, ClsLocal] rep0) @?= Void
+            -- the report and its JSON carry the count and the settings
+            let j = toJSON rep
+            parseMaybe (withObject "report" $ \o -> o .: "generation" >>= (.: "skipped")) j @?= Just (1 :: Int)
+            parseMaybe (withObject "report" $ \o -> o .: "perClass" >>= (.: "local") >>= (.: "generationSkipped")) j @?= Just (1 :: Int)
+            parseMaybe (withObject "report" $ \o -> o .: "settings" >>= (.: "allowReadsInLocal")) j @?= Just ("true" :: T.Text)
+            assertBool "the summary names the settings" $
+                "allowReadsInLocal=true" `T.isInfixOf` reportSummary rep
+    ]
+
+-- -------------------------------------------------------------------------- --
 -- Tests
 
 tests :: TestTree
 tests = withResource buildFixture removeFixture $ \getFx -> testGroup "InProcess"
-    [ testCase "same DB on both sides: header, payload and /local Same, report Pass" $ do
+    [ endToEnd getFx
+    , testCase "same DB on both sides: header, payload and /local Same, report Pass" $ do
         fx <- getFx
         a <- copyDb fx "same-a"
         b <- copyDb fx "same-b"
