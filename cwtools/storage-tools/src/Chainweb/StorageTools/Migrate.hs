@@ -42,6 +42,13 @@ module Chainweb.StorageTools.Migrate
 , payloadNamespaces
 , stepNamespaces
 
+  -- * Live files
+, LiveFile(..)
+, liveFileRanges
+, liveFilePath
+, namespaceBounds
+, overlapsNamespace
+
   -- * Progress
 , Progress(..)
 , progressFile
@@ -60,6 +67,14 @@ import qualified Data.Set as S
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
 
+import Foreign.C
+import Foreign.Marshal.Alloc (alloca)
+import Foreign.Ptr
+import Foreign.Storable (peek)
+
+import qualified GHC.Foreign as GHC
+import qualified GHC.IO.Encoding as GHC
+
 import System.Clock
 import System.Directory (doesFileExist, renameFile)
 import System.FilePath ((</>), takeDirectory)
@@ -68,6 +83,8 @@ import System.Posix.IO (OpenMode(..), closeFd, defaultFileFlags, openFd)
 import System.Posix.Unistd (fileSynchronise)
 
 -- internal modules
+
+import qualified Database.RocksDB.Internal as R
 
 import Chainweb.Logger
 import Chainweb.Storage.Table.RocksDB
@@ -89,6 +106,88 @@ treeNamespaces = ["TransactionTree","TransactionTree2","OutputTree","OutputTree2
 --
 payloadNamespaces :: [B.ByteString]
 payloadNamespaces = ["BlockPayloadIndex","BlockPayload","BlockPayload2","BlockTransactions","BlockTransactions2","BlockOutputs","BlockOutputs2"]
+
+-- -------------------------------------------------------------------------- --
+-- Live files
+
+-- | A live SST file of a database and the range of the user keys in it.
+--
+data LiveFile = LiveFile
+    { _lfName :: !FilePath
+        -- ^ relative to the database directory and starting with @/@, as
+        -- RocksDB reports it, for instance @/000012.sst@
+    , _lfLevel :: !Int
+    , _lfSmallestKey :: !B.ByteString
+    , _lfLargestKey :: !B.ByteString
+        -- ^ inclusive; the end of a range tombstone counts as a key
+    }
+    deriving (Show, Eq)
+
+-- | The path of a live file in the database directory.
+--
+liveFilePath :: FilePath -> LiveFile -> FilePath
+liveFilePath db f = db </> dropWhile (== '/') (_lfName f)
+
+-- | The live SST files of an open database, with their key ranges.
+--
+liveFileRanges :: RocksDb -> IO [LiveFile]
+liveFileRanges rdb =
+    bracket (c_rocksdb_livefiles dbPtr) c_rocksdb_livefiles_destroy $ \lf -> do
+        n <- c_rocksdb_livefiles_count lf
+        forM [0 .. n - 1] $ \i -> LiveFile
+            <$> (GHC.peekCString GHC.utf8 =<< c_rocksdb_livefiles_name lf i)
+            <*> (fromIntegral <$> c_rocksdb_livefiles_level lf i)
+            <*> key c_rocksdb_livefiles_smallestkey lf i
+            <*> key c_rocksdb_livefiles_largestkey lf i
+  where
+    R.DB dbPtr = _rocksDbHandle rdb
+    -- the key is owned by the live files object, so it is copied
+    key f lf i = alloca $ \sizePtr -> do
+        p <- f lf i sizePtr
+        size <- peek sizePtr
+        B.packCStringLen (p, fromIntegral size)
+
+-- | The raw keys @[lower, upper)@ of a table namespace, for instance
+-- @"TransactionTree"@ or @"BlockHeader/0/header"@. These are the bounds of
+-- 'rawTable' (@newTable@ and its @$@ and @%@ bounds in
+-- "Chainweb.Storage.Table.RocksDB").
+--
+namespaceBounds :: RocksDb -> B.ByteString -> (B.ByteString, B.ByteString)
+namespaceBounds rdb ns = (prefix <> "$", prefix <> "%")
+  where
+    prefix = _rocksDbNamespace rdb <> "-" <> ns
+
+-- | Whether the key range of a live file overlaps the keys of a namespace.
+--
+overlapsNamespace :: RocksDb -> B.ByteString -> LiveFile -> Bool
+overlapsNamespace rdb ns f = _lfSmallestKey f < upper && _lfLargestKey f >= lower
+  where
+    (lower, upper) = namespaceBounds rdb ns
+
+-- Foreign imports of the vendored RocksDB 8.3.2 C API (@c.h@) that
+-- "Chainweb.Storage.Table.RocksDB.Tuning" does not import. The other
+-- @rocksdb_livefiles_*@ calls come from there.
+
+-- | @int rocksdb_livefiles_level(const rocksdb_livefiles_t*, int index);@
+foreign import ccall safe "rocksdb_livefiles_level"
+    c_rocksdb_livefiles_level
+        :: Ptr LiveFiles -> CInt -> IO CInt
+
+-- | @const char* rocksdb_livefiles_smallestkey(const rocksdb_livefiles_t*,
+-- int index, size_t* size);@
+--
+-- The key is owned by the live files object.
+foreign import ccall safe "rocksdb_livefiles_smallestkey"
+    c_rocksdb_livefiles_smallestkey
+        :: Ptr LiveFiles -> CInt -> Ptr CSize -> IO CString
+
+-- | @const char* rocksdb_livefiles_largestkey(const rocksdb_livefiles_t*,
+-- int index, size_t* size);@
+--
+-- The key is owned by the live files object.
+foreign import ccall safe "rocksdb_livefiles_largestkey"
+    c_rocksdb_livefiles_largestkey
+        :: Ptr LiveFiles -> CInt -> Ptr CSize -> IO CString
 
 -- -------------------------------------------------------------------------- --
 -- Steps

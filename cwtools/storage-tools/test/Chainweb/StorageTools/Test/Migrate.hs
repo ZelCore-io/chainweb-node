@@ -9,7 +9,9 @@
 -- databases. The fixture is a range database of the test source (see
 -- "Chainweb.StorageTools.Test.RangeDb") plus entries in the old-layout tables
 -- (@BlockPayload@, @BlockTransactions@, @BlockOutputs@, @TransactionTree@,
--- @OutputTree@), which 'addNewPayload' never writes.
+-- @OutputTree@), which 'addNewPayload' never writes. Each namespace of the
+-- fixture sits in SST files of its own, so the tests see which namespaces a
+-- step rewrote.
 --
 module Chainweb.StorageTools.Test.Migrate
 ( tests
@@ -61,19 +63,57 @@ everyNamespace :: [B.ByteString]
 everyNamespace = treeNamespaces <> otherNamespaces
 
 -- | A closed range database at @<dir>/db@: the range database of the source,
--- with the old-layout entries of every payload, flushed to SST files.
+-- with the old-layout entries of every payload.
+--
+-- Each namespace sits in SST files of its own: the namespaces are written one
+-- after the other, and each is flushed and compacted before the next one is
+-- written. A range compaction of one namespace therefore rewrites the files
+-- of that namespace only, so the tests see which namespaces a step rewrote.
+-- The fixture asserts this.
 --
 withFixture :: (FilePath -> FilePath -> IO a) -> IO a
-withFixture act = withSource $ \src -> withSystemTempDirectory "storage-migrate" $ \dir -> do
+withFixture act = withMixedFixture $ \dir mixed -> do
     let db = dir </> "db"
+    withReadOnlyRocksDb mixed modernDefaultOptions $ \from ->
+        withRocksDb db modernDefaultOptions $ \rdb -> do
+            -- the sentinel key of the open goes to a file of its own
+            flushRocksDb rdb
+            forM_ everyNamespace $ \ns -> do
+                es <- readNamespace from ns
+                updateBatch [RocksDbInsert (rawTable rdb ns) k v | (k, v) <- es]
+                flushRocksDb rdb
+                compactRangeForced (rawTable rdb ns) (Nothing, Nothing)
+    assertNonEmpty db
+    -- no live file holds keys of two namespaces
+    files <- withReadOnlyRocksDb db modernDefaultOptions $ \rdb -> do
+        fs <- liveFileRanges rdb
+        return [(f, filter (\ns -> overlapsNamespace rdb ns f) everyNamespace) | f <- fs]
+    forM_ files $ \(f, nss) ->
+        assertBool ("fixture: " <> show f <> " overlaps " <> show nss) (length nss <= 1)
+    forM_ (treeNamespaces <> payloadNamespaces) $ \ns -> do
+        fs <- filesOverlapping db ns
+        assertBool ("fixture: no file for " <> B8.unpack ns) (not $ null fs)
+    act dir db
+
+-- | A closed range database at @<dir>/mixed@, with the content of the
+-- fixture, flushed once: its SST files hold keys of every namespace.
+--
+withMixedFixture :: (FilePath -> FilePath -> IO a) -> IO a
+withMixedFixture act = withSource $ \src -> withSystemTempDirectory "storage-migrate" $ \dir -> do
+    let db = dir </> "mixed"
     withRocksDb db modernDefaultOptions $ \rdb -> do
         _ <- buildRangeDbWith silent defaultPayloadDbConfig (_srcApi src) (srcCut src) (RangeSpec maxH) rdb
         addOldLayout rdb
         flushRocksDb rdb
-    -- every namespace has entries, so no check below is vacuous
+    assertNonEmpty db
+    act dir db
+
+-- | Every namespace has entries, so no check of a test is vacuous.
+--
+assertNonEmpty :: FilePath -> Assertion
+assertNonEmpty db = do
     sizes <- namespaceSizes db everyNamespace
     forM_ sizes $ \(ns, n) -> assertBool ("fixture: " <> B8.unpack ns <> " is empty") (n > 0)
-    act dir db
 
 -- | Writes each payload of the new-layout tables again in the old layout.
 --
@@ -139,6 +179,55 @@ assertAllZstd msg db = do
         assertBool (msg <> ": dictionary of " <> f <> ": " <> show o)
             ("max_dict_bytes=65536;" `B.isInfixOf` o)
 
+-- | The live SST files whose key ranges overlap a namespace.
+--
+filesOverlapping :: FilePath -> B.ByteString -> IO [LiveFile]
+filesOverlapping db ns = withReadOnlyRocksDb db modernDefaultOptions $ \rdb ->
+    filter (overlapsNamespace rdb ns) <$> liveFileRanges rdb
+
+-- | The compression and the compression options of each live SST file that
+-- overlaps a namespace.
+--
+namespaceSstInfo :: FilePath -> B.ByteString -> IO [(FilePath, (B.ByteString, B.ByteString))]
+namespaceSstInfo db ns = do
+    files <- filesOverlapping db ns
+    info' <- sstCompressionInfo db
+    forM files $ \f -> let p = liveFilePath db f in
+        maybe (assertFailure $ "no SST info for " <> show f) (return . (,) p) $ M.lookup p info'
+
+-- | The compression of each live SST file that overlaps a namespace.
+--
+namespaceCompressions :: FilePath -> B.ByteString -> IO [B.ByteString]
+namespaceCompressions db ns = fmap (fst . snd) <$> namespaceSstInfo db ns
+
+-- | Every live SST file of the namespaces is ZSTD with a dictionary, and each
+-- namespace has files.
+--
+assertNamespacesZstd :: String -> FilePath -> [B.ByteString] -> Assertion
+assertNamespacesZstd msg db nss = forM_ nss $ \ns -> do
+    info' <- namespaceSstInfo db ns
+    assertBool (msg <> ": no SST files for " <> B8.unpack ns) (not $ null info')
+    forM_ info' $ \(f, (c, o)) -> do
+        assertEqual (msg <> ": compression of " <> f <> " (" <> B8.unpack ns <> ")") "ZSTD" c
+        assertBool (msg <> ": dictionary of " <> f <> ": " <> show o)
+            ("max_dict_bytes=65536;" `B.isInfixOf` o)
+
+-- | Every live SST file of the namespaces is Snappy.
+--
+assertNamespacesSnappy :: String -> FilePath -> [B.ByteString] -> Assertion
+assertNamespacesSnappy msg db nss = forM_ nss $ \ns -> do
+    cs <- namespaceCompressions db ns
+    assertBool (msg <> ": no SST files for " <> B8.unpack ns) (not $ null cs)
+    assertEqual (msg <> ": compressions of " <> B8.unpack ns) ("Snappy" <$ cs) cs
+
+-- | No live file overlaps a tree namespace: the space of the trees was
+-- reclaimed, not only their entries hidden by a range tombstone.
+--
+assertTreeFilesGone :: String -> FilePath -> [B.ByteString] -> Assertion
+assertTreeFilesGone msg db nss = forM_ nss $ \ns -> do
+    fs <- filesOverlapping db ns
+    assertEqual (msg <> ": live files that overlap " <> B8.unpack ns) [] fs
+
 keysOf :: MigrateStep -> [B.ByteString] -> S.Set Text
 keysOf step = S.fromList . fmap (progressKey step)
 
@@ -154,20 +243,23 @@ tests = testGroup "Migrate"
             migrateTrees silent db defaultMigrateOpts
             sizes <- namespaceSizes db treeNamespaces
             assertEqual "tree namespaces" [(ns, 0) | ns <- treeNamespaces] sizes
+            assertTreeFilesGone "after trees" db treeNamespaces
             -- the seven payload namespaces, and the headers and cuts as well
             d <- diffDbs pre db otherNamespaces
             assertNoDiff "trees changed another namespace" d
             Progress done <- readProgress db
             assertEqual "progress" (keysOf MigrateTrees treeNamespaces) done
 
-    , testCase "payloads: every SST ZSTD; diffRangeDbs against a pre-migration copy over all seven payload namespaces, old layout included: no differences" $
+    , testCase "payloads: every SST of the seven payload namespaces ZSTD, the others still Snappy; diffRangeDbs against a pre-migration copy over all seven payload namespaces, old layout included: no differences" $
         withFixture $ \dir db -> do
             let pre = dir </> "pre"
             copyDb db pre
             before <- compressions db
             assertBool ("before: Snappy only: " <> show before) (all (== "Snappy") before && not (null before))
             migratePayloads silent db defaultMigrateOpts
-            assertAllZstd "after" db
+            assertNamespacesZstd "after" db payloadNamespaces
+            -- the files of the other namespaces were not rewritten
+            assertNamespacesSnappy "after" db (treeNamespaces <> headerNamespaces testVer <> metadataNamespaces)
             d <- diffDbs pre db payloadNamespaces
             assertNoDiff "payloads changed a payload" d
             assertEqual "the seven payload namespaces are compared" 7 (length $ _dsNamespaces d)
@@ -191,12 +283,21 @@ tests = testGroup "Migrate"
             sizes <- namespaceSizes db treeNamespaces
             assertEqual "the first two tree namespaces are empty" [0, 0] (snd <$> take 2 sizes)
             assertBool "the other two are not" (all ((> 0) . snd) (drop 2 sizes))
+            assertTreeFilesGone "after the stop" db (take 2 treeNamespaces)
             migrateTrees silent db defaultMigrateOpts
 
             migratePayloads silent db stop2
             Progress p2 <- readProgress db
             assertEqual "progress after the second stop"
                 (keysOf MigrateTrees treeNamespaces <> keysOf MigratePayloads (take 2 payloadNamespaces)) p2
+            -- the files of the first two namespaces were rewritten, those of
+            -- the other five were not
+            forM_ (zip [1 :: Int ..] payloadNamespaces) $ \(i, ns) -> do
+                cs <- namespaceCompressions db ns
+                assertBool ("files of " <> B8.unpack ns) (not $ null cs)
+                let expected = if i <= 2 then "ZSTD" else "Snappy"
+                assertEqual ("after the stop, compression of the files of namespace "
+                    <> show i <> ", " <> B8.unpack ns) (expected <$ cs) cs
             migratePayloads silent db defaultMigrateOpts
 
             migrateTrees silent other defaultMigrateOpts
@@ -209,8 +310,8 @@ tests = testGroup "Migrate"
             assertEqual "progress lists all" allKeys done
             Progress done' <- readProgress other
             assertEqual "progress of the uninterrupted run" allKeys done'
-            assertAllZstd "interrupted" db
-            assertAllZstd "uninterrupted" other
+            assertNamespacesZstd "interrupted" db payloadNamespaces
+            assertNamespacesZstd "uninterrupted" other payloadNamespaces
 
     , testCase "rerun after completion changes nothing" $
         withFixture $ \dir db -> do
