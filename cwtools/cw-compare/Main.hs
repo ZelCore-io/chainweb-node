@@ -11,8 +11,8 @@
 -- rate limited per host across all threads; two sides on one host share the
 -- limit. While the pause file exists, no request is made.
 --
--- Exit code: 0 if the run passes, 1 if it fails (or on bad arguments), 2 if it
--- is void and must be rerun.
+-- Exit codes: 0 if the run passes, 2 if it fails (a difference), 3 if it is
+-- void and must be rerun, 1 on bad arguments or a crash.
 --
 module Main (main) where
 
@@ -134,6 +134,7 @@ main = do
     o <- execParser $ info (options <**> helper)
         ( fullDesc
         <> progDesc "Compare the answers of a test node with those of the oracle"
+        <> footer "Exit codes: 0 pass; 2 fail (a difference); 3 void (rerun); 1 bad arguments or a crash."
         )
     reqs <- readRequests (_optRequests o)
     let logger = genericLogger Info (T.hPutStrLn stderr)
@@ -144,7 +145,4 @@ main = do
     rep <- runCompare logger coverage oracle test reqs
     writeReport (_optReport o) rep
     T.putStr (reportSummary rep)
-    case reportVerdict rep of
-        Pass -> exitSuccess
-        Fail -> exitWith (ExitFailure 1)
-        Void -> exitWith (ExitFailure 2)
+    exitWith (gateExitCode (reportVerdict rep))

@@ -30,6 +30,7 @@ import Network.Wai
     (Application, pathInfo, queryString, rawPathInfo, rawQueryString, responseLBS, strictRequestBody)
 import Network.Wai.Handler.Warp (testWithApplication)
 
+import System.Exit (ExitCode(..))
 import System.LogLevel (LogLevel(..))
 
 import Test.Tasty
@@ -102,6 +103,12 @@ localReqAt h = Request ClsLocal cid0 (Just h) methodPost
 
 keysReqAt :: BlockHeight -> Request
 keysReqAt h = (localReqAt h) { _reqBody = Just "{\"code\":\"(keys coin.coin-table)\"}" }
+
+historyReqAt :: BlockHeight -> Request
+historyReqAt h = (localReqAt h)
+    { _reqClass = ClsHistory
+    , _reqBody = Just "{\"code\":\"(txids coin.coin-table 0)\"}"
+    }
 
 localReq, keysReq :: Request
 localReq = localReqAt 100
@@ -289,6 +296,65 @@ reportTests = testGroup "report"
         reportPinned (run 3) @?= 200
     , testCase "a run that compared nothing is void" $
         reportVerdict (addOutcome emptyReport (Outcome 0 uncoveredReq (Skipped NotCovered) Nothing Nothing 0)) @?= Void
+    , testCase "every History request ends Unpinned and every payload request is Same: Void, not Pass" $ do
+        let rep = foldl addOutcome emptyReport $
+                [ Outcome i (historyReqAt 100) (Skipped Unpinned) Nothing Nothing 1 | i <- [0 .. 9] ]
+                <> [ Outcome i payloadReq Same (Just (ok "p")) (Just (ok "p")) 1 | i <- [10 .. 109] ]
+        reportVerdict rep @?= Void
+        assertBool "a reason names the hollow class" $
+            any (\r -> requestClassText ClsHistory `T.isPrefixOf` r && "none compared" `T.isInfixOf` r) (reportVoidReasons rep)
+        assertBool "the summary gives the reason" $ "  void: " `T.isInfixOf` reportSummary rep
+        reportUnpinnedSent rep @?= 10
+        reportSent rep ClsHistory @?= 10
+    , testCase "Unpinned after sending counts toward the 1% threshold; Unpinned before sending does not" $ do
+        let run k attempts = foldl addOutcome emptyReport
+                [ Outcome i localReq (if i < k then Skipped Unpinned else Same) Nothing Nothing (if i < k then attempts else 1)
+                | i <- [0 .. 199]
+                ]
+        reportVerdict (run 2 1) @?= Pass
+        reportVerdict (run 3 1) @?= Void
+        reportVerdict (run 3 0) @?= Pass
+    , testCase "1% split between PinUnstable and Unpinned after sending: Void" $ do
+        let rep = foldl addOutcome emptyReport $
+                [ Outcome 0 localReq (Skipped PinUnstable) Nothing Nothing 6
+                , Outcome 1 localReq (Skipped Unpinned) Nothing Nothing 1
+                , Outcome 2 localReq (Skipped Unpinned) Nothing Nothing 1
+                ]
+                <> [ Outcome i localReq Same Nothing Nothing 1 | i <- [3 .. 199] ]
+        reportVerdict rep @?= Void
+    , testCase "a class whose sent requests were all skipped voids the run, below the 1% threshold too" $ do
+        let rep = foldl addOutcome emptyReport $
+                Outcome 0 (historyReqAt 100) (Skipped PinUnstable) Nothing Nothing 6
+                : [ Outcome i localReq Same Nothing Nothing 1 | i <- [1 .. 200] ]
+        reportVerdict rep @?= Void
+    , testCase "a class with requests in coverage but none compared voids the run, even if none was sent" $ do
+        let rep = foldl addOutcome emptyReport $
+                [ Outcome i (historyReqAt 100) (Skipped Unpinned) Nothing Nothing 0 | i <- [0 .. 4] ]
+                <> [ Outcome i payloadReq Same Nothing Nothing 1 | i <- [5 .. 104] ]
+        reportVerdict rep @?= Void
+    , testCase "NotCovered never voids a run" $ do
+        let rep = foldl addOutcome emptyReport $
+                [ Outcome i (historyReqAt 100) { _reqChain = cid3 } (Skipped NotCovered) Nothing Nothing 0 | i <- [0 .. 49] ]
+                <> [ Outcome i payloadReq Same Nothing Nothing 1 | i <- [50 .. 59] ]
+        reportVerdict rep @?= Pass
+        reportSkippedIn rep ClsHistory NotCovered @?= 50
+        reportSkippedFor rep NotCovered @?= 50
+        reportSent rep ClsHistory @?= 0
+    , testCase "Same is split into 2xx and non-2xx per class, in the summary and the JSON" $ do
+        let rep = foldl addOutcome emptyReport
+                [ Outcome 0 payloadReq Same (Just (ok "p")) (Just (ok "p")) 1
+                , Outcome 1 payloadReq Same (Just notFound) (Just notFound) 1
+                , Outcome 2 payloadReq Same (Just notFound) (Just notFound) 1
+                ]
+        reportSame2xx rep ClsPayload @?= 1
+        reportSameNon2xx rep ClsPayload @?= 2
+        let line = "  " <> requestClassText ClsPayload <> ": 1 / 2 / 0 / 0 / 0 ("
+        assertBool "summary" $ line `T.isInfixOf` reportSummary rep
+        assertBool "json" $ "\"sameNon2xx\":2" `B.isInfixOf` BL.toStrict (encode rep)
+    , testCase "exit codes: 0 Pass, 2 Fail, 3 Void" $ do
+        gateExitCode Pass @?= ExitSuccess
+        gateExitCode Fail @?= ExitFailure 2
+        gateExitCode Void @?= ExitFailure 3
     , testCase "the first 50 differences by request index are kept, bodies cut to 4 KB" $ do
         let big = Answer 200 (B.replicate 10_000 0x61) Nothing
             rep = foldl addOutcome emptyReport
