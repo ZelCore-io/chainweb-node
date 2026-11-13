@@ -328,6 +328,7 @@ library storage-tools
     default-language: Haskell2010
     hs-source-dirs: storage-tools/src
     exposed-modules:
+        Chainweb.StorageTools.Compare.InProcess
         Chainweb.StorageTools.Compare.PactSet
         Chainweb.StorageTools.Compare.Report
         Chainweb.StorageTools.Compare.Requests
@@ -371,6 +372,7 @@ library storage-tools
         , text
         , unordered-containers
         , vector
+        , warp
         , yaml
 
 executable cw-range-db
@@ -459,6 +461,7 @@ test-suite storage-tools-tests
         Chainweb.StorageTools.Test.Cold
         Chainweb.StorageTools.Test.Compare
         Chainweb.StorageTools.Test.Http
+        Chainweb.StorageTools.Test.InProcess
         Chainweb.StorageTools.Test.RangeDb
         Chainweb.StorageTools.Test.Requests
     build-depends:
@@ -483,6 +486,7 @@ test-suite storage-tools-tests
         , loglevel
         , merkle-log
         , pact
+        , pact-tng
         , resourcet
         , rocksdb-haskell-kadena
         , servant-client
