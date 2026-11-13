@@ -11,28 +11,43 @@
 module Chainweb.Test.Pact.Store.SQLite (tests) where
 
 import Control.Exception (ErrorCall(..), SomeException, throwIO, try)
+import Control.Lens (view)
 import Control.Monad
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Char8 as B8
+import qualified Data.ByteString.Short as SB
+import qualified Data.HashMap.Strict as HM
 import Data.List (intersperse, sort)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
+import qualified Data.Vector as V
 import qualified Database.SQLite3.Direct as SQ3
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.Resource (runResourceT)
 import Test.Tasty
 import Test.Tasty.HUnit
 
+import qualified Pact.Interpreter as P4 (PactDbEnv(..))
+import qualified Pact.Types.Runtime as P4
 import qualified Pact.Types.SQLite as P4SQL
 
 import Chainweb.BlockHash
+import Chainweb.BlockHeader.Internal
 import Chainweb.BlockHeight
+import Chainweb.Logger (GenericLogger)
 import Chainweb.Pact.Backend.Store.SQLite
 import Chainweb.Pact.Backend.Store.Types
 import Chainweb.Pact.Backend.Types (SQLiteEnv)
-import Chainweb.Pact.Backend.Utils (chainwebPragmas, withSQLiteConnection, withTempSQLiteConnection)
+import Chainweb.Pact.Backend.Utils
+    ( chainwebPragmas, doLookupSuccessful, getEndTxId, getEndTxId', rewindDbTo
+    , withSQLiteConnection, withTempSQLiteConnection )
+import qualified Chainweb.Pact.PactService.Checkpointer.Internal as Cp
+import qualified Chainweb.Pact4.Backend.ChainwebPactDb as Pact4
+import qualified Chainweb.Test.Pact.Store.Characterization as C
 import Chainweb.Test.Utils (withTempDir)
+import Chainweb.Version (PactVersionT(..))
 import Chainweb.Utils.Serialization (runGetEitherS)
 
 tests :: TestTree
@@ -150,6 +165,85 @@ tests = testGroup "PactStore SQLite"
             copy <- withSQLiteConnection file chainwebPragmas dumpAll
             assertBool "the source has user tables" (length source > 9)
             copy @?= source
+
+    , testGroup "differential: each store field against the 3.2.1 function it replaces"
+        [ testCase "block queries on an empty database" $ withStore $ \sql ps -> do
+            let p = (0, mkHash 1)
+            same "getEarliestBlock" (_psGetEarliestBlock ps) (Cp.getEarliestBlock sql)
+            same "getLatestBlock" (_psGetLatestBlock ps) (Cp.getLatestBlock sql)
+            same "lookupBlock" (_psLookupBlock ps p) (Cp.lookupBlock sql p)
+            same "getBlockParent" (_psGetBlockParent ps C.v4 C.cid p) (Cp.getBlockParent C.v4 C.cid sql p)
+            same "getEndTxId" (_psGetEndTxId ps "msg" Nothing) (getEndTxId "msg" sql Nothing)
+            same "getEndTxId'" (_psGetEndTxId' ps "msg" 0 (mkHash 1)) (getEndTxId' "msg" sql 0 (mkHash 1))
+
+        , testCase "block queries on the characterization script" $ C.withP4 $ \cp sql -> do
+            scriptBlocks cp
+            let ps = sqlitePactStore sql
+                inDb = [ (view blockHeight h, view blockHash h) | h <- take 7 C.p4Headers ]
+                -- unknown hash at a known height, known hash at the wrong
+                -- height, a height above the tip, and the genesis hash
+                notInDb =
+                    [ (3, mkHash 99), (3, view blockHash (C.p4Header 4))
+                    , (7, view blockHash (C.p4Header 7)), (0, mkHash 99) ]
+            same "getEarliestBlock" (_psGetEarliestBlock ps) (Cp.getEarliestBlock sql)
+            same "getLatestBlock" (_psGetLatestBlock ps) (Cp.getLatestBlock sql)
+            forM_ (inDb <> notInDb) $ \p -> do
+                same ("lookupBlock " <> show p) (_psLookupBlock ps p) (Cp.lookupBlock sql p)
+                same ("getBlockParent " <> show p)
+                    (_psGetBlockParent ps C.v4 C.cid p) (Cp.getBlockParent C.v4 C.cid sql p)
+            -- _psGetEndTxId: the tip, every parent, a parent that is not in the db
+            let parents = Nothing : [ Just (ParentHeader h) | h <- take 8 C.p4Headers ]
+                         <> [ Just (ParentHeader ((C.p4Header 3) { _blockHash = mkHash 99 })) ]
+            forM_ parents $ \mp ->
+                same ("getEndTxId " <> show (fmap (view blockHeight . _parentHeader) mp))
+                    (_psGetEndTxId ps "msg" mp) (getEndTxId "msg" sql mp)
+            forM_ (inDb <> notInDb) $ \(h, bh) ->
+                same ("getEndTxId' " <> show (h, bh)) (_psGetEndTxId' ps "msg" h bh) (getEndTxId' "msg" sql h bh)
+            -- the script yields 1, 4, 7, 9, 10, 12, 13
+            _psGetEndTxId' ps "msg" 2 (view blockHash (C.p4Header 2)) >>= (@?= Historical 7)
+
+        , testCase "doLookupSuccessful" $ C.withP4 $ \cp sql -> do
+            scriptBlocks cp
+            let ps = sqlitePactStore sql
+                hashes = V.fromList $ SB.toShort . B8.pack <$>
+                    ["tx-0-0", "tx-1-1", "tx-2-0", "tx-3-1", "tx-6-0", "unknown", ""]
+            forM_ [0, 1, 2, 3, 7, 100] $ \h -> do
+                same ("doLookupSuccessful " <> show h)
+                    (_psDoLookupSuccessful ps h hashes) (doLookupSuccessful sql h hashes)
+            r <- _psDoLookupSuccessful ps 7 hashes
+            assertBool "found some hashes" (HM.size r >= 5)
+
+        , testCase "txIdsAfter equals _txids of the Pact 4 db" $ C.withP4 $ \cp sql -> do
+            scriptBlocks cp
+            let ps = sqlitePactStore sql
+            r <- Cp.readFrom cp (Just (ParentHeader (C.p4Header 6))) Pact4T $ \env _ ->
+                forM [("t1", 0), ("t1", 4), ("t1", 9), ("t1", 100), ("t2", 0), ("t2", 5)] $ \(t, n) -> do
+                    let P4.PactDbEnv pdb mv = Pact4._cpPactDbEnv env
+                    old <- P4._txids pdb (P4.TableName t) (P4.TxId n) mv
+                    new <- _psTxIdsAfter ps t (P4.TxId n)
+                    return (show (t, n), Right old, fmap sort new)
+            case r of
+                NoHistory -> assertFailure "NoHistory"
+                Historical rs -> do
+                    forM_ rs $ \(lbl, old, new) -> assertEqual lbl old new
+                    assertBool "non-trivial" (any (\(_, o, _) -> o /= Right []) rs)
+
+        , testCase "rewindDbTo: same txid or exception, same dump of every table afterwards" $ do
+            let targets = Nothing : [ Just (ParentHeader h) | h <- take 7 C.p4Headers ]
+                    -- a parent that is not in the db
+                    <> [ Just (ParentHeader ((C.p4Header 3) { _blockHash = mkHash 99 })), Just (ParentHeader (C.p4Header 8)) ]
+            forM_ targets $ \mp -> C.withP4 $ \cpA sqlA -> C.withP4 $ \cpB sqlB -> do
+                scriptBlocks cpA
+                scriptBlocks cpB
+                dumpAll sqlA >>= \a -> dumpAll sqlB >>= (@?= a)
+                new <- try @SomeException $ _psRewindDbTo (sqlitePactStore sqlA) mp
+                old <- try @SomeException $ rewindDbTo sqlB mp
+                let lbl = "rewindDbTo " <> show (fmap (view blockHeight . _parentHeader) mp)
+                assertEqual lbl (either show show old) (either show show new)
+                a <- dumpAll sqlA
+                b <- dumpAll sqlB
+                assertEqual (lbl <> ": dumps") b a
+        ]
     ]
 
 -- -------------------------------------------------------------------------- --
@@ -184,6 +278,17 @@ commit
     -> IO ()
 commit ps h newTables rows txs =
     _psCommitBlock ps (blockCommit h newTables rows txs) >>= either (fail . show) return
+
+-- | Run both actions and compare their results.
+same :: (Eq a, Show a) => String -> IO a -> IO a -> Assertion
+same lbl new old = do
+    n <- new
+    o <- old
+    assertEqual lbl o n
+
+-- | The seven blocks of the characterization script.
+scriptBlocks :: Cp.Checkpointer GenericLogger -> IO ()
+scriptBlocks cp = C.extend cp Nothing (zipWith C.p4Block C.p4Headers C.scenario)
 
 -- | Run a query of @n@ columns, all rendered as text.
 query :: SQLiteEnv -> Int -> SQ3.Utf8 -> IO [[Text]]

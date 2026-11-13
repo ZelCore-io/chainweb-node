@@ -247,7 +247,7 @@ rowsAtTxId db tableName txid = runExceptT $ do
 tableExistsAt :: SQLiteEnv -> Text -> BlockHeight -> IO (Either SQ3.Error Bool)
 tableExistsAt db tableName bh = runExceptT $ do
     let tableExistsStmt =
-          -- table names are case-sensitive
+          -- table names are compared case-insensitively: lower(...) on both sides
           "SELECT tablename FROM VersionedTableCreation WHERE createBlockheight < ? AND lower(tablename) = lower(?)"
     qry db tableExistsStmt [Pact4.SInt $ max 0 (fromIntegral bh), Pact4.SText (toUtf8 tableName)] [Pact4.RText] >>= \case
         [] -> return False
