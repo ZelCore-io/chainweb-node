@@ -10,7 +10,7 @@
 --
 module Main (main) where
 
-import Control.Monad (forM_)
+import Control.Monad (forM_, unless, when)
 import Data.Aeson.Types (parseEither)
 
 import Data.Aeson
@@ -21,6 +21,7 @@ import Data.Word
 
 import Options.Applicative
 
+import System.Exit (exitFailure)
 import System.IO (stderr)
 import System.LogLevel (LogLevel(..))
 
@@ -68,7 +69,8 @@ commands = hsubparser $ mconcat
             <*> option tuningReader (long "tuning" <> metavar "TUNING" <> value defaultTuning <> help "default, zstd or cold; default: default")
             <*> option auto (long "samples" <> metavar "N" <> value 1000 <> showDefault)
             <*> option auto (long "seed" <> metavar "SEED" <> value 1 <> showDefault)
-    , cmd "cold" "copy one chain's Pact SQLite file into a cold store (spec 4.3), measure its size and its point reads"
+    , cmdF "cold" "copy one chain's Pact SQLite file into a cold store (spec 4.3), measure its size and its point reads"
+        coldFooter
         $ Cold
             <$> (ColdBuildSpec
                 <$> strOption (long "sqlite" <> metavar "FILE" <> help "the chain's Pact SQLite file; opened read-only")
@@ -79,18 +81,41 @@ commands = hsubparser $ mconcat
             <*> option auto (long "samples" <> metavar "N" <> value 1000 <> showDefault <> help "cold reads, checked against SQLite")
             <*> option auto (long "seed" <> metavar "SEED" <> value 1 <> showDefault)
             <*> optional (strOption (long "json" <> metavar "FILE" <> help "write {sizes, latency} as JSON, the input of project"))
-    , cmd "project" "project the cold-store measurements over all 20 chains: the R or S verdict"
+    , cmdF "project" "project the cold-store measurements over all 20 chains: the R or S verdict"
+        projectFooter
         $ fmap Project $ ProjectArgs
             <$> strOption (long "chain3" <> metavar "FILE" <> help "JSON of cw-measure cold on chain 3")
             <*> strOption (long "chain19" <> metavar "FILE" <> help "JSON of cw-measure cold on chain 19")
             <*> strOption (long "chain0-walk" <> metavar "FILE" <> help "the report's SQLite walk of chain 0 (cw0.json)")
             <*> option auto (long "others-today-bytes" <> metavar "N" <> help "summed size of the SQLite files of the 17 chains other than 0, 3 and 19")
-            <*> optional (option auto (long "chain0-ratio" <> metavar "X" <> help "real-engine ratio for chain 0; default: chain 19's measured ratio"))
+            <*> optional (option auto (long "chain0-ratio" <> metavar "X" <> help "real-engine ratio for chain 0's history tables; default: chain 19's history ratio, the transaction index out of both sides"))
             <*> option auto (long "chain0-hot-bytes" <> metavar "N" <> value specChain0HotBytes <> showDefault <> help "chain 0's anchors and system tables (spec 4.3)")
             <*> optional (strOption (long "json" <> metavar "FILE" <> help "write the projection as JSON"))
     ]
   where
     cmd name desc p = command name (info p (progDesc desc))
+    cmdF name desc foot p = command name (info p (progDesc desc <> footer foot))
+
+    coldFooter = unwords
+        [ "Exits non-zero if any cold read differs from SQLite."
+        , "Memory: Task 17 runs it as cw-measure +RTS -M5g -N4 -RTS cold ..."
+        , "--json writes {\"sizes\": ColdSizes, \"latency\": ColdLatency}."
+        , "ColdSizes: {chain, sqliteFileBytes, totalSst, hotKeptBytes, hotAnchorBytes,"
+        , "keyspaceSst: {I, K, N, R, T, X}, tables: {NAME: {versions, distinctKeys,"
+        , "keyBytes, valueBytes, sstBytes, sqliteBytes}}}."
+        , "ColdLatency: {reads, coldReads, found, mismatches, warmP50Us, warmP99Us,"
+        , "coldP50Us, coldP99Us, coldMaxUs}. Bytes are integers, latencies microseconds."
+        ]
+
+    projectFooter = unwords
+        [ "Chain 0 = history bytes / ratio + transaction-index entries x chain 19's X bytes"
+        , "per entry + hot bytes. Fails if a cold run had a read mismatch."
+        , "--json writes {projection: {chain0GB, chain0TxIndexGB, chain19GB, chain3GB,"
+        , "othersGB, chain3Ratio, pactTotalGB, limitGB, sizeVerdict}, verdict: {size,"
+        , "latencyChain3, latencyChain19, overall}, chain0Ratio, chain0RatioSource,"
+        , "chain0HistoryLogicalBytes, chain0TxIndexEntries, chain19TxIndexBytesPerEntry,"
+        , "wholeStoreRatio: {chain0Ratio, chain0GB, pactTotalGB}}. A verdict is \"R\" or \"S\"."
+        ]
 
 main :: IO ()
 main = do
@@ -106,37 +131,58 @@ main = do
             T.putStr (renderColdLatency latency)
             forM_ json $ \f -> BL.writeFile f $ encode $ object
                 [ "sizes" .= sizes, "latency" .= latency ]
+            -- a mismatch means the cold store or the measurement is wrong
+            when (_clMismatches latency > 0) $ do
+                T.hPutStrLn stderr $ "error: " <> T.pack (show (_clMismatches latency))
+                    <> " cold reads differ from SQLite"
+                exitFailure
         Project pa -> do
             (c3, l3) <- readCold (_paChain3 pa)
             (c19, l19) <- readCold (_paChain19 pa)
-            walk <- either fail return . chain0LogicalFromWalk =<< BL.readFile (_paChain0Walk pa)
+            walk <- either fail return . chain0FromWalk =<< BL.readFile (_paChain0Walk pa)
+            perEntry <- maybe
+                (fail $ _paChain19 pa <> ": no TransactionIndex measurement; run cw-measure cold on all tables")
+                return (txIndexBytesPerEntry c19)
             let (ratio, source) = case _paChain0Ratio pa of
                     Just r -> (r, "given" :: T.Text)
-                    Nothing -> (coldRatio c19, "chain 19 measured")
-                inputs = ProjectionInputs
-                    { _piChain0Logical = walk
-                    , _piChain0Ratio = ratio
+                    Nothing -> (historyRatio c19, "chain 19 history tables, X out of both sides")
+                inputsAt r = ProjectionInputs
+                    { _piChain0Logical = _c0wHistory walk
+                    , _piChain0TxIndexEntries = _c0wTxIndexEntries walk
+                    , _piChain0Ratio = r
                     , _piChain3 = c3
                     , _piChain19 = c19
                     , _piHot = _paChain0Hot pa
                     , _piOthersTodayBytes = _paOthersToday pa
                     }
-                p = projectCold inputs
+                p = projectCold (inputsAt ratio)
+                -- sensitivity: chain 19's whole-store ratio (X in both sides)
+                pWhole = projectCold (inputsAt (coldRatio c19))
+            unless (ratio > 0 && not (isInfinite ratio)) $ fail $ "invalid chain 0 ratio: " <> show ratio
+            v <- either fail return (verdict p l3 l19)
             T.putStrLn $ "chain 0 ratio: " <> T.pack (show ratio) <> " (" <> source <> ")"
+            T.putStrLn $ "chain 0 transaction index: " <> T.pack (show (_c0wTxIndexEntries walk))
+                <> " entries at " <> T.pack (show perEntry) <> " bytes (chain 19's X)"
             T.putStr (renderProjection p)
-            -- spec 11.3: option S if the size or the cold-read latency misses
-            let overall = maximum [_projVerdict p, latencyVerdict l3, latencyVerdict l19]
-            T.putStrLn $ "latency verdict: chain 3 " <> T.pack (show (latencyVerdict l3))
-                <> ", chain 19 " <> T.pack (show (latencyVerdict l19))
-            T.putStrLn $ "overall verdict: " <> T.pack (show overall)
+            T.putStrLn $ "at chain 19's whole-store ratio " <> T.pack (show (coldRatio c19))
+                <> ": chain 0 " <> T.pack (show (_projChain0GB pWhole))
+                <> " GB, Pact state total " <> T.pack (show (_projPactTotalGB pWhole)) <> " GB"
+            T.putStrLn $ "latency verdict: chain 3 " <> T.pack (show (_vLatencyChain3 v))
+                <> ", chain 19 " <> T.pack (show (_vLatencyChain19 v))
+            T.putStrLn $ "overall verdict: " <> T.pack (show (_vOverall v))
             forM_ (_paJson pa) $ \f -> BL.writeFile f $ encode $ object
                 [ "projection" .= p
+                , "verdict" .= v
                 , "chain0Ratio" .= ratio
                 , "chain0RatioSource" .= source
-                , "chain0LogicalBytes" .= sum [ k + v | (k, v) <- foldr (:) [] walk ]
-                , "latencyVerdictChain3" .= latencyVerdict l3
-                , "latencyVerdictChain19" .= latencyVerdict l19
-                , "overallVerdict" .= overall
+                , "chain0HistoryLogicalBytes" .= sum (uncurry (+) <$> _c0wHistory walk)
+                , "chain0TxIndexEntries" .= _c0wTxIndexEntries walk
+                , "chain19TxIndexBytesPerEntry" .= perEntry
+                , "wholeStoreRatio" .= object
+                    [ "chain0Ratio" .= coldRatio c19
+                    , "chain0GB" .= _projChain0GB pWhole
+                    , "pactTotalGB" .= _projPactTotalGB pWhole
+                    ]
                 ]
   where
     readCold f = BL.readFile f >>= \bytes -> case eitherDecode bytes of
