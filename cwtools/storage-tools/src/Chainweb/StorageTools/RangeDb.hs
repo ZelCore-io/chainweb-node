@@ -429,14 +429,15 @@ storePayloads api pdb cid reqs = do
 -- | A description of a range database: the highest cut, and the number of
 -- entries of each header and payload table.
 --
--- Opens the database read-write, for once, which applies a write ahead log
--- that a previous process left. The database must exist.
+-- Opens the database read-only: nothing in the directory changes. A write
+-- ahead log that a previous process left is replayed in memory, so its data
+-- is counted. The database must exist.
 --
 rangeDbInfo :: FilePath -> IO T.Text
 rangeDbInfo path = do
     exists <- doesFileExist (path </> "CURRENT")
     unless exists $ ioError $ userError $ "not a RocksDB database: " <> path
-    withRocksDb path modernDefaultOptions $ \db -> do
+    withReadOnlyRocksDb path modernDefaultOptions $ \db -> do
         cut <- withTableIterator (unCasify $ cutHashesTable db) $ \it ->
             iterLast it >> iterValue it
         cuts <- length <$> readNamespace db "CutHashes"

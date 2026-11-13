@@ -112,7 +112,7 @@ commands = hsubparser $ mconcat
             <*> option (unsafeChainId <$> auto) (long "chain" <> metavar "CHAIN")
             <*> option heightReader (long "from" <> metavar "HEIGHT")
             <*> option heightReader (long "to" <> metavar "HEIGHT" <> help "inclusive")
-    , cmd "info" "highest cut and sizes of a range database (opens it read-write once, which applies its write ahead log)"
+    , cmd "info" "highest cut and sizes of a range database (opens it read-only; a write ahead log is replayed in memory)"
         $ ShowInfo <$> dbOption
     , cmd "diff" "compare two databases (exit code 1 if they differ)"
         $ Diff <$> versionOption

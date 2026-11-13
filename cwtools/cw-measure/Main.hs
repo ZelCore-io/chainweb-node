@@ -30,9 +30,12 @@ import Chainweb.Logger (genericLogger)
 import Chainweb.Storage.Table.RocksDB.Tuning
 import Chainweb.StorageTools.Measure.Cold
 import Chainweb.StorageTools.Measure.Payload
+import Chainweb.Version
+import Chainweb.Version.Mainnet (mainnet)
+import Chainweb.Version.Registry (findKnownVersion)
 
 data Command
-    = PayloadSize FilePath FilePath
+    = PayloadSize ChainwebVersion FilePath FilePath
     | PayloadRead FilePath RocksDbTuning Int Word64
     | Cold ColdBuildSpec Int Word64 (Maybe FilePath)
     | Project ProjectArgs
@@ -50,6 +53,19 @@ data ProjectArgs = ProjectArgs
 chainReader :: ReadM ChainId
 chainReader = eitherReader $ \s -> either (Left . show) Right $ chainIdFromText (T.pack s)
 
+versionOption :: Parser ChainwebVersion
+versionOption = option (eitherReader readVersion)
+    ( long "version"
+    <> metavar "NAME"
+    <> value mainnet
+    <> showDefaultWith (T.unpack . getChainwebVersionName . _versionName)
+    <> help "chainweb version of the database; its chains name the header tables"
+    )
+  where
+    readVersion s = case findKnownVersion (ChainwebVersionName $ T.pack s) of
+        Just v -> Right v
+        Nothing -> Left $ "unknown chainweb version: " <> s
+
 tuningReader :: ReadM RocksDbTuning
 tuningReader = eitherReader $ \s -> case s of
     "default" -> Right defaultTuning
@@ -61,7 +77,8 @@ commands :: Parser Command
 commands = hsubparser $ mconcat
     [ cmd "payload-size" "size of each table on disk, under the default and the zstd tuning"
         $ PayloadSize
-            <$> strOption (long "db" <> metavar "DIR" <> help "the database; flush it before, the write ahead log is not read")
+            <$> versionOption
+            <*> strOption (long "db" <> metavar "DIR" <> help "the database; flush it before, the write ahead log is not read")
             <*> strOption (long "work" <> metavar "DIR" <> help "where the copies are written; removed afterwards")
     , cmd "payload-read" "latency of warm payload reads"
         $ PayloadRead
@@ -121,7 +138,7 @@ main :: IO ()
 main = do
     c <- execParser $ info (commands <**> helper) (fullDesc <> progDesc "Storage measurements")
     case c of
-        PayloadSize db work -> T.putStr . renderPayloadSizes =<< measurePayloadSizes db work
+        PayloadSize v db work -> T.putStr . renderPayloadSizes =<< measurePayloadSizes v db work
         PayloadRead db tuning n seed -> T.putStr . renderLatencies =<< measurePayloadReads db tuning n seed
         Cold spec n seed json -> do
             let logger = genericLogger Info (T.hPutStrLn stderr)
