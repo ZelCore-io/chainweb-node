@@ -1,4 +1,5 @@
 {-# OPTIONS_GHC -Wno-orphans #-}
+{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE OverloadedStrings #-}
 
 -- |
@@ -12,7 +13,10 @@ module Chainweb.Test.Pact.Store.ColdKey
 
 import Control.Exception
 
+import Data.Bits ((.|.), shiftL)
+import qualified Data.Bits as Bits
 import qualified Data.ByteString as B
+import Data.Maybe (isJust)
 import Data.Word
 
 import Test.QuickCheck
@@ -62,6 +66,36 @@ instance Arbitrary KeyPair where
             , (\(Key k) -> k) <$> arbitrary
             ]
         return (KeyPair a b)
+
+-- | Byte strings for the decoders: arbitrary bytes, bytes drawn from the
+-- values that matter to the escape and varint codes, and valid encodings
+-- with and without a change (truncated, extended, or one byte replaced).
+newtype Bytes = Bytes B.ByteString
+    deriving (Show, Eq)
+
+instance Arbitrary Bytes where
+    arbitrary = Bytes <$> oneof
+        [ B.pack <$> arbitrary
+        , B.pack <$> listOf special
+        , valid
+        , valid >>= mutate
+        ]
+      where
+        special = elements [0x00, 0x01, 0x0F, 0x10, 0x52, 0x7F, 0x80, 0x81, 0xFE, 0xFF]
+        valid = oneof
+            [ encodeKeyIdList <$> arbitrary
+            , (\(Key k) (Key r) -> escapeKey k <> r) <$> arbitrary <*> arbitrary
+            , (\(Cid c) t (Key k) x -> rowKey c t k x) <$> arbitrary <*> arbitrary <*> arbitrary <*> arbitrary
+            ]
+        mutate b = oneof
+            [ B.take <$> choose (0, B.length b) <*> pure b
+            , (b <>) . B.pack <$> listOf1 special
+            , if B.null b
+                then pure b
+                else (\i w -> B.take i b <> B.singleton w <> B.drop (i + 1) b)
+                    <$> choose (0, B.length b - 1) <*> special
+            ]
+    shrink (Bytes b) = Bytes . B.pack <$> shrink (B.unpack b)
 
 newtype Cid = Cid ChainId
     deriving (Show, Eq)
@@ -120,14 +154,74 @@ prop_txidKeyOrder (Cid c) t x y = compare (txidKey c t x) (txidKey c t y) === co
 prop_idKeyOrder :: Cid -> TableId -> KeyId -> KeyId -> Property
 prop_idKeyOrder (Cid c) t x y = compare (idKey c t x) (idKey c t y) === compare x y
 
--- | The keyspaces never overlap: the first byte differs.
-prop_keyspacesDisjoint :: Cid -> TableId -> Key -> Word64 -> KeyId -> Property
-prop_keyspacesDisjoint (Cid c) t (Key k) x i =
+-- | Each key starts with the tag byte of its keyspace. The seven tags differ,
+-- so the keyspaces cannot overlap.
+prop_keyTagBytes :: Cid -> TableId -> Key -> Word64 -> KeyId -> Property
+prop_keyTagBytes (Cid c) t (Key k) x i =
     (B.head <$> keys) === ["RTKINMX" `B.index` n | n <- [0 .. 6]]
   where
     keys =
         [ rowKey c t k x, txidKey c t x, keyIdKey c t k, idKey c t i
         , tableIdKey c "tbl", metaKey c, txIndexKey c k ]
+
+-- | 'decodeKeyIdList' as it was before it used an accumulator.
+decodeKeyIdListRecursive :: B.ByteString -> Maybe [KeyId]
+decodeKeyIdListRecursive s = case B.uncons s of
+    Nothing -> Just []
+    Just _ -> do
+        (i, rest) <- varint 0 0 s
+        (KeyId i :) <$> decodeKeyIdListRecursive rest
+  where
+    varint :: Int -> Word64 -> B.ByteString -> Maybe (Word32, B.ByteString)
+    varint !n !acc b = do
+        (x, rest) <- B.uncons b
+        let acc' = acc .|. (fromIntegral (x Bits..&. 0x7F) `shiftL` (7 * n))
+        if x Bits..&. 0x80 /= 0
+            then if n >= 4 then Nothing else varint (n + 1) acc' rest
+            else if (n > 0 && x == 0) || acc' > fromIntegral (maxBound :: Word32)
+                then Nothing
+                else Just (fromIntegral acc', rest)
+
+prop_keyIdListSameAsRecursive :: Bytes -> Property
+prop_keyIdListSameAsRecursive (Bytes b) =
+    decodeKeyIdList b === decodeKeyIdListRecursive b
+
+-- | Every byte string that decodes is the encoding of what it decodes to, so
+-- each list has exactly one accepted encoding.
+prop_keyIdListCanonical :: Bytes -> Property
+prop_keyIdListCanonical (Bytes b) = case decodeKeyIdList b of
+    Nothing -> property True
+    Just ids -> encodeKeyIdList ids === b
+
+-- | An id written with more varint bytes than it needs, but at most five, is
+-- rejected wherever it sits in the list.
+prop_keyIdListRejectsOverlong :: [KeyId] -> [KeyId] -> Property
+prop_keyIdListRejectsOverlong pre post = forAll overlong $ \o ->
+    decodeKeyIdList (encodeKeyIdList pre <> o <> encodeKeyIdList post) === Nothing
+  where
+    overlong = do
+        w <- oneof [choose (0, 0x7F), choose (0, 0x0FFFFFFF)] :: Gen Word32
+        let minimal = encodeKeyIdList [KeyId w]
+        pad <- choose (1, 5 - B.length minimal)
+        -- the last byte gets the continuation bit, then pad - 1 bytes 0x80
+        -- and a final 0x00 add nothing to the value
+        return $ B.init minimal <> B.singleton (B.last minimal .|. 0x80)
+            <> B.replicate (pad - 1) 0x80 <> B.singleton 0x00
+
+-- | 'unescapeKey' never throws, and what it accepts is an escaped key
+-- followed by the rest.
+prop_unescapeFuzz :: Bytes -> Property
+prop_unescapeFuzz (Bytes b) = case unescapeKey b of
+    Nothing -> property True
+    Just (k, rest) -> escapeKey k <> rest === b
+
+-- | 'decodeRowKey' never throws, and what it accepts is a row key.
+prop_decodeRowKeyFuzz :: Bytes -> Property
+prop_decodeRowKeyFuzz (Bytes b) = cover 5 (isJust r) "decodes" $ case r of
+    Nothing -> property True
+    Just (c, t, k, x) -> rowKey (unsafeChainId (fromIntegral c)) t k x === b
+  where
+    r = decodeRowKey b
 
 -- -------------------------------------------------------------------------- --
 -- Vectors
@@ -191,6 +285,13 @@ unit_varintMalformed = do
     decodeKeyIdList "\x80\x80\x80\x80\x10" @?= Nothing
     -- overlong encoding of zero
     decodeKeyIdList "\x80\x00" @?= Nothing
+    decodeKeyIdList "\x80\x80\x80\x80\x00" @?= Nothing
+    -- overlong: 127 in two bytes, 128 in three
+    decodeKeyIdList "\xFF\x00" @?= Nothing
+    decodeKeyIdList "\x80\x81\x00" @?= Nothing
+    -- six bytes: longer than any Word32 varint
+    decodeKeyIdList "\x80\x80\x80\x80\x80\x00" @?= Nothing
+    decodeKeyIdList "\xFF\xFF\xFF\xFF\x8F\x00" @?= Nothing
 
 -- -------------------------------------------------------------------------- --
 -- Tests
@@ -207,7 +308,12 @@ tests = testGroup "Cold key encoding"
     , testProperty "key id list round trip" prop_keyIdListRoundTrip
     , testProperty "txidKey order" prop_txidKeyOrder
     , testProperty "idKey order" prop_idKeyOrder
-    , testProperty "keyspaces are disjoint" prop_keyspacesDisjoint
+    , testProperty "each key starts with its keyspace's tag byte" prop_keyTagBytes
+    , testProperty "decodeKeyIdList equals the recursive decoder" prop_keyIdListSameAsRecursive
+    , testProperty "key id lists: decode then encode gives the input back" prop_keyIdListCanonical
+    , testProperty "key id lists: an overlong varint is rejected" prop_keyIdListRejectsOverlong
+    , testProperty "unescapeKey on arbitrary bytes: no exception; accepted input round-trips" prop_unescapeFuzz
+    , testProperty "decodeRowKey on arbitrary bytes: no exception; accepted input round-trips" prop_decodeRowKeyFuzz
     , testCase "chainByte rejects chain ids above 255" unit_chainByteRange
     , testCase "escape vector" unit_escapeVector
     , testCase "escape empty key" unit_escapeEmpty
