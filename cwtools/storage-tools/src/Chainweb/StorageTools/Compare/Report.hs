@@ -43,6 +43,8 @@ module Chainweb.StorageTools.Compare.Report
 , reportUnpinnedSent
 , reportNoAnswer
 , reportCompared
+, reportPactFailures
+, reportExpectClasses
 , maxDiffSamples
 , maxBodyBytes
 
@@ -57,9 +59,11 @@ module Chainweb.StorageTools.Compare.Report
 , writeReport
 ) where
 
+import Control.Applicative ((<|>))
 import Data.Aeson
 import qualified Data.Aeson.Key as K
 import qualified Data.Aeson.KeyMap as KM
+import Data.Aeson.Types (parseMaybe)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.Map.Strict as M
@@ -172,6 +176,11 @@ data Report = Report
     , _repUnpinnedSent :: !Int
         -- ^ 'Unpinned' requests that were sent (a tip probe or the request)
     , _repNoAnswer :: !(M.Map NoAnswer Int)
+    , _repPactFailures :: !(M.Map RequestClass Int)
+        -- ^ oracle answers 200 with Pact status @failure@, see
+        -- 'reportPactFailures'
+    , _repExpected :: ![RequestClass]
+        -- ^ see 'reportExpectClasses'
     }
 
 -- | The number of differences kept with their bodies.
@@ -185,7 +194,7 @@ maxBodyBytes :: Int
 maxBodyBytes = 4_096
 
 emptyReport :: Report
-emptyReport = Report mempty mempty mempty mempty mempty 0 mempty 0 0 0 mempty
+emptyReport = Report mempty mempty mempty mempty mempty 0 mempty 0 0 0 mempty mempty []
 
 -- | Adds the outcome of a request. The result does not depend on the order
 -- in which outcomes are added.
@@ -207,7 +216,12 @@ addOutcome rep0 o = case v of
         }
   where
     rep = rep0
-        { _repNoAnswer = maybe id (\na -> M.insertWith (+) na 1) (_outNoAnswer o) (_repNoAnswer rep0) }
+        { _repNoAnswer = maybe id (\na -> M.insertWith (+) na 1) (_outNoAnswer o) (_repNoAnswer rep0)
+        , _repPactFailures = if pactFailure then M.insertWith (+) cls 1 (_repPactFailures rep0) else _repPactFailures rep0
+        }
+    pactFailure = isPinnedClass cls && case _outOracle o of
+        Just a -> _ansStatus a == 200 && pactResultStatus (_ansBody a) == Just "failure"
+        Nothing -> False
     v = effectiveVerdict (_outVerdict o)
     idx = _outIndex o
     req = _outRequest o
@@ -327,6 +341,32 @@ reportComparedIn rep c = sum [ reportCount rep c k | k <- [KindSame, KindAllowed
 inScope :: Report -> RequestClass -> Int
 inScope rep c = sum [ reportCount rep c k | k <- [minBound .. maxBound] ] - reportSkippedIn rep c NotCovered
 
+-- | The answers of the oracle with status 200 whose Pact result status is
+-- @failure@, in a class of @/local@ requests ('isPinnedClass': local,
+-- history, preflight). For the reader of the report only: the comparison
+-- stays byte for byte, so two equal failures are 'Same'.
+--
+reportPactFailures :: Report -> RequestClass -> Int
+reportPactFailures rep c = M.findWithDefault 0 c (_repPactFailures rep)
+
+-- | The classes of a run of generated requests (@--classes@). Each of them
+-- must have a request compared, or the run is 'Void', even when it has no
+-- request at all (for example, History on a range above the last Pact 4
+-- height).
+--
+reportExpectClasses :: [RequestClass] -> Report -> Report
+reportExpectClasses cs rep = rep { _repExpected = cs }
+
+-- | The status in @result@ (plain @/local@) or @preflightResult.result@
+-- (preflight) of a Pact answer.
+--
+pactResultStatus :: B.ByteString -> Maybe T.Text
+pactResultStatus b = decodeStrict b >>= parseMaybe (withObject "answer" $ \o ->
+    (o .: "result" >>= status)
+    <|> (o .: "preflightResult" >>= withObject "preflightResult" (\p -> p .: "result" >>= status)))
+  where
+    status = withObject "result" (.: "status")
+
 -- -------------------------------------------------------------------------- --
 -- Gate verdict
 
@@ -356,6 +396,8 @@ reportVerdict rep
 -- * a class has requests within the coverage, but none of them was
 --   compared: a hollow class must not pass ('NotCovered' requests never
 --   count here);
+-- * a class of a generated run ('reportExpectClasses') has no request
+--   compared, even if it has no request at all;
 -- * 'PinUnstable' and 'Unpinned' requests that were sent are together more
 --   than 1% of the pinned requests that were sent;
 -- * 'NoOracleAnswer' requests (no HTTP answer from the oracle, or from
@@ -368,6 +410,12 @@ reportVoidReasons rep = concat
       | c <- allRequestClasses
       , let n = inScope rep c
       , n > 0
+      , reportComparedIn rep c == 0
+      ]
+    , [ requestClassText c <> ": a class of the run (--classes) without a request compared"
+      | c <- allRequestClasses
+      , c `elem` _repExpected rep
+      , inScope rep c == 0
       , reportComparedIn rep c == 0
       ]
     , [ sh pu <> " pin unstable and " <> sh up <> " unpinned after sending of "
@@ -474,6 +522,10 @@ reportSummary rep = T.unlines $
        | c <- allRequestClasses
        , any (\k -> reportCount rep c k > 0) [minBound .. maxBound]
        ]
+    <> [ ""
+       , "pact failure (oracle status 200, Pact result status failure) per class: "
+            <> T.intercalate ", " [ requestClassText c <> " " <> sh (reportPactFailures rep c) | c <- allRequestClasses, isPinnedClass c ]
+       ]
     <> [ "", "allowed per rule:" ]
     <> [ "  " <> allowRuleText r <> ": " <> sh (reportAllowedFor rep r) | r <- [minBound .. maxBound] ]
     <> [ "    #" <> sh (_asIndex a) <> " " <> requestLine (_asRequest a) (_asDepths a) <> ": " <> _asEvidence a
@@ -501,6 +553,7 @@ instance ToJSON Report where
     toJSON rep = object
         [ "verdict" .= show (reportVerdict rep)
         , "voidReasons" .= reportVoidReasons rep
+        , "classesOfRun" .= map requestClassText (_repExpected rep)
         , "compared" .= reportCompared rep
         , "differences" .= _repDiffCount rep
         , "sent" .= reportSentTotal rep
@@ -515,6 +568,7 @@ instance ToJSON Report where
                 <> [ "same2xx" .= reportSame2xx rep c
                    , "sameNon2xx" .= reportSameNon2xx rep c
                    , "sent" .= reportSent rep c
+                   , "pactFailure200" .= reportPactFailures rep c
                    , "skippedPerReason" .= object
                         [ K.fromText (skipReasonText r) .= reportSkippedIn rep c r | r <- [minBound .. maxBound] ]
                    ]

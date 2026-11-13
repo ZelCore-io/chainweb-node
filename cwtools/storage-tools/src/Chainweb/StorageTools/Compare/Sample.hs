@@ -22,6 +22,7 @@ module Chainweb.StorageTools.Compare.Sample
 , boundaryDistance
 , historyMaxHeight
 , sampleTargets
+, genesisCoverage
 ) where
 
 import Control.Lens (at, (^?), _Just)
@@ -38,7 +39,7 @@ import System.Random (StdGen, mkStdGen, uniformR)
 import Chainweb.BlockHeight
 import Chainweb.ChainId
 import Chainweb.StorageTools.Compare.Types
-import Chainweb.Version (ChainwebVersion, Fork(Pact5Fork), ForkHeight(..), chainIds, versionForks)
+import Chainweb.Version (ChainwebVersion, Fork(Pact5Fork), ForkHeight(..), chainIds, genesisBlockHeight, versionForks)
 
 data SampleSpec = SampleSpec
     { _ssSeed :: !Word64
@@ -168,3 +169,15 @@ sampleTargets spec = go (mkStdGen (fromIntegral (_ssSeed spec))) (_ssCount spec)
                 ws = if u < _ssBoundaryShare spec && not (null near) then near else regular
                 ((c, h), g3) = drawFrom ws g2
             in (cls, c, h) : go g3 (k - 1)
+
+-- | The coverage of the given chains over an inclusive height range, each
+-- chain from the greater of the range's low end and its genesis height (on
+-- mainnet, chains 10 to 19 start at 852,054). A chain whose genesis is above
+-- the range has no range, so no height of it is sampled or covered.
+--
+genesisCoverage :: ChainwebVersion -> [ChainId] -> (BlockHeight, BlockHeight) -> Coverage
+genesisCoverage v cs (lo, hi) = Coverage $ M.fromList
+    [ (c, [ (lo', hi) | lo' <= hi ])
+    | c <- cs
+    , let lo' = max lo (genesisBlockHeight v c)
+    ]
