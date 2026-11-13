@@ -381,7 +381,7 @@ commit ps h newTables rows txs =
 
 -- | Pact 5's @commitBlockStateToDatabase@.
 pact5Commit :: SQLiteEnv -> PactStore -> BlockHash -> BlockHeight -> BlockHandle Pact5 -> IO ()
-pact5Commit sql _ = Pact5.commitBlockStateToDatabase sql
+pact5Commit _ ps = Pact5.commitBlockStateToDatabase ps
 
 -- | Run both actions and compare their results.
 same :: (Eq a, Show a) => String -> IO a -> IO a -> Assertion

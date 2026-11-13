@@ -125,14 +125,15 @@ initCheckpointerResources
     -> ChainId
     -> IO (Checkpointer logger)
 initCheckpointerResources dbCacheLimit sql p loggr v cid = do
-    Pact5.initSchema sql
+    let store = sqlitePactStore sql
+    _psInitSchema store
     moduleCacheVar <- newMVar (emptyDbCache dbCacheLimit)
     return Checkpointer
         { cpLogger = loggr
         , cpCwVersion = v
         , cpChainId = cid
         , cpSql = sql
-        , cpStore = sqlitePactStore sql
+        , cpStore = store
         , cpIntraBlockPersistence = p
         , cpModuleCacheVar = moduleCacheVar
         }
@@ -202,7 +203,7 @@ readFrom res maybeParent pactVersion doRead = do
                   view blockHash ph == latestHash
                 _ -> False
               blockHandlerEnv = Pact5.BlockHandlerEnv
-                { Pact5._blockHandlerDb = res.cpSql
+                { Pact5._blockHandlerStore = res.cpStore
                 , Pact5._blockHandlerLogger = res.cpLogger
                 , Pact5._blockHandlerVersion = res.cpCwVersion
                 , Pact5._blockHandlerChainId = res.cpChainId
@@ -338,7 +339,7 @@ restoreAndSave res rewindParent blocks = do
             | pact5 res.cpCwVersion res.cpChainId bh -> do
               let
                 blockEnv = Pact5.BlockHandlerEnv
-                  { Pact5._blockHandlerDb = res.cpSql
+                  { Pact5._blockHandlerStore = res.cpStore
                   , Pact5._blockHandlerLogger = res.cpLogger
                   , Pact5._blockHandlerVersion = res.cpCwVersion
                   , Pact5._blockHandlerBlockHeight = bh
@@ -361,7 +362,7 @@ restoreAndSave res rewindParent blocks = do
                     "doRestoreAndSave: non-genesis block should be one higher than its parent. parent at "
                       <> sshow (view blockHeight ph) <> ", child height " <> sshow (view blockHeight nextBlockHeader)
                 _ -> return ()
-              Pact5.commitBlockStateToDatabase res.cpSql
+              Pact5.commitBlockStateToDatabase res.cpStore
                 (view blockHash nextBlockHeader) (view blockHeight nextBlockHeader)
                 blockHandle
 

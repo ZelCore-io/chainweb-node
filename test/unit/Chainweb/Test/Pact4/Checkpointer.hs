@@ -66,8 +66,8 @@ import Chainweb.Version
 import Chainweb.Test.Orphans.Internal ({- Arbitrary BlockHash -})
 import Chainweb.Pact.Backend.Types
 import Chainweb.Pact.Backend.Store.SQLite (sqlitePactStore)
+import Chainweb.Pact.Backend.Store.Types (PactStore(..))
 import qualified Chainweb.Pact.PactService.Checkpointer.Internal as Checkpointer
-import qualified Chainweb.Pact5.Backend.ChainwebPactDb as Pact5
 
 -- -------------------------------------------------------------------------- --
 -- Tests
@@ -763,10 +763,11 @@ simpleBlockEnvInit
     -> (PactDb (BlockEnv logger) -> BlockEnv logger -> (MVar (BlockEnv logger) -> IO ()) -> IO a)
     -> IO a
 simpleBlockEnvInit logger f = withTempSQLiteConnection chainwebPragmas $ \sqlenv ->
-    f chainwebPactDb (blockEnv sqlenv) (\_ -> Pact5.initSchema sqlenv)
+    let store = sqlitePactStore sqlenv
+    in f chainwebPactDb (blockEnv store) (\_ -> _psInitSchema store)
   where
-    blockEnv sqlenv = BlockEnv
-      (mkBlockHandlerEnv testVer testChainId (BlockHeight 0) (sqlitePactStore sqlenv) DoNotPersistIntraBlockWrites logger)
+    blockEnv s = BlockEnv
+      (mkBlockHandlerEnv testVer testChainId (BlockHeight 0) s DoNotPersistIntraBlockWrites logger)
       (initBlockState defaultModuleCacheLimit (TxId 0))
 
 {- this should be moved to pact -}
