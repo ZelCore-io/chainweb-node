@@ -27,6 +27,7 @@ import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
 import Data.ByteString.Char8 qualified as B8
 import Data.ByteString.Unsafe qualified as BU
+import Data.Char (toLower)
 import Data.List qualified as L
 import Data.Map.Strict qualified as M
 import Data.Maybe (isJust)
@@ -36,7 +37,7 @@ import Foreign.C
 
 import GHC.Stack (HasCallStack, callStack, prettyCallStack)
 
-import System.Directory (doesDirectoryExist)
+import System.Directory (doesDirectoryExist, listDirectory)
 import System.IO.Temp (withSystemTempDirectory)
 import Text.Read (readMaybe)
 
@@ -134,6 +135,42 @@ assertAllCompression dir expected = do
             (c == expected)
     return info
 
+-- | The table properties of every live SST file of the database.
+--
+sstProperties :: FilePath -> IO [M.Map ByteString ByteString]
+sstProperties dir = do
+    files <- M.keys <$> sstCompressionInfo dir
+    assertBool "no live SST files" (not (null files))
+    mapM readSstProperties files
+
+-- | A numeric table property, which RocksDB stores as a varint64.
+--
+numProperty :: HasCallStack => ByteString -> M.Map ByteString ByteString -> IO Word64
+numProperty name props = case M.lookup name props of
+    Nothing -> fail' "missing"
+    Just v -> maybe (fail' ("not a varint: " <> show v)) return (varint 0 0 v)
+  where
+    fail' msg = do
+        assertBool ("property " <> show name <> ": " <> msg) False
+        return 0
+    varint :: Int -> Word64 -> ByteString -> Maybe Word64
+    varint sh acc b = case B.uncons b of
+        Nothing -> Nothing
+        Just (w, rest)
+            | sh > 63 -> Nothing
+            | otherwise ->
+                let acc' = acc .|. (fromIntegral (w .&. 0x7f) `shiftL` sh)
+                in if w .&. 0x80 == 0 then Just acc' else varint (sh + 7) acc' rest
+
+-- | 1000 pseudo-random bytes that zstd cannot compress, so that a data
+-- block's size on disk is close to its uncompressed size.
+--
+noiseFor :: Int -> ByteString
+noiseFor i = B.pack $ take 1000 $ fmap (fromIntegral . (`shiftR` 56)) $
+    drop 1 $ iterate step (fromIntegral i * 0x9E3779B97F4A7C15 + 1 :: Word64)
+  where
+    step x = x * 6364136223846793005 + 1442695040888963407
+
 assertContains :: HasCallStack => String -> ByteString -> ByteString -> IO ()
 assertContains ctx needle hay = assertBool
     (ctx <> ": " <> show needle <> " not in " <> show hay)
@@ -158,6 +195,10 @@ tuningTests = forM_ tests $ \(name, test) -> do
         , ("propertyAndSizeTest", propertyAndSizeTest)
         , ("compactRangeForcedTest", compactRangeForcedTest)
         , ("readOnlyTunedTest", readOnlyTunedTest)
+        , ("bloomFilterReachesSstTest", bloomFilterReachesSstTest)
+        , ("blockSizeReachesSstTest", blockSizeReachesSstTest)
+        , ("blockCacheReachesDbTest", blockCacheReachesDbTest)
+        , ("directReadsReachOptionsTest", directReadsReachOptionsTest)
         ]
 
 -- | Every foreign import of "Chainweb.Storage.Table.RocksDB.Tuning" resolves
@@ -369,3 +410,71 @@ readOnlyTunedTest = withTestDir "tuning-ro" $ \dir -> do
         writeEntries (bytesTable db "t") [10000 .. 10999]
     withReadOnlyRocksDbTuned dir modernDefaultOptions payloadZstdTuning $ \db ->
         checkEntries (bytesTable db "t") [0 .. 10999]
+
+-- | The bloom filter of 'coldStoreTuning' is written into every SST file;
+-- 'payloadZstdTuning' writes no filter.
+--
+bloomFilterReachesSstTest :: IO ()
+bloomFilterReachesSstTest =
+    forM_ [(coldStoreTuning, True), (payloadZstdTuning, False)] $ \(tuning, bloom) ->
+    withTestDir "tuning-bloom" $ \dir -> do
+        withRocksDbTuned dir modernDefaultOptions tuning $ \db -> do
+            writeEntries (bytesTable db "t") [0 .. 9999]
+            flushRocksDb db
+        props <- sstProperties dir
+        forM_ props $ \p -> do
+            let policy = M.findWithDefault "" "rocksdb.filter.policy" p
+            if bloom
+              then assertContains "filter policy" "bloom" (B8.map toLower policy)
+              else assertBool ("unexpected filter policy: " <> show policy) (B.null policy)
+
+-- | The data blocks of an SST file written with 32 KB blocks average about
+-- 32 KB. The values are incompressible, so the on-disk block size is close to
+-- the uncompressed one; RocksDB cuts a block once it reaches the block size
+-- (or comes within 10% of it), so the average sits near the block size. The
+-- binding's default, 4 KB, is far outside the tolerance.
+--
+blockSizeReachesSstTest :: IO ()
+blockSizeReachesSstTest = withTestDir "tuning-blocksize" $ \dir -> do
+    let blockSize = 32768
+        tuning = payloadZstdTuning { _tuningBlockSize = Just blockSize }
+    withRocksDbTuned dir modernDefaultOptions tuning $ \db -> do
+        let t = bytesTable db "t"
+        forM_ (chunksOf 1000 [0 .. 9999]) $ \c ->
+            tableInsertBatch t [ (k, noiseFor k) | k <- c ]
+        flushRocksDb db
+    props <- sstProperties dir
+    dataSize <- sum <$> mapM (numProperty "rocksdb.data.size") props
+    blocks <- sum <$> mapM (numProperty "rocksdb.num.data.blocks") props
+    assertBool ("no data blocks: " <> show (dataSize, blocks)) (blocks > 100)
+    let avg = fromIntegral dataSize / fromIntegral blocks :: Double
+        target = fromIntegral blockSize
+    assertBool ("average data block size " <> show avg <> " for block size " <> show blockSize) $
+        avg >= 0.8 * target && avg <= 1.25 * target
+
+-- | The block cache of the tuning is the one the database uses.
+--
+blockCacheReachesDbTest :: IO ()
+blockCacheReachesDbTest =
+    forM_ [coldStoreTuning, defaultTuning { _tuningBlockCacheBytes = Just 8388608 }] $ \tuning ->
+    withTempRocksDbTuned "tuning-cache" tuning $ \db -> do
+        capacity <- rocksDbProperty db "rocksdb.block-cache-capacity"
+        assertBool ("block cache capacity " <> show capacity <> " for " <> show tuning) $
+            (readMaybe . B8.unpack =<< capacity) == _tuningBlockCacheBytes tuning
+
+-- | @use_direct_reads@ reaches the options that RocksDB persists in the
+-- database directory, and reads work with it.
+--
+directReadsReachOptionsTest :: IO ()
+directReadsReachOptionsTest =
+    forM_ [(True, "use_direct_reads=true"), (False, "use_direct_reads=false")] $ \(direct, expected) ->
+    withTestDir "tuning-direct" $ \dir -> do
+        let tuning = coldStoreTuning { _tuningDirectReads = direct }
+        withRocksDbTuned dir modernDefaultOptions tuning $ \db -> do
+            writeEntries (bytesTable db "t") [0 .. 999]
+            flushRocksDb db
+            checkEntries (bytesTable db "t") [0 .. 999]
+        optionFiles <- L.sort . filter ("OPTIONS-" `L.isPrefixOf`) <$> listDirectory dir
+        assertBool ("no OPTIONS file in " <> dir) (not (null optionFiles))
+        options <- B.readFile (dir <> "/" <> last optionFiles)
+        assertContains (last optionFiles) expected options

@@ -33,6 +33,7 @@ module Chainweb.Storage.Table.RocksDB.Tuning
 
   -- * SST inspection
   , sstCompressionInfo
+  , readSstProperties
 
   -- * Foreign imports
   -- ** Opaque C types
