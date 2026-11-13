@@ -13,7 +13,6 @@
 --
 module Chainweb.Pact.Backend.Store.SQLite
     ( sqlitePactStore
-    , withSavepoint
     ) where
 
 import Control.Exception (SomeAsyncException, evaluate)
@@ -390,7 +389,7 @@ abortSavepoint db name = do
   commitSavepoint db name
 
 -- | Moved from "Chainweb.Pact.Backend.Utils" with the savepoint statements it
--- runs. Used by both @initSchema@s.
+-- runs. Used by 'initSchema'.
 withSavepoint
     :: SQLiteEnv
     -> SavepointName
