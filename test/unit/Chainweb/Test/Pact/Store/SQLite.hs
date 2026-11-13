@@ -29,6 +29,8 @@ import Control.Monad.Trans.Resource (runResourceT)
 import Test.Tasty
 import Test.Tasty.HUnit
 
+import qualified Pact.Core.Names as P5
+import qualified Pact.Core.Persistence as P5
 import qualified Pact.Interpreter as P4 (PactDbEnv(..))
 import qualified Pact.Types.Runtime as P4
 import qualified Pact.Types.SQLite as P4SQL
@@ -37,6 +39,7 @@ import Chainweb.BlockHash
 import Chainweb.BlockHeader.Internal
 import Chainweb.BlockHeight
 import Chainweb.Logger (GenericLogger)
+import Chainweb.Pact.Types (BlockTxHistory(..))
 import Chainweb.Pact.Backend.Store.SQLite
 import Chainweb.Pact.Backend.Store.Types
 import Chainweb.Pact.Backend.Types (SQLiteEnv)
@@ -45,8 +48,6 @@ import Chainweb.Pact.Backend.Utils
 import qualified Chainweb.Pact.PactService.Checkpointer.Internal as Cp
 import qualified Chainweb.Pact4.Backend.ChainwebPactDb as Pact4
 import qualified Chainweb.Test.Pact.Store.Characterization as C
-import Chainweb.Test.Pact.Store.Reference
-    ( doLookupSuccessful, getEndTxId, getEndTxId', rewindDbTo )
 import qualified Chainweb.Test.Pact.Store.Reference as Ref
 import Chainweb.Test.Utils (withTempDir)
 import Chainweb.Version (PactVersionT(..))
@@ -123,10 +124,14 @@ tests = testGroup "PactStore SQLite"
         _psRowsAtTxId ps "t" 7 >>= (@?= Right [("b", "x"), ("a", "y"), ("d", "w")])
         _psRowsAtTxId ps "t" 9 >>= (@?= Right [])
 
-    , testCase "rowsInTxIdRange: from inclusive, to exclusive; readPrev and readHistorical: newest below the bound" $ withStore $ \_ ps -> do
+    , testCase "rowsInTxIdRange: from inclusive, to exclusive; readPrev and readHistorical: newest below the bound" $ withStore $ \sql ps -> do
         commit ps 1 ["t"] [("t", [("a", 1, "a1"), ("a", 2, "a2"), ("b", 3, "b3"), ("a", 4, "a4")])] []
         Right r <- _psRowsInTxIdRange ps "t" 2 4
         sort r @?= [(2, "a", "a2"), (3, "b", "b3")]
+        -- unsorted: the rows in the order 3.2.1's queryHistory statement returns them
+        raw <- P4SQL.qry sql "SELECT txid, rowkey, rowdata FROM [t] WHERE txid >= ? AND txid < ?"
+            [P4SQL.SInt 2, P4SQL.SInt 4] [P4SQL.RInt, P4SQL.RText, P4SQL.RBlob]
+        r @?= [ (fromIntegral i, k, v) | [P4SQL.SInt i, P4SQL.SText (SQ3.Utf8 k), P4SQL.SBlob v] <- raw ]
         _psRowsInTxIdRange ps "t" 5 9 >>= (@?= Right [])
         _psReadPrev ps "t" "a" 4 >>= (@?= Right (Just "a2"))
         _psReadPrev ps "t" "a" 5 >>= (@?= Right (Just "a4"))
@@ -175,8 +180,8 @@ tests = testGroup "PactStore SQLite"
             same "getLatestBlock" (_psGetLatestBlock ps) (Ref.getLatestBlock sql)
             same "lookupBlock" (_psLookupBlock ps p) (Ref.lookupBlock sql p)
             same "getBlockParent" (_psGetBlockParent ps C.v4 C.cid p) (Ref.getBlockParent C.v4 C.cid sql p)
-            same "getEndTxId" (_psGetEndTxId ps "msg" Nothing) (getEndTxId "msg" sql Nothing)
-            same "getEndTxId'" (_psGetEndTxId' ps "msg" 0 (mkHash 1)) (getEndTxId' "msg" sql 0 (mkHash 1))
+            same "getEndTxId" (_psGetEndTxId ps "msg" Nothing) (Ref.getEndTxId "msg" sql Nothing)
+            same "getEndTxId'" (_psGetEndTxId' ps "msg" 0 (mkHash 1)) (Ref.getEndTxId' "msg" sql 0 (mkHash 1))
 
         , testCase "block queries on the characterization script" $ C.withP4 $ \cp sql -> do
             scriptBlocks cp
@@ -198,9 +203,9 @@ tests = testGroup "PactStore SQLite"
                          <> [ Just (ParentHeader ((C.p4Header 3) { _blockHash = mkHash 99 })) ]
             forM_ parents $ \mp ->
                 same ("getEndTxId " <> show (fmap (view blockHeight . _parentHeader) mp))
-                    (_psGetEndTxId ps "msg" mp) (getEndTxId "msg" sql mp)
+                    (_psGetEndTxId ps "msg" mp) (Ref.getEndTxId "msg" sql mp)
             forM_ (inDb <> notInDb) $ \(h, bh) ->
-                same ("getEndTxId' " <> show (h, bh)) (_psGetEndTxId' ps "msg" h bh) (getEndTxId' "msg" sql h bh)
+                same ("getEndTxId' " <> show (h, bh)) (_psGetEndTxId' ps "msg" h bh) (Ref.getEndTxId' "msg" sql h bh)
             -- the script yields 1, 4, 7, 9, 10, 12, 13
             _psGetEndTxId' ps "msg" 2 (view blockHash (C.p4Header 2)) >>= (@?= Historical 7)
 
@@ -211,13 +216,20 @@ tests = testGroup "PactStore SQLite"
                     ["tx-0-0", "tx-1-1", "tx-2-0", "tx-3-1", "tx-6-0", "unknown", ""]
             forM_ [0, 1, 2, 3, 7, 100] $ \h -> do
                 same ("doLookupSuccessful " <> show h)
-                    (_psDoLookupSuccessful ps h hashes) (doLookupSuccessful sql h hashes)
+                    (_psDoLookupSuccessful ps h hashes) (Ref.doLookupSuccessful sql h hashes)
             r <- _psDoLookupSuccessful ps 7 hashes
             assertBool "found some hashes" (HM.size r >= 5)
 
-        , testCase "txIdsAfter equals _txids of the Pact 4 db" $ C.withP4 $ \cp sql -> do
+        , testCase "txIdsAfter equals _txids of the Pact 4 db and 3.2.1's doTxIds statement" $ C.withP4 $ \cp sql -> do
             scriptBlocks cp
             let ps = sqlitePactStore sql
+            -- _txids reaches the store itself since Task 14, so the 3.2.1
+            -- statement, run directly, is the oracle of the unsorted result
+            forM_ [("t1", 0), ("t1", 4), ("t1", 9), ("t2", 0), ("t2", 5)] $ \(t, n) -> do
+                raw <- P4SQL.qry sql ("SELECT DISTINCT txid FROM [" <> SQ3.Utf8 (T.encodeUtf8 t) <> "] WHERE txid > ?")
+                    [P4SQL.SInt n] [P4SQL.RInt]
+                new <- _psTxIdsAfter ps t (P4.TxId (fromIntegral n))
+                assertEqual (show (t, n)) (Right [ P4.TxId (fromIntegral i) | [P4SQL.SInt i] <- raw ]) new
             r <- Cp.readFrom cp (Just (ParentHeader (C.p4Header 6))) Pact4T $ \env _ ->
                 forM [("t1", 0), ("t1", 4), ("t1", 9), ("t1", 100), ("t2", 0), ("t2", 5)] $ \(t, n) -> do
                     let P4.PactDbEnv pdb mv = Pact4._cpPactDbEnv env
@@ -239,12 +251,40 @@ tests = testGroup "PactStore SQLite"
                 scriptBlocks cpB
                 dumpAll sqlA >>= \a -> dumpAll sqlB >>= (@?= a)
                 new <- try @SomeException $ _psRewindDbTo (sqlitePactStore sqlA) mp
-                old <- try @SomeException $ rewindDbTo sqlB mp
+                old <- try @SomeException $ Ref.rewindDbTo sqlB mp
                 let lbl = "rewindDbTo " <> show (fmap (view blockHeight . _parentHeader) mp)
                 assertEqual lbl (either show show old) (either show show new)
                 a <- dumpAll sqlA
                 b <- dumpAll sqlB
                 assertEqual (lbl <> ": dumps") b a
+
+        , testCase "getBlockHistory and lookupHistorical on a Pact 5 script: same results, row order included" $
+            C.withP5 $ \cpA sqlA -> C.withP5 $ \cpB sqlB -> do
+                -- A and B are built by the same script; A is read through the
+                -- store, B through the frozen 3.2.1 functions
+                p5ScriptBlocks cpA
+                p5ScriptBlocks cpB
+                dumpAll sqlA >>= \a -> dumpAll sqlB >>= (@?= a)
+                let ps = sqlitePactStore sqlA
+                    -- blocks 0 to 6 are in the db, block 7 is not
+                    headers = take 8 C.p5Headers
+                    domains = [ P5.DUserTables (C.tn5 t) | t <- ["t1", "t2", "nope"] ]
+                    keys = P5.RowKey <$> ["a", "b", "C", "zz", "k9", "k10", "B", "x", "y", "missing"]
+                    -- BlockTxHistory's Show leaves out the prev map; compare both
+                    hist = fmap (fmap (\bth -> (_blockTxHistory bth, _blockPrevHistory bth)))
+                multi <- fmap concat $ forM headers $ \h -> fmap concat $ forM domains $ \d -> do
+                    let lbl = show (view blockHeight h, P5.renderDomain d)
+                    new <- try @SomeException $ Cp.getBlockHistory ps h d
+                    old <- try @SomeException $ Ref.getBlockHistory sqlB h d
+                    sameOutcome ("getBlockHistory " <> lbl) (hist old) (hist new)
+                    forM_ keys $ \k -> do
+                        newL <- try @SomeException $ Cp.lookupHistorical ps h d k
+                        oldL <- try @SomeException $ Ref.lookupHistorical sqlB h d k
+                        sameOutcome ("lookupHistorical " <> lbl <> " " <> show k) oldL newL
+                    return [ () | Right (Historical bth) <- [new], any ((> 1) . length) (_blockTxHistory bth) ]
+                -- some txid wrote two rows of one table, so the row order shows
+                -- in the per-txid log lists
+                assertBool "a txid with two rows of one table" (not (null multi))
         ]
     ]
 
@@ -288,9 +328,19 @@ same lbl new old = do
     o <- old
     assertEqual lbl o n
 
+-- | Both threw the same text, or both returned equal values.
+sameOutcome :: (Eq a, Show a) => String -> Either SomeException a -> Either SomeException a -> Assertion
+sameOutcome lbl old new = case (old, new) of
+    (Right o, Right n) -> assertEqual lbl o n
+    _ -> assertEqual lbl (either show show old) (either show show new)
+
 -- | The seven blocks of the characterization script.
 scriptBlocks :: Cp.Checkpointer GenericLogger -> IO ()
 scriptBlocks cp = C.extend cp Nothing (zipWith C.p4Block C.p4Headers C.scenario)
+
+-- | The same script in Pact 5 blocks.
+p5ScriptBlocks :: Cp.Checkpointer GenericLogger -> IO ()
+p5ScriptBlocks cp = C.extend cp Nothing (zipWith C.p5Block C.p5Headers C.scenario)
 
 -- | Run a query of @n@ columns, all rendered as text.
 query :: SQLiteEnv -> Int -> SQ3.Utf8 -> IO [[Text]]

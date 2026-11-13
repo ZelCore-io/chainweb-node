@@ -1,6 +1,7 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE TupleSections #-}
 
 -- |
 -- Module: Chainweb.Test.Pact.Store.Reference
@@ -10,11 +11,18 @@
 -- @Chainweb.Pact.Backend.Utils@ at 3.2.1. They are the oracle of the
 -- differential tests in "Chainweb.Test.Pact.Store.SQLite". Do not change them.
 --
+-- The one edit: 3.2.1's @getBlockHistory@ and @lookupHistorical@ called
+-- @PactDb.getEndTxId@ and @PactDb.getEndTxId'@ (that is,
+-- @Chainweb.Pact.Backend.Utils@); here they call the frozen copies of those
+-- two functions further down this module.
+--
 module Chainweb.Test.Pact.Store.Reference
     ( getEarliestBlock
     , getLatestBlock
     , lookupBlock
     , getBlockParent
+    , getBlockHistory
+    , lookupHistorical
     , doLookupSuccessful
     , getEndTxId
     , getEndTxId'
@@ -30,13 +38,19 @@ import qualified Data.ByteString.Short as SB
 import qualified Data.HashMap.Strict as HashMap
 import Data.HashSet (HashSet)
 import qualified Data.HashSet as HashSet
+import Data.Int (Int64)
+import qualified Data.Map.Strict as M
+import Data.Maybe (catMaybes)
+import qualified Data.Set as S
 import Data.Text (Text)
 import qualified Data.Text as T
+import qualified Data.Text.Encoding as T
 import qualified Data.Vector as V
 import Database.SQLite3.Direct (Database, Utf8(..))
 import GHC.Stack (HasCallStack)
 
 import Pact.Types.SQLite
+import Pact.Types.Persistence (RowKey(..), TxId)
 import qualified Pact.Types.Persistence as Pact4
 import qualified Pact.Types.SQLite as Pact4
 
@@ -44,8 +58,13 @@ import Chainweb.BlockHash
 import Chainweb.BlockHeader
 import Chainweb.BlockHeight
 import Chainweb.Pact.Backend.Types (Historical(..), SQLiteEnv)
-import Chainweb.Pact.Backend.Utils (expectSingle, tbl)
-import Chainweb.Pact.Types (PactException(..), internalError)
+import Chainweb.Pact.Backend.Utils (expectSingle, tbl, toUtf8)
+import Chainweb.Pact.Types (BlockTxHistory(..), PactException(..), internalError)
+import qualified Chainweb.Pact5.Backend.ChainwebPactDb as Pact5
+import qualified Pact.Core.Builtin as Pact5
+import qualified Pact.Core.Evaluate as Pact5
+import qualified Pact.Core.Names as Pact5
+import qualified Pact.Core.Persistence as Pact5
 import Chainweb.Utils (T2(..), T3(..), sshow)
 import Chainweb.Utils.Serialization (runGetEitherS, runPutS)
 import Chainweb.Version
@@ -114,6 +133,100 @@ getBlockParent v cid db (bh, hash)
               _ -> error "getBlockParent: output type mismatch"
   where
     qtext = "SELECT hash FROM BlockHistory WHERE blockheight = ?"
+
+-- TODO: do this in ChainwebPactDb instead?
+getBlockHistory
+  :: SQLiteEnv
+  -> BlockHeader
+  -> Pact5.Domain Pact5.RowKey Pact5.RowData Pact5.CoreBuiltin Pact5.Info
+  -> IO (Historical BlockTxHistory)
+getBlockHistory db blockHeader d = do
+  historicalEndTxId <-
+      fmap fromIntegral
+      <$> getEndTxId "getBlockHistory" db (Just $ ParentHeader blockHeader)
+  forM historicalEndTxId $ \endTxId -> do
+    startTxId <-
+      if bHeight == genesisHeight v cid
+      then return 0
+      else getEndTxId' "getBlockHistory" db (pred bHeight) (view blockParent blockHeader) >>= \case
+        NoHistory ->
+          internalError $ "getBlockHistory: missing parent for: " <> sshow blockHeader
+        Historical startTxId ->
+          return $ fromIntegral startTxId
+
+    let tname = Pact5.domainTableName d
+    history <- queryHistory tname startTxId endTxId
+    let (!hkeys,tmap) = foldl' procTxHist (S.empty,mempty) history
+    !prev <- M.fromList . catMaybes <$> mapM (queryPrev tname startTxId) (S.toList hkeys)
+    return $ BlockTxHistory tmap prev
+  where
+    v = _chainwebVersion blockHeader
+    cid = view blockChainId blockHeader
+    bHeight = view blockHeight blockHeader
+
+    procTxHist
+      :: (S.Set Utf8, M.Map TxId [Pact5.TxLog Pact5.RowData])
+      -> (Utf8,TxId,Pact5.TxLog Pact5.RowData)
+      -> (S.Set Utf8,M.Map TxId [Pact5.TxLog Pact5.RowData])
+    procTxHist (ks,r) (uk,t,l) = (S.insert uk ks, M.insertWith (++) t [l] r)
+
+    -- Start index is inclusive, while ending index is not.
+    -- `endingtxid` in a block is the beginning txid of the following block.
+    queryHistory :: Utf8 -> Int64 -> Int64 -> IO [(Utf8,TxId,Pact5.TxLog Pact5.RowData)]
+    queryHistory tableName s e = do
+      let sql = "SELECT txid, rowkey, rowdata FROM [" <> tableName <>
+                "] WHERE txid >= ? AND txid < ?"
+      r <- qry db sql
+            [SInt s,SInt e]
+            [RInt,RText,RBlob]
+      forM r $ \case
+        [SInt txid, SText key, SBlob value] ->
+            (key,fromIntegral txid,)
+            <$> Pact5.toTxLog (_chainwebVersion blockHeader) (_chainId blockHeader) (view blockHeight blockHeader) (Pact5.renderDomain d) key value
+        err -> internalError $
+          "queryHistory: Expected single row with three columns as the \
+          \result, got: " <> T.pack (show err)
+
+    -- Get last tx data, if any, for key before start index.
+    queryPrev :: Utf8 -> Int64 -> Utf8 -> IO (Maybe (RowKey,Pact5.TxLog Pact5.RowData))
+    queryPrev tableName s k@(Utf8 sk) = do
+      let sql = "SELECT rowdata FROM [" <> tableName <>
+                "] WHERE rowkey = ? AND txid < ? " <>
+                "ORDER BY txid DESC LIMIT 1"
+      r <- qry db sql
+        [SText k,SInt s]
+        [RBlob]
+      case r of
+        [] -> return Nothing
+        [[SBlob value]] ->
+            Just . (RowKey $ T.decodeUtf8 sk,)
+            <$> Pact5.toTxLog (_chainwebVersion blockHeader) (_chainId blockHeader) (view blockHeight blockHeader) (Pact5.renderDomain d) k value
+        _ -> internalError $ "queryPrev: expected 0 or 1 rows, got: " <> T.pack (show r)
+
+-- TODO: do this in ChainwebPactDb instead?
+lookupHistorical
+    :: SQLiteEnv
+    -> BlockHeader
+    -> Pact5.Domain Pact5.RowKey Pact5.RowData Pact5.CoreBuiltin Pact5.Info
+    -> Pact5.RowKey
+    -> IO (Historical (Maybe (Pact5.TxLog Pact5.RowData)))
+lookupHistorical db blockHeader d k = do
+  historicalEndTxId <-
+    getEndTxId "lookupHistorical" db (Just $ ParentHeader blockHeader)
+  forM historicalEndTxId (queryHistoryLookup . fromIntegral)
+  where
+    queryHistoryLookup :: Int64 -> IO (Maybe (Pact5.TxLog Pact5.RowData))
+    queryHistoryLookup e = do
+      let sql = "SELECT rowKey, rowdata FROM [" <> Pact5.domainTableName d <>
+                "] WHERE txid < ? AND rowkey = ? ORDER BY txid DESC LIMIT 1;"
+      r <- qry db sql
+        [SInt e, SText (toUtf8 $ Pact5.convRowKey k)]
+        [RText, RBlob]
+      case r of
+        [[SText key, SBlob value]] ->
+            Just <$> Pact5.toTxLog (_chainwebVersion blockHeader) (_chainId blockHeader) (view blockHeight blockHeader) (Pact5.renderDomain d) key value
+        [] -> pure Nothing
+        _ -> internalError $ "lookupHistorical: expected single-row result, got " <> sshow r
 
 -- -------------------------------------------------------------------------- --
 -- Chainweb.Pact.Backend.Utils (3.2.1)

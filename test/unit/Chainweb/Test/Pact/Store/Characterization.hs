@@ -26,9 +26,13 @@ module Chainweb.Test.Pact.Store.Characterization
     , p4Header
     , p4Headers
     , p4Read
+    , p5Block
+    , p5Headers
     , scenario
+    , tn5
     , v4
     , withP4
+    , withP5
     ) where
 
 import Control.Exception (evaluate)

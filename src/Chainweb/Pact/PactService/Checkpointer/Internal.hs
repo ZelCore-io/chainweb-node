@@ -69,7 +69,7 @@ import Pact.Interpreter (PactDbEnv(..))
 import Pact.Types.Command(RequestKey(..))
 import Pact.Types.Hash (Hash(..))
 import Pact.Types.Persistence
-import Pact.Types.SQLite
+import Pact.Types.SQLite (liftEither)
 
 import qualified Pact.Core.Persistence as Pact5
 
