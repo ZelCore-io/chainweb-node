@@ -100,6 +100,32 @@ limiterTests = testGroup "Limiter"
                 threadDelay 1_000_000
                 n3 <- limiterPermits lim
                 assertBool ("permits resume within 1 s of removing the pause file, " <> show (n2, n3)) (n3 > n2)
+
+    , testCase "permits reserved before the pause file appeared wait until it is removed" $
+        withSystemTempDirectory "limiter-pause" $ \dir -> do
+            let pauseFile = dir </> "PAUSE"
+            -- at 1 r/s the first permit is immediate; each of the 4 threads
+            -- then reserves one of the slots 1, 2, 3 and 4 s later and
+            -- sleeps until its slot
+            lim <- newLimiter 1 (Just pauseFile)
+            t0 <- getMonotonicTime
+            throttled lim (return ())
+            workers <- replicateM 4 $ async $ throttled lim (return ())
+            flip finally (mapM_ cancel workers) $ do
+                threadDelay 300_000
+                writeFile pauseFile "pause"
+                -- sample the count until every reserved slot has passed
+                let flat = do
+                        n <- limiterPermits lim
+                        assertEqual "no permit while the pause file exists" 1 n
+                        t <- getMonotonicTime
+                        when (t - t0 < 4.6) $ threadDelay 200_000 >> flat
+                flat
+                removeFile pauseFile
+                -- the threads take new slots, one per second from now
+                done <- timeout 6_000_000 (mapM_ wait workers)
+                assertEqual "the reserved permits are granted after the removal" (Just ()) done
+                assertEqual "number of permits" 5 =<< limiterPermits lim
     ]
 
 -- -------------------------------------------------------------------------- --
