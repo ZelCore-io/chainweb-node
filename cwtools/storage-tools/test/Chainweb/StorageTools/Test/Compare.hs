@@ -13,6 +13,10 @@ module Chainweb.StorageTools.Test.Compare
 ( tests
 ) where
 
+import Control.Concurrent (threadDelay)
+import Control.Exception (toException)
+import Control.Monad (when)
+
 import Data.Aeson (Value(..), decode, decodeStrict, encode, object, withObject, (.:), (.=))
 import Data.Aeson.Types (Parser, parseMaybe)
 import qualified Data.ByteString as B
@@ -26,9 +30,10 @@ import qualified Data.Text.Encoding as T
 
 import GHC.Clock (getMonotonicTime)
 
+import qualified Network.HTTP.Client as HTTP
 import Network.HTTP.Types
 import Network.Wai
-    (Application, pathInfo, queryString, rawPathInfo, rawQueryString, responseLBS, strictRequestBody)
+    (Application, pathInfo, queryString, rawPathInfo, rawQueryString, responseLBS, responseRaw, strictRequestBody)
 import Network.Wai.Handler.Warp (testWithApplication)
 
 import System.Exit (ExitCode(..))
@@ -481,6 +486,11 @@ data StubConfig = StubConfig
         -- ^ the first tip probes answer 500 without block metadata
     , _scDataTag :: !B.ByteString
         -- ^ added to the data of every @/local@ answer if not empty
+    , _scDelay :: !Int
+        -- ^ microseconds before every answer
+    , _scDropLocal :: !Bool
+        -- ^ a @/local@ request that is not a tip probe gets no answer: the
+        -- connection is closed after the request was read
     }
 
 -- | Arrival time and path with query of every request a stub saw.
@@ -501,6 +511,8 @@ oracleConf = StubConfig
     , _scOrphanHeaders = [('V', payloadO)]
     , _scProbeFailures = 0
     , _scDataTag = ""
+    , _scDelay = 0
+    , _scDropLocal = False
     }
 
 -- | The same answers as the oracle at a different tip, without the orphan.
@@ -527,6 +539,7 @@ stubApp seen probes sc req respond = do
             | _scLocalMeta sc = reply 200 (localBody (_scTip sc - fromIntegral d) (_scParent sc) dat)
             | otherwise = reply 200 "{\"result\":{\"status\":\"success\",\"data\":1},\"metaData\":null}"
     atomicModifyIORef' seen (\xs -> ((t, full) : xs, ()))
+    when (_scDelay sc > 0) $ threadDelay (_scDelay sc)
     case drop 3 (pathInfo req) of
         ["cut"] -> reply 200 $ mconcat
             [ "{\"hashes\":{\"0\":{\"height\":", B8.pack (show (_scTip sc))
@@ -550,6 +563,7 @@ stubApp seen probes sc req respond = do
                     n <- atomicModifyIORef' probes (\k -> (k + 1, k))
                     if n < _scProbeFailures sc then reply 500 "probe failed" else local d
                 | d == 0, "txids" `B.isInfixOf` body -> reply 500 "history functions are not available at the tip"
+                | _scDropLocal sc -> respond $ responseRaw (\_ _ -> return ()) (responseLBS status500 [] "no raw")
                 | otherwise -> local d
             Nothing -> reply 400 "no rewindDepth"
         _ -> reply 404 "no route"
@@ -762,6 +776,53 @@ runTests = testGroup "runCompare"
             rep <- runCompare quietLogger cov o t [localReqAt 100, keysReqAt 200]
             reportVerdict rep @?= Fail
             reportDiffCount rep @?= 2
+
+    , testCase "no answer within the response timeout: each request is sent once, never again" $
+        withStubs 1_000 oracleConf { _scDelay = 1_000_000 } testConf $ \o t so _ -> do
+            let opts = defaultRunOptions
+                    { _roTransportAttempts = 5, _roRetryDelay = 10_000
+                    , _roResponseTimeout = 200_000, _roOracleLocalTimeout = 200_000
+                    }
+            rep <- runCompareWith quietLogger opts cov o t [payloadReqFor payloadA, localReqAt 100]
+            ps <- seenPaths so
+            -- the payload request once, and the tip probe of the /local request once
+            assertEqual ("oracle arrivals: " <> show ps) 2 (length ps)
+            reportSkippedFor rep NoOracleAnswer @?= 2
+            reportVerdict rep @?= Void
+
+    , testCase "a connection closed after the request, without an answer: the request is sent once, never again" $
+        withStubs 1_000 oracleConf { _scDropLocal = True } testConf $ \o t so _ -> do
+            let opts = defaultRunOptions { _roTransportAttempts = 5, _roRetryDelay = 10_000 }
+            rep <- runCompareWith quietLogger opts cov o t [localReqAt 100]
+            n <- deepLocals <$> seenPaths so
+            n @?= 1
+            reportSkippedFor rep NoOracleAnswer @?= 1
+            reportVerdict rep @?= Void
+
+    , testCase "the oracle's /local waits 30 s by default, other calls 120 s; a slow /local is not sent again" $ do
+        _roOracleLocalTimeout defaultRunOptions @?= 30_000_000
+        _roResponseTimeout defaultRunOptions @?= 120_000_000
+        withStubs 1_000 oracleConf { _scDelay = 500_000 } testConf $ \o t so _ -> do
+            let opts = defaultRunOptions
+                    { _roRetryDelay = 10_000, _roResponseTimeout = 10_000_000, _roOracleLocalTimeout = 100_000 }
+            rep <- runCompareWith quietLogger opts cov o t [localReqAt 100, payloadReqFor payloadA]
+            reportSkippedIn rep ClsLocal NoOracleAnswer @?= 1
+            reportCount rep ClsPayload KindSame @?= 1
+            n <- probeCount <$> seenPaths so
+            n @?= 1
+
+    , testCase "only a call that never reached the server is tried again" $ do
+        let failure = HTTP.HttpExceptionRequest HTTP.defaultRequest
+        map (isPreSendFailure . failure)
+            [ HTTP.ConnectionFailure (toException (userError "refused"))
+            , HTTP.ConnectionTimeout
+            , HTTP.ResponseTimeout
+            , HTTP.NoResponseDataReceived
+            , HTTP.ConnectionClosed
+            , HTTP.IncompleteHeaders
+            , HTTP.InternalException (toException (userError "reset"))
+            ]
+            @?= [True, True, False, False, False, False, False]
 
     , testCase "both sides on one host at rate r: at most r requests per second in total, probes and orphan checks included" $ do
         let rate = 10 :: Double

@@ -83,7 +83,7 @@ import System.Random (StdGen, mkStdGen, uniformR)
 import Chainweb.BlockHeight
 import Chainweb.ChainId
 import Chainweb.StorageTools.Compare.PactSet
-import Chainweb.StorageTools.Compare.Run (HostLimiters, limiterFor)
+import Chainweb.StorageTools.Compare.Run (HostLimiters, isPreSendFailure, limiterFor, newCompareManager)
 import Chainweb.StorageTools.Compare.Sample (historyMaxHeight)
 import Chainweb.StorageTools.Compare.Types
 import Chainweb.StorageTools.Http
@@ -258,10 +258,15 @@ genError = throwIO . RequestGenError
 
 -- | The oracle's service API, throttled by the limiter of its host from
 -- 'limiterFor': the limiter the oracle 'Side' gets from the same
--- 'HostLimiters'.
+-- 'HostLimiters'. Its manager is 'newCompareManager' with a response timeout
+-- of 120 seconds: no connection is reused, so http-client never sends a
+-- lookup again on its own.
 --
 oracleServiceApi :: HostLimiters -> ChainwebVersion -> T.Text -> IO ServiceApi
-oracleServiceApi hl v url = limiterFor hl url >>= newServiceApi url v
+oracleServiceApi hl v url = do
+    api <- limiterFor hl url >>= newServiceApi url v
+    mgr <- newCompareManager 120_000_000
+    return api { _saManager = mgr }
 
 -- | @/chainweb/0.0/{version}@
 --
@@ -315,7 +320,11 @@ oracleAttempts :: Int
 oracleAttempts = 5
 
 -- | One call to the oracle. Each attempt takes a permit of '_saLimiter'.
--- Exceptions, 429 and 5xx are retried 5 times in all, after 1, 2, 4 and 8 s.
+-- A call that failed before it reached the oracle ('isPreSendFailure'), and
+-- an answer 429 or 5xx, are tried 5 times in all, after 1, 2, 4 and 8 s. Any
+-- other failure (a response timeout, a connection closed without an answer)
+-- is thrown at once: the oracle may have the request, so it is never sent
+-- again.
 --
 oracleCall :: ServiceApi -> Method -> T.Text -> [Header] -> Maybe B.ByteString -> IO (Int, B.ByteString)
 oracleCall api m path hdrs body = do
@@ -332,7 +341,7 @@ oracleCall api m path hdrs body = do
                 , (s == 429 || s >= 500) && attempt < oracleAttempts -> backoff attempt >> go (attempt + 1)
                 | otherwise -> return (statusCode (HTTP.responseStatus resp), BL.toStrict (HTTP.responseBody resp))
             Left (e :: HTTP.HttpException)
-                | attempt < oracleAttempts -> backoff attempt >> go (attempt + 1)
+                | isPreSendFailure e, attempt < oracleAttempts -> backoff attempt >> go (attempt + 1)
                 | otherwise -> throwIO e
     go 1
   where

@@ -1,4 +1,5 @@
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE NumericUnderscores #-}
 {-# LANGUAGE OverloadedStrings #-}
 
 -- |
@@ -86,6 +87,8 @@ data Options = Options
     , _optRate :: !Double
     , _optPauseFile :: !(Maybe FilePath)
     , _optReport :: !FilePath
+    , _optOracleLocalTimeout :: !Int
+        -- ^ seconds
     }
 
 data TestSide
@@ -125,6 +128,11 @@ heightsReader = eitherReader $ \s -> case splitOn '-' s of
     [a, b] | [(lo, "")] <- reads a, [(hi, "")] <- reads b, lo <= hi ->
         Right (BlockHeight (lo :: Word64), BlockHeight hi)
     _ -> Left $ "invalid height range, expected LOW-HIGH: " <> s
+
+positiveSeconds :: String -> Either String Int
+positiveSeconds s = case reads s of
+    [(n, "")] | n > 0, n <= 3_600 -> Right n
+    _ -> Left $ "expected a number of seconds from 1 to 3600: " <> s
 
 splitOn :: Char -> String -> [String]
 splitOn c s = case break (== c) s of
@@ -252,6 +260,13 @@ options = Options
         <> metavar "FILE"
         <> help "where to write the JSON report; a text summary goes to stdout"
         )
+    <*> option (eitherReader positiveSeconds)
+        ( long "oracle-local-timeout"
+        <> metavar "SECONDS"
+        <> value 30
+        <> showDefault
+        <> help "how long a /local on the oracle (tip probes included) waits for its answer. A request without an answer is never sent again: it is skipped as no-oracle-answer"
+        )
 
 -- -------------------------------------------------------------------------- --
 -- Main
@@ -311,7 +326,8 @@ main = do
                 "target skipped at generation (" <> requestClassText cls <> ", chain " <> toText cid
                 <> ", height " <> T.pack (show h) <> "): " <> k <> ": " <> e
             return (rs, _genClasses g, reportGeneration (length targets) [ (c, k) | GenSkip (c, _, _) k _ <- skips ])
-    let compareWith test = runCompareClasses logger defaultRunOptions classCov oracle test reqs
+    let runOpts = defaultRunOptions { _roOracleLocalTimeout = 1_000_000 * _optOracleLocalTimeout o }
+        compareWith test = runCompareClasses logger runOpts classCov oracle test reqs
     rep0 <- case _optTest o of
         TestUrl url -> limiterFor hl url >>= compareWith . Side "test" url
         TestDb td -> withInProcessSide logger (inProcessSpec o td) compareWith

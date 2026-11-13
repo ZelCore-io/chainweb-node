@@ -30,6 +30,8 @@ module Chainweb.StorageTools.Compare.Run
 , runCompareWith
 , runCompareClasses
 , tipProbe
+, isPreSendFailure
+, newCompareManager
 , compareWorkers
 , tipRefreshInterval
 , maxPinRetries
@@ -141,24 +143,31 @@ maxPinRetries = 5
 --
 data RunOptions = RunOptions
     { _roTransportAttempts :: !Int
-        -- ^ attempts of a call that gets no HTTP answer at all
+        -- ^ attempts of a call that failed before it reached the server
+        -- ('isPreSendFailure'). A call that may have reached it is never
+        -- sent again.
     , _roRetryDelay :: !Int
         -- ^ microseconds before the second attempt, doubled before each
         -- further one
     , _roResponseTimeout :: !Int
         -- ^ microseconds
+    , _roOracleLocalTimeout :: !Int
+        -- ^ microseconds; the response timeout of a @/local@ on the oracle
+        -- (tip probes included), in place of '_roResponseTimeout'
     , _roProbeAttempts :: !Int
         -- ^ tip probes sent while they answer without block metadata
     }
 
--- | 5 attempts with delays of 1, 2, 4 and 8 seconds; a response timeout of
--- 120 seconds; 3 tip probes.
+-- | 5 attempts with delays of 1, 2, 4 and 8 seconds, for calls that never
+-- reached the server; a response timeout of 120 seconds, 30 seconds for a
+-- @/local@ on the oracle; 3 tip probes.
 --
 defaultRunOptions :: RunOptions
 defaultRunOptions = RunOptions
     { _roTransportAttempts = 5
     , _roRetryDelay = 1_000_000
     , _roResponseTimeout = 120_000_000
+    , _roOracleLocalTimeout = 30_000_000
     , _roProbeAttempts = 3
     }
 
@@ -197,23 +206,59 @@ sideOf env TestRole = _envTest env
 -- -------------------------------------------------------------------------- --
 -- HTTP
 
+-- | Whether a failed call never reached the server: the connection could not
+-- be opened (refused, unreachable, a name that does not resolve) or was not
+-- opened in time. Only such a call is sent again.
+--
+-- Every other failure is final: a response timeout, a connection closed or
+-- reset after the request was written, an empty or broken answer. The server
+-- may have the request and be working on it; a @/local@ that runs on a busy
+-- production chain must not be queued there a second time (I1 of the P0
+-- review).
+--
+isPreSendFailure :: HTTP.HttpException -> Bool
+isPreSendFailure = \case
+    HTTP.HttpExceptionRequest _ (HTTP.ConnectionFailure _) -> True
+    HTTP.HttpExceptionRequest _ HTTP.ConnectionTimeout -> True
+    _ -> False
+
+-- | The HTTP manager of @cw-compare@: the given response timeout in
+-- microseconds, and every request on a connection of its own. A pooled
+-- connection that the server closed while idle looks like a request without
+-- an answer, and http-client would send such a request again on its own; a
+-- connection that is never reused rules both out.
+--
+newCompareManager :: Int -> IO HTTP.Manager
+newCompareManager timeout = HTTP.newTlsManagerWith HTTP.tlsManagerSettings
+    { HTTP.managerResponseTimeout = HTTP.responseTimeoutMicro timeout
+    , HTTP.managerIdleConnectionCount = 0
+    , HTTP.managerRetryableException = const False
+    }
+
 -- | Sends a request through the limiter of the side's host. Any HTTP status
--- is an answer. Connection failures and timeouts are tried
--- '_roTransportAttempts' times (by default 5, with delays of 1, 2, 4 and 8
--- seconds); each attempt takes a permit.
+-- is an answer. A call that failed before it reached the server
+-- ('isPreSendFailure') is tried '_roTransportAttempts' times (by default 5,
+-- with delays of 1, 2, 4 and 8 seconds); each attempt takes a permit. Any
+-- other failure is final and sent once only. A @/local@ to the oracle waits
+-- '_roOracleLocalTimeout' for its answer.
 --
 sendRaw
     :: Env
-    -> Side
+    -> Role
     -> Method
     -> T.Text
     -> [Header]
     -> Maybe B.ByteString
     -> IO (Either T.Text (Int, B.ByteString))
-sendRaw env side method path hdrs body = go (1 :: Int)
+sendRaw env role method path hdrs body = go (1 :: Int)
   where
     opts = _envOptions env
+    side = sideOf env role
     url = T.unpack (T.dropWhileEnd (== '/') (_sideBaseUrl side) <> path)
+    timeout
+        | role == OracleRole, "/pact/api/v1/local" `T.isInfixOf` path =
+            HTTP.responseTimeoutMicro (_roOracleLocalTimeout opts)
+        | otherwise = HTTP.responseTimeoutMicro (_roResponseTimeout opts)
     go attempt = do
         r <- try $ throttled (_sideLimiter side) $ do
             req0 <- HTTP.parseRequest url
@@ -221,17 +266,19 @@ sendRaw env side method path hdrs body = go (1 :: Int)
                     { HTTP.method = method
                     , HTTP.requestHeaders = hdrs
                     , HTTP.requestBody = maybe (HTTP.requestBody req0) HTTP.RequestBodyBS body
+                    , HTTP.responseTimeout = timeout
                     }
             HTTP.httpLbs req (_envManager env)
         case r of
             Right resp -> return $ Right
                 (statusCode (HTTP.responseStatus resp), BL.toStrict (HTTP.responseBody resp))
             Left (e :: HTTP.HttpException)
-                | attempt < _roTransportAttempts opts -> do
+                | isPreSendFailure e, attempt < _roTransportAttempts opts -> do
                     threadDelay (_roRetryDelay opts * 2 ^ (attempt - 1))
                     go (attempt + 1)
                 | otherwise -> return $ Left $
-                    "no answer from " <> _sideName side <> " for " <> T.pack url <> ": " <> sshow e
+                    "no answer from " <> _sideName side <> " for " <> T.pack url
+                    <> " after " <> sshow attempt <> " attempt(s): " <> sshow e
 
 requestHeaders :: Request -> [Header]
 requestHeaders r = (hAccept, "application/json")
@@ -242,7 +289,7 @@ toAnswer r (s, b) = Answer s b $ if isPinnedClass (_reqClass r) then answerPin b
 
 sendTo :: Env -> Role -> Request -> T.Text -> IO (Either T.Text Answer)
 sendTo env role r path = fmap (toAnswer r) <$>
-    sendRaw env (sideOf env role) (_reqMethod r) path (requestHeaders r) (_reqBody r)
+    sendRaw env role (_reqMethod r) path (requestHeaders r) (_reqBody r)
 
 -- | Sending a request once to both sides.
 --
@@ -311,9 +358,9 @@ tipProbe prefix cid now = (path, BL.toStrict (encode command))
 -- tip.
 --
 -- A probe answered without block metadata is sent again, up to
--- '_roProbeAttempts' probes in all; a probe without an HTTP answer has had its
--- transport attempts already. If the probe fails, the cached tip is used if
--- there is one.
+-- '_roProbeAttempts' probes in all; a probe without an HTTP answer is not
+-- (see 'sendRaw'). If the probe fails, the cached tip is used if there is
+-- one.
 --
 tipOf :: Env -> Role -> T.Text -> ChainId -> Bool -> IO (Either ProbeFailure BlockHeight)
 tipOf env role prefix cid force = do
@@ -337,7 +384,7 @@ tipOf env role prefix cid force = do
     probe n = do
         TimeSpec secs _ <- getTime Realtime
         let (path, body) = tipProbe prefix cid secs
-        sendRaw env (sideOf env role) methodPost path
+        sendRaw env role methodPost path
             [(hAccept, "application/json"), (hContentType, "application/json")] (Just body) >>= \case
             Left e -> return (Left (ProbeTransport e))
             Right (s, b) -> case answerPin b of
@@ -409,19 +456,20 @@ headerItems = withObject "page" $ \o -> do
 -- | The canonical header of a side at a height: the branch below the side's
 -- current cut, at that height.
 --
-canonicalAt :: Env -> Side -> T.Text -> ChainId -> BlockHeight -> IO (Either T.Text HeaderRef)
-canonicalAt env side prefix cid h =
-    sendRaw env side methodGet (prefix <> "/cut") [(hAccept, "application/json")] Nothing >>= \case
+canonicalAt :: Env -> Role -> T.Text -> ChainId -> BlockHeight -> IO (Either T.Text HeaderRef)
+canonicalAt env role prefix cid h =
+    sendRaw env role methodGet (prefix <> "/cut") [(hAccept, "application/json")] Nothing >>= \case
         Left e -> return (Left e)
         Right (200, cb) -> case decodeStrict' cb >>= parseMaybe cutHash of
             Nothing -> return (Left "the cut does not decode")
             Just top -> branch top
         Right (s, _) -> return (Left ("the cut: status " <> sshow s))
   where
+    side = sideOf env role
     hs = sshow (getBlockHeight h)
     branchPath = prefix <> "/chain/" <> toText cid <> "/header/branch?minheight=" <> hs <> "&maxheight=" <> hs
 
-    branch top = sendRaw env side methodPost branchPath
+    branch top = sendRaw env role methodPost branchPath
         [ (hAccept, "application/json;blockheader-encoding=object")
         , (hContentType, "application/json")
         ]
@@ -445,9 +493,9 @@ canonicalAt env side prefix cid h =
 -- | Every header of a side at a height, canonical or not: the first page of
 -- @GET .../header?minheight=h&maxheight=h@.
 --
-headersAt :: Env -> Side -> T.Text -> ChainId -> BlockHeight -> IO (Either T.Text [HeaderRef])
-headersAt env side prefix cid h =
-    sendRaw env side methodGet path [(hAccept, "application/json;blockheader-encoding=object")] Nothing >>= \case
+headersAt :: Env -> Role -> T.Text -> ChainId -> BlockHeight -> IO (Either T.Text [HeaderRef])
+headersAt env role prefix cid h =
+    sendRaw env role methodGet path [(hAccept, "application/json;blockheader-encoding=object")] Nothing >>= \case
         Left e -> return (Left e)
         Right (200, b) -> return $ case decodeStrict' b >>= parseMaybe headerItems of
             Nothing -> Left "the headers do not decode"
@@ -465,9 +513,9 @@ checkOrphan env r ph = case (_reqTarget r, apiPrefixOfPath (_reqPath r)) of
     (Just h, Just prefix) -> do
         ((hs, co), ct) <- concurrently
             (concurrently
-                (headersAt env (_envOracle env) prefix cid h)
-                (canonicalAt env (_envOracle env) prefix cid h))
-            (canonicalAt env (_envTest env) prefix cid h)
+                (headersAt env OracleRole prefix cid h)
+                (canonicalAt env OracleRole prefix cid h))
+            (canonicalAt env TestRole prefix cid h)
         return (orphanVerdict cid h ph hs co ct)
     _ -> return $ Differ "found on the oracle only; no target height or API prefix for the orphan check"
   where
@@ -518,7 +566,8 @@ compareOne env (i, r) = do
 --
 -- A request the test side alone gives no HTTP answer to is a difference that
 -- keeps the oracle's answer. One the oracle gives no HTTP answer to is
--- 'Skipped' 'NoOracleAnswer', whatever the test side did.
+-- 'Skipped' 'NoOracleAnswer', whatever the test side did. A request that may
+-- have reached a side is never sent to it again ('isPreSendFailure').
 --
 runCompare :: Logger l => l -> Coverage -> Side -> Side -> [Request] -> IO Report
 runCompare logger = runCompareWith logger defaultRunOptions
@@ -543,8 +592,7 @@ runCompareClasses
     -> [Request]
     -> IO Report
 runCompareClasses logger opts cov oracle test reqs = do
-    mgr <- HTTP.newTlsManagerWith HTTP.tlsManagerSettings
-        { HTTP.managerResponseTimeout = HTTP.responseTimeoutMicro (_roResponseTimeout opts) }
+    mgr <- newCompareManager (_roResponseTimeout opts)
     env <- Env opts mgr cov oracle test <$> newIORef mempty <*> newIORef 0 <*> pure logg
     queue <- newMVar (zip [0 ..] reqs)
     rep <- newMVar emptyReport

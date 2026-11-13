@@ -36,7 +36,7 @@ import qualified Data.Text.Encoding as T
 import qualified Data.Vector as V
 import Data.Word (Word64)
 import Network.HTTP.Types
-import Network.Wai (Application, pathInfo, queryString, responseLBS, strictRequestBody)
+import Network.Wai (Application, pathInfo, queryString, responseLBS, responseRaw, strictRequestBody)
 import Network.Wai.Handler.Warp (testWithApplication)
 import Test.Tasty
 import Test.Tasty.HUnit
@@ -91,6 +91,7 @@ tests = testGroup "Requests"
     , testCase "generation skips are reported per kind" skipKinds
     , testCase "spv: a target chain outside the coverage at the target height + 3 is NotCovered" spvTargetCoverage
     , testCase "--allow-reads-in-local takes a required true|false" allowReadsOption
+    , testCase "an oracle lookup whose connection closes without an answer is sent once, never again" lookupNotResent
     ]
 
 cid0, cid3, cid10 :: ChainId
@@ -648,3 +649,24 @@ allowReadsOption = do
     allow [] @?= Nothing
     allow ["--allow-reads-in-local"] @?= Nothing
     allow ["--allow-reads-in-local", "yes"] @?= Nothing
+
+-- -------------------------------------------------------------------------- --
+-- Fix P0-A
+
+-- | An oracle that reads each request and closes the connection without an
+-- answer.
+--
+lookupNotResent :: Assertion
+lookupNotResent = do
+    arrivals <- newIORef (0 :: Int)
+    let app req respond = do
+            _ <- strictRequestBody req
+            atomicModifyIORef' arrivals (\n -> (n + 1, ()))
+            respond $ responseRaw (\_ _ -> return ()) (responseLBS status500 [] "no raw")
+    testWithApplication (return app) $ \port -> do
+        hl <- newHostLimiters 1_000 Nothing
+        api <- oracleServiceApi hl mainnet ("http://127.0.0.1:" <> tshow port)
+        r <- try @SomeException (gen api 1 ClsHeader 10)
+        assertBool "the lookup fails" (either (const True) (const False) r)
+        n <- readIORef arrivals
+        n @?= 1
