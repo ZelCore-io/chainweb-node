@@ -19,6 +19,7 @@ module Chainweb.StorageTools.Compare.PactSet
 , decodePactSet
 , loadPactSet
 , entriesFor
+, generatedEntries
 ) where
 
 import Data.Aeson
@@ -47,6 +48,12 @@ data PactEntry = PactEntry
     , _peStep :: !Int
         -- ^ the step of a continuation
     , _peWhy :: !T.Text
+        -- ^ why the entry is in the set, and the bound of its cost on a live
+        -- node
+    , _peSameSnapshotOnly :: !Bool
+        -- ^ the entry is generated only with @--same-snapshot@ (both sides
+        -- copied from one snapshot, never a production node): its cost has
+        -- no known bound on a live node, or its answer depends on the tip
     }
     deriving (Show, Eq)
 
@@ -67,6 +74,7 @@ instance FromJSON PactEntry where
             <$> o .: "code"
             <*> o .:? "step" .!= 1
             <*> o .:? "why" .!= ""
+            <*> o .:? "sameSnapshotOnly" .!= False
 
 instance FromJSON PactSet where
     parseJSON = withObject "PactSet" $ \o -> PactSet <$> o .: "entries"
@@ -89,3 +97,12 @@ loadPactSet f = B.readFile f >>= either (ioError . userError . ((f <> ": ") <>))
 --
 entriesFor :: PactSet -> RequestClass -> [PactEntry]
 entriesFor s c = [ e | e <- _pactEntries s, c `elem` _peClasses e ]
+
+-- | The entries that the generator picks from for a request class:
+-- @generatedEntries sameSnapshot@ leaves out the entries marked
+-- 'sameSnapshotOnly' unless @sameSnapshot@ (ruling C1 on Task 6), so that a
+-- run against a live oracle sends only entries with a bounded cost.
+--
+generatedEntries :: Bool -> PactSet -> RequestClass -> [PactEntry]
+generatedEntries sameSnapshot s c =
+    [ e | e <- entriesFor s c, sameSnapshot || not (_peSameSnapshotOnly e) ]
