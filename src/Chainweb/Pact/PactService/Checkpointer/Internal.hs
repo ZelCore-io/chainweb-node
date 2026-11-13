@@ -167,7 +167,7 @@ readFrom res maybeParent pactVersion doRead = do
             "Pact 4 readFrom executed on block height after Pact 5 fork, height: " <> sshow currentHeight
           | otherwise -> _psGetEndTxId res.cpStore "doReadFrom" maybeParent >>= traverse \startTxId -> do
             newDbEnv <- newMVar $ Pact4.BlockEnv
-              (Pact4.mkBlockHandlerEnv res.cpCwVersion res.cpChainId currentHeight res.cpSql DoNotPersistIntraBlockWrites res.cpLogger)
+              (Pact4.mkBlockHandlerEnv res.cpCwVersion res.cpChainId currentHeight res.cpStore DoNotPersistIntraBlockWrites res.cpLogger)
               (Pact4.initBlockState defaultModuleCacheLimit startTxId)
                 { Pact4._bsModuleCache = sharedModuleCache }
             let
@@ -287,7 +287,7 @@ restoreAndSave res rewindParent blocks = do
                 "Pact 4 block executed on block height after Pact 5 fork, height: " <> sshow bh
             | otherwise -> do
               -- prepare a fresh block state
-              let handlerEnv = Pact4.mkBlockHandlerEnv res.cpCwVersion res.cpChainId bh res.cpSql res.cpIntraBlockPersistence res.cpLogger
+              let handlerEnv = Pact4.mkBlockHandlerEnv res.cpCwVersion res.cpChainId bh res.cpStore res.cpIntraBlockPersistence res.cpLogger
               let state = (Pact4.initBlockState defaultModuleCacheLimit txid)
                     { Pact4._bsModuleCache = moduleCache }
               dbMVar <- newMVar Pact4.BlockEnv
@@ -330,7 +330,7 @@ restoreAndSave res rewindParent blocks = do
                       <> sshow (view blockHeight ph) <> ", child height " <> sshow (view blockHeight newBh)
                 _ -> return ()
               -- persist any changes to the database
-              Pact4.commitBlockStateToDatabase res.cpSql
+              Pact4.commitBlockStateToDatabase res.cpStore
                 (view blockHash newBh) (view blockHeight newBh)
                 (BlockHandle (Pact4._bsTxId nextState) (Pact4._bsPendingBlock nextState))
               return (m'', Just (ParentHeader newBh), nextTxId, nextModuleCache)

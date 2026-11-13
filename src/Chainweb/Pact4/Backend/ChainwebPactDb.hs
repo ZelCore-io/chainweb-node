@@ -26,7 +26,6 @@ module Chainweb.Pact4.Backend.ChainwebPactDb
 ( chainwebPactDb
 , rewoundPactDb
 , indexPactTransaction
-, vacuumDb
 , toTxLog
 , CurrentBlockDbEnv(..)
 , cpPactDbEnv
@@ -43,7 +42,7 @@ module Chainweb.Pact4.Backend.ChainwebPactDb
 , initBlockState
 , BlockHandler(..)
 , BlockHandlerEnv(..)
-, blockHandlerDb
+, blockHandlerStore
 , blockHandlerLogger
 , blockHandlerBlockHeight
 , blockHandlerModuleNameFix
@@ -95,7 +94,7 @@ import Pact.Persist
 import Pact.PersistPactDb hiding (db)
 import Pact.Types.Persistence
 import Pact.Types.RowData
-import Pact.Types.SQLite
+import Pact.Types.SQLite (liftEither)
 import Pact.Types.Term (ModuleName(..), ObjectMap(..), TableName(..), KeySetName(..), NamespaceName(..), PactId(..))
 import Pact.Types.Util (AsString(..))
 
@@ -108,6 +107,7 @@ import Chainweb.BlockHash
 import Chainweb.BlockHeight
 import Chainweb.Logger
 import Chainweb.Pact.Backend.DbCache
+import Chainweb.Pact.Backend.Store.Types
 import Chainweb.Pact.Backend.Utils
 import Chainweb.Pact.Types
 import Chainweb.Utils
@@ -120,21 +120,7 @@ import Chainweb.Version.Guards
 import Control.Exception.Safe
 import Pact.Types.Command (RequestKey)
 import Chainweb.Pact.Backend.Types
-import Chainweb.Utils.Serialization (runPutS)
 import Data.Foldable
-
-execMulti :: Traversable t => SQ3.Database -> SQ3.Utf8 -> t [SType] -> IO ()
-execMulti db q rows = bracket (prepStmt db q) destroy $ \stmt -> do
-    forM_ rows $ \row -> do
-        SQ3.reset stmt >>= checkError
-        SQ3.clearBindings stmt
-        bindParams stmt row
-        SQ3.step stmt >>= checkError
-  where
-    checkError (Left e) = void $ fail $ "error during batch insert: " ++ show e
-    checkError (Right _) = return ()
-
-    destroy x = void (SQ3.finalize x >>= checkError)
 
 domainTableName :: Domain k v -> Text
 domainTableName = asString
@@ -160,19 +146,18 @@ convPactId :: PactId -> SQ3.Utf8
 convPactId = toUtf8 . sshow
 
 callDb
-    :: (MonadCatch m, MonadReader (BlockHandlerEnv logger) m, MonadIO m)
+    :: (MonadCatch m, MonadIO m)
     => T.Text
-    -> (SQ3.Database -> IO b)
+    -> IO b
     -> m b
 callDb callerName action = do
-  c <- asks _blockHandlerDb
-  res <- tryAny $ liftIO $ action c
+  res <- tryAny $ liftIO action
   case res of
     Left err -> internalError $ "callDb (" <> callerName <> "): " <> sshow err
     Right r -> return r
 
 data BlockHandlerEnv logger = BlockHandlerEnv
-    { _blockHandlerDb :: !SQLiteEnv
+    { _blockHandlerStore :: !PactStore
     , _blockHandlerLogger :: !logger
     , _blockHandlerBlockHeight :: !BlockHeight
     , _blockHandlerModuleNameFix :: !Bool
@@ -183,9 +168,9 @@ data BlockHandlerEnv logger = BlockHandlerEnv
 
 mkBlockHandlerEnv
   :: ChainwebVersion -> ChainId -> BlockHeight
-  -> SQLiteEnv -> IntraBlockPersistence -> logger -> BlockHandlerEnv logger
-mkBlockHandlerEnv v cid bh sql p logger = BlockHandlerEnv
-    { _blockHandlerDb = sql
+  -> PactStore -> IntraBlockPersistence -> logger -> BlockHandlerEnv logger
+mkBlockHandlerEnv v cid bh store p logger = BlockHandlerEnv
+    { _blockHandlerStore = store
     , _blockHandlerLogger = logger
     , _blockHandlerBlockHeight = bh
     , _blockHandlerModuleNameFix = enableModuleNameFix v cid bh
@@ -254,6 +239,20 @@ initBlockState cl txid = BlockState
 makeLenses ''BlockEnv
 makeLenses ''BlockState
 
+-- | Run a row operation of the block's 'PactStore'. A 'Left' is rethrown
+-- through Pact 4's 'liftEither' inside 'callDb', which is how 3.2.1's 'qry'
+-- failed inside 'callDb': the result is the same
+-- @callDb (<caller>): user error (Database error: <error>)@. The store's
+-- result-shape errors stay outside 'callDb', where 3.2.1 raised them.
+callStore
+    :: T.Text
+    -> (PactStore -> IO (Either SQ3.Error b))
+    -> BlockHandler logger b
+callStore callerName action = do
+  store <- view blockHandlerStore
+  r <- liftIO $ action store
+  callDb callerName $ liftEither (return r)
+
 
 -- this is effectively a read-write snapshot of the Pact state at a block.
 data CurrentBlockDbEnv logger = CurrentBlockDbEnv
@@ -308,13 +307,7 @@ tableExistsInDbAtHeight tableName bh = do
           ["SYS:Pacts", "SYS:Modules", "SYS:KeySets", "SYS:Namespaces", "SYS:ModuleSources"]
     if tableName `elem` knownTbls
     then return True
-    else callDb "tableExists" $ \db -> do
-      let tableExistsStmt =
-            -- table names are case-sensitive
-            "SELECT tablename FROM VersionedTableCreation WHERE createBlockheight < ? AND lower(tablename) = lower(?)"
-      qry db tableExistsStmt [SInt $ max 0 (fromIntegral bh), SText (toUtf8 tableName)] [RText] >>= \case
-        [] -> return False
-        _ -> return True
+    else callStore "tableExists" $ \store -> _psTableExistsAt store tableName bh
 
 doReadRow
     :: (IsString k, FromJSON v)
@@ -362,26 +355,18 @@ doReadRow mlim d k = forModuleNameFix $ \mnFix ->
         => Utf8
         -> (Utf8 -> BS.ByteString -> MaybeT (BlockHandler logger) v)
         -> MaybeT (BlockHandler logger) v
-    lookupInDb rowkey checkCache = do
+    lookupInDb rowkey@(Utf8 rk) checkCache = do
         -- First, check: did we create this table during this block? If so,
         -- there's no point in looking up the key.
         checkDbTablePendingCreation tableName
         lift $ forM_ mlim $ \(bh, _) ->
             failIfTableDoesNotExistInDbAtHeight "doReadRow" tableName bh
         -- we inject the endingtx limitation to reduce the scope up to the provided block height
-        let blockLimitStmt = maybe "" (const " AND txid < ?") mlim
-        let blockLimitParam = maybe [] (\(TxId txid) -> [SInt $ fromIntegral txid]) (snd <$> mlim)
-        let queryStmt =
-                "SELECT rowdata FROM " <> tbl (toUtf8 tableName) <> " WHERE rowkey = ?" <> blockLimitStmt
-                <> " ORDER BY txid DESC LIMIT 1;"
-        result <- lift $ callDb "doReadRow"
-                       $ \db -> qry db queryStmt ([SText rowkey] ++ blockLimitParam) [RBlob]
+        result <- lift $ callStore "doReadRow"
+                       $ \store -> _psReadNewest store tableName rk (snd <$> mlim)
         case result of
-            [] -> mzero
-            [[SBlob a]] -> checkCache rowkey a
-            err -> internalError $
-                     "doReadRow: Expected (at most) a single result, but got: " <>
-                     T.pack (show err)
+            Nothing -> mzero
+            Just a -> checkCache rowkey a
 
     checkModuleCache u b = MaybeT $ do
         !txid <- use bsTxId -- cache priority
@@ -529,20 +514,15 @@ doKeys mlim d = do
     return allKeys
 
   where
-    blockLimitStmt = maybe "" (const " WHERE txid < ?;") mlim
-    blockLimitParam = maybe [] (\(TxId txid) -> [SInt (fromIntegral txid)]) (snd <$> mlim)
     getDbKeys = do
         m <- runMaybeT $ checkDbTablePendingCreation $ tn
         case m of
             Nothing -> return mempty
             Just () -> do
                 forM_ mlim (failIfTableDoesNotExistInDbAtHeight "doKeys" tn . fst)
-                ks <- callDb "doKeys" $ \db ->
-                          qry db ("SELECT DISTINCT rowkey FROM " <> tbl (toUtf8 tn) <> blockLimitStmt) blockLimitParam [RText]
-                forM ks $ \row -> do
-                    case row of
-                        [SText k] -> return $! T.unpack $ fromUtf8 k
-                        _ -> internalError "doKeys: The impossible happened."
+                ks <- callStore "doKeys" $ \store ->
+                          _psDistinctKeys store KeysAsStored tn (snd <$> mlim)
+                forM ks $ \k -> return $! T.unpack $ fromUtf8 (Utf8 k)
 
     tn = domainTableName d
     collect p =
@@ -560,7 +540,7 @@ failIfTableDoesNotExistInDbAtHeight caller tn bh = do
 
 -- tid is non-inclusive lower bound for the search
 doTxIds :: TableName -> TxId -> BlockHandler logger [TxId]
-doTxIds (TableName tn) _tid@(TxId tid) = do
+doTxIds (TableName tn) _tid = do
     dbOut <- getFromDb
 
     -- also collect from pending non-committed data
@@ -578,15 +558,7 @@ doTxIds (TableName tn) _tid@(TxId tid) = do
         case m of
             Nothing -> return mempty
             Just () -> do
-                rows <- callDb "doTxIds" $ \db ->
-                  qry db stmt
-                    [SInt (fromIntegral tid)]
-                    [RInt]
-                forM rows $ \case
-                    [SInt tid'] -> return $ TxId (fromIntegral tid')
-                    _ -> internalError "doTxIds: the impossible happened"
-
-    stmt = "SELECT DISTINCT txid FROM " <> tbl (toUtf8 tn) <> " WHERE txid > ?"
+                callStore "doTxIds" $ \store -> _psTxIdsAfter store tn _tid
 
     collect p =
         let txids = fmap _deltaTxId $
@@ -644,24 +616,17 @@ doCreateUserTable mbh tn@(TableName ttxt) mn = do
             $ over pendingTableCreation (HashSet.insert ttxt)
             . over pendingTxLogMap (M.insertWith DL.append (TableName txlogKey) txlogs)
   where
+    -- The store's catalog check is true exactly when one table matches,
+    -- which is 3.2.1's single-row case with @lcTables || rname == t@ true:
+    -- an exact (non-lowercase) match returns the argument's own name.
     inDb lcTables t = do
-      r <- callDb "doCreateUserTable" $ \db ->
-        qry db (tableLookupStmt lcTables) [SText (toUtf8 t)] [RText]
-      case r of
-        [[SText (Utf8 (T.decodeUtf8 -> rname))]] ->
-          case mbh of
-              -- if lowercase matching, no need to check equality
-              -- (wasn't needed before either but leaving alone for replay)
-              Nothing -> return (lcTables || rname == t)
-              Just bh -> do
-                  existsInDb <- tableExistsInDbAtHeight t bh
-                  return $ existsInDb && (lcTables || rname == t)
-        _ -> return False
-
-    tableLookupStmt False =
-      "SELECT name FROM sqlite_master WHERE type='table' and name=?;"
-    tableLookupStmt True =
-      "SELECT name FROM sqlite_master WHERE type='table' and lower(name)=lower(?);"
+      found <- callStore "doCreateUserTable" $ \store ->
+        _psTableInCatalog store lcTables t
+      if not found
+      then return False
+      else case mbh of
+          Nothing -> return True
+          Just bh -> tableExistsInDbAtHeight t bh
     txlogKey = "SYS:usertables"
     stn = asString tn
     uti = UserTableInfo mn
@@ -768,15 +733,8 @@ doGetTxLog d txid = do
         mapM (\x -> toTxLog (asString d) (Utf8 $ _deltaRowKey x) (_deltaData x)) deltas
 
     readFromDb = do
-        rows <- callDb "doGetTxLog" $ \db -> qry db stmt
-          [SInt (fromIntegral txid)]
-          [RText, RBlob]
-        forM rows $ \case
-            [SText key, SBlob value] -> toTxLog (asString d) key value
-            err -> internalError $
-              "readHistoryResult: Expected single row with two columns as the \
-              \result, got: " <> T.pack (show err)
-    stmt = "SELECT rowkey, rowdata FROM " <> tbl (toUtf8 tableName) <> " WHERE txid = ?"
+        rows <- callStore "doGetTxLog" $ \store -> _psRowsAtTxId store tableName txid
+        forM rows $ \(key, value) -> toTxLog (asString d) (Utf8 key) value
 
 
 toTxLog :: MonadThrow m =>
@@ -793,99 +751,32 @@ indexPactTransaction h = modify' $
     over (bsPendingBlock . pendingSuccessfulTxs) $ HashSet.insert h
 
 
--- | Careful doing this! It's expensive and for our use case, probably pointless.
--- We should reserve vacuuming for an offline process
-vacuumDb :: BlockHandler logger ()
-vacuumDb = callDb "vacuumDb" (`exec_` "VACUUM;")
-
-commitBlockStateToDatabase :: SQLiteEnv -> BlockHash -> BlockHeight -> BlockHandle Pact4 -> IO ()
-commitBlockStateToDatabase db hsh bh blockHandle = do
-  let newTables = _pendingTableCreation $ _blockHandlePending blockHandle
-  mapM_ (\tn -> createUserTable tn) newTables
-  let writeV = toChunks $ _pendingWrites (_blockHandlePending blockHandle)
-  backendWriteUpdateBatch writeV
-  indexPendingPactTransactions
-  let nextTxId = _blockHandleTxId blockHandle
-  blockHistoryInsert nextTxId
+-- | Write the block's pending state through the store, in 3.2.1's order:
+-- new tables, then each table's rows followed by its mutation row, then the
+-- transaction index, then the block history row.
+--
+-- A 'Left' is rethrown through Pact 4's 'liftEither', as 3.2.1's 'exec'' and
+-- every prepare and bind failure raised it: @user error (Database error:
+-- <error>)@. 3.2.1's own @execMulti@ said @error during batch insert:
+-- <error>@ for a failed step of the batched row and transaction-index
+-- inserts; the store's result does not say which statement failed.
+commitBlockStateToDatabase :: PactStore -> BlockHash -> BlockHeight -> BlockHandle Pact4 -> IO ()
+commitBlockStateToDatabase store hsh bh blockHandle =
+    liftEither $ _psCommitBlock store BlockCommit
+        { _bcHeight = bh
+        , _bcHash = hsh
+        , _bcEndTxId = _blockHandleTxId blockHandle
+        , _bcNewTables = toList (_pendingTableCreation pending)
+        , _bcRows = toChunks (_pendingWrites pending)
+        , _bcTxHashes = toList (_pendingSuccessfulTxs pending)
+        }
   where
+    pending = _blockHandlePending blockHandle
+
+    -- per table in 'HashMap.toList' order, every delta of every rowkey
     toChunks writes =
-      over _2 (concatMap toList . HashMap.elems) .
-      over _1 toUtf8 <$> HashMap.toList writes
+      [ (tableName, prepRow <$> concatMap toList (HashMap.elems byKey))
+      | (tableName, byKey) <- HashMap.toList writes
+      ]
 
-    backendWriteUpdateBatch
-        :: [(Utf8, [SQLiteRowDelta])]
-        -> IO ()
-    backendWriteUpdateBatch writesByTable = mapM_ writeTable writesByTable
-        where
-          prepRow (SQLiteRowDelta _ txid rowkey rowdata) =
-            [ SText (Utf8 rowkey)
-            , SInt (fromIntegral txid)
-            , SBlob rowdata
-            ]
-
-          writeTable (tableName, writes) = do
-            execMulti db q (map prepRow writes)
-            markTableMutation tableName bh
-            where
-            q = "INSERT OR REPLACE INTO " <> tbl tableName <> "(rowkey,txid,rowdata) VALUES(?,?,?)"
-
-          -- Mark the table as being mutated during this block, so that we know
-          -- to delete from it if we rewind past this block.
-          markTableMutation tablename blockheight = do
-              exec' db mutq [SText tablename, SInt (fromIntegral blockheight)]
-            where
-              mutq = "INSERT OR IGNORE INTO VersionedTableMutation VALUES (?,?);"
-
-    -- | Record a block as being in the history of the checkpointer.
-    blockHistoryInsert :: TxId -> IO ()
-    blockHistoryInsert t =
-        exec' db stmt
-            [ SInt (fromIntegral bh)
-            , SBlob (runPutS (encodeBlockHash hsh))
-            , SInt (fromIntegral t)
-            ]
-      where
-        stmt =
-          "INSERT INTO BlockHistory ('blockheight','hash','endingtxid') VALUES (?,?,?);"
-
-    createUserTable :: Text -> IO ()
-    createUserTable (toUtf8 -> tablename) = do
-        createVersionedTable tablename db
-        markTableCreation tablename
-
-    -- Mark the table as being created during this block, so that we know
-    -- to drop it if we rewind past this block.
-    markTableCreation tablename =
-        exec' db insertstmt insertargs
-      where
-        insertstmt = "INSERT OR IGNORE INTO VersionedTableCreation VALUES (?,?)"
-        insertargs =  [SText tablename, SInt (fromIntegral bh)]
-
-    -- | Commit the index of pending successful transactions to the database
-    indexPendingPactTransactions :: IO ()
-    indexPendingPactTransactions = do
-        let txs = _pendingSuccessfulTxs $ _blockHandlePending blockHandle
-        dbIndexTransactions txs
-
-      where
-        toRow b = [SBlob b, SInt (fromIntegral bh)]
-        dbIndexTransactions txs = do
-            let rows = map toRow $ toList txs
-            execMulti db "INSERT INTO TransactionIndex (txhash, blockheight) \
-                         \ VALUES (?, ?)" rows
-
-
-createVersionedTable :: Utf8 -> Database -> IO ()
-createVersionedTable tablename db = do
-    exec_ db createtablestmt
-    exec_ db indexcreationstmt
-    where
-    ixName = tablename <> "_ix"
-    createtablestmt =
-        "CREATE TABLE IF NOT EXISTS " <> tbl tablename <> " \
-                \ (rowkey TEXT\
-                \, txid UNSIGNED BIGINT NOT NULL\
-                \, rowdata BLOB NOT NULL\
-                \, UNIQUE (rowkey, txid));"
-    indexcreationstmt =
-        "CREATE INDEX IF NOT EXISTS " <> tbl ixName <> " ON " <> tbl tablename <> "(txid DESC);"
+    prepRow (SQLiteRowDelta _ txid rowkey rowdata) = (rowkey, txid, rowdata)
