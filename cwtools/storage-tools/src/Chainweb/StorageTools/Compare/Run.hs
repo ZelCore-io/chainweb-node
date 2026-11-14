@@ -27,6 +27,8 @@ module Chainweb.StorageTools.Compare.Run
 , runCompare
 , RunOptions(..)
 , defaultRunOptions
+, runOptionsParser
+, positiveSeconds
 , runCompareWith
 , runCompareClasses
 , tipProbe
@@ -65,6 +67,8 @@ import Network.HTTP.Types (Header, Method, hAccept, hContentType, methodGet, met
 import Pact.Core.Hash (hash, hashToText)
 
 import Servant.Client (baseUrlHost, parseBaseUrl)
+
+import qualified Options.Applicative as O
 
 import System.Clock (Clock(Realtime), TimeSpec(..), getTime)
 
@@ -172,6 +176,29 @@ defaultRunOptions = RunOptions
     , _roOracleLocalTimeout = 30_000_000
     , _roProbeAttempts = 3
     }
+
+-- | @--oracle-local-timeout SECONDS@ (1 to 3600, default 30) on top of
+-- 'defaultRunOptions'. It lives here, not in @cw-compare@'s @Main@, so that a
+-- test can pin both the bounds and that the value reaches
+-- '_roOracleLocalTimeout' (N3 of the P0-B re-review).
+--
+runOptionsParser :: O.Parser RunOptions
+runOptionsParser = withTimeout <$> O.option (O.eitherReader positiveSeconds)
+    ( O.long "oracle-local-timeout"
+    <> O.metavar "SECONDS"
+    <> O.value 30
+    <> O.showDefault
+    <> O.help "how long a /local on the oracle (tip probes included) waits for its answer. A request without an answer is never sent again: it is skipped as no-oracle-answer"
+    )
+  where
+    withTimeout s = defaultRunOptions { _roOracleLocalTimeout = 1_000_000 * s }
+
+-- | A number of seconds from 1 to 3600.
+--
+positiveSeconds :: String -> Either String Int
+positiveSeconds s = case reads s of
+    [(n, "")] | n > 0, n <= 3_600 -> Right n
+    _ -> Left $ "expected a number of seconds from 1 to 3600: " <> s
 
 -- | @depthFor tip target@: the rewind depth of the target below the tip, or
 -- 'Nothing' if the target is above the tip.

@@ -94,6 +94,7 @@ tests = testGroup "Requests"
     , testCase "generation skips are reported per kind" skipKinds
     , testCase "spv: a target chain outside the coverage at the target height + 3 is NotCovered" spvTargetCoverage
     , testCase "--allow-reads-in-local takes a required true|false" allowReadsOption
+    , testCase "--oracle-local-timeout takes 1 to 3600 seconds and reaches the run options" oracleLocalTimeoutOption
     , testCase "an oracle lookup whose connection closes without an answer is sent once, never again" lookupNotResent
     , testCase "a custom Pact set fails closed: a cont entry needs a step; a live entry needs a bound, step 0, no scan" customPactSet
     , testCase "a request file holds only the read requests of the 7 classes, pinned ones with {rewindDepth} and a target" requestFileAllowlist
@@ -664,6 +665,22 @@ spvTargetCoverage = do
     preJudge (cov [c0, (cid1, [(0, 1_000)])]) (spvTo "1") @?= Nothing
     preJudge (cov [c0, (cid1, [(0, 302)])]) (spvTo "1") @?= Just (Skipped NotCovered)
     preJudge (cov [c0]) (spvTo "0") @?= Nothing
+
+-- | @--oracle-local-timeout@ takes 1 to 3600 seconds, defaults to 30, and
+-- reaches the 'RunOptions' that the run uses (N3 of the P0-B re-review).
+--
+oracleLocalTimeoutOption :: Assertion
+oracleLocalTimeoutOption = do
+    let parse args = case O.execParserPure O.defaultPrefs (O.info runOptionsParser mempty) args of
+            O.Success x -> Just (_roOracleLocalTimeout x)
+            _ -> Nothing
+    parse ["--oracle-local-timeout", "0"] @?= Nothing
+    parse ["--oracle-local-timeout", "3601"] @?= Nothing
+    parse ["--oracle-local-timeout", "-1"] @?= Nothing
+    parse ["--oracle-local-timeout", "ten"] @?= Nothing
+    parse ["--oracle-local-timeout", "1"] @?= Just 1_000_000
+    parse ["--oracle-local-timeout", "3600"] @?= Just 3_600_000_000
+    parse [] @?= Just (_roOracleLocalTimeout defaultRunOptions)
 
 allowReadsOption :: Assertion
 allowReadsOption = do
