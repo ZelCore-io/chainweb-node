@@ -332,7 +332,7 @@ node conf logger = do
     let compression = _configPayloadCompression cwConf
     when (compression /= PayloadSnappy) $
         logFunctionText logger Info $ "RocksDB compression: " <> toText compression
-    withRocksDb' rocksDbDir modernDefaultOptions (payloadCompressionTuning compression) $ \rocksDb -> do
+    withRocksDb' rocksDbDir modernDefaultOptions (chainwebRocksDbTuning cwConf) $ \rocksDb -> do
         logFunctionText logger Info $ "opened rocksdb in directory " <> sshow rocksDbDir
         logFunctionText logger Debug $ "backup config: " <> sshow (_configBackup cwConf)
         withChainweb cwConf logger rocksDb pactDbDir dbBackupsDir (_nodeConfigResetChainDbs conf) $ \case

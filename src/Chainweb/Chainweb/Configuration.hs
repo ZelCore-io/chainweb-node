@@ -81,6 +81,8 @@ module Chainweb.Chainweb.Configuration
 , configEnableLocalTimeout
 , defaultChainwebConfiguration
 , pChainwebConfiguration
+, chainwebPayloadDbConfig
+, chainwebRocksDbTuning
 , validateChainwebConfiguration
 , boolValueReader
 
@@ -122,6 +124,7 @@ import Chainweb.Mempool.P2pConfig
 import Chainweb.Miner.Config
 import Chainweb.Pact.Types (defaultReorgLimit, defaultModuleCacheLimit, defaultPreInsertCheckTimeout)
 import Chainweb.Pact.Types (RewindLimit(..))
+import Chainweb.Payload.PayloadStore (PayloadDbConfig(..), StoreMerkleTrees(..))
 import Chainweb.Payload.RestAPI (PayloadBatchLimit(..), defaultServicePayloadBatchLimit)
 import Chainweb.Storage.Table.RocksDB.Tuning (RocksDbTuning, defaultTuning, payloadZstdTuning)
 import Chainweb.Utils
@@ -512,6 +515,25 @@ validateBackupConfig c =
         perms <- liftIO (getPermissions dir)
         unless (writable perms) $
             throwError $ "Backup directory " <> T.pack dir <> " is not writable"
+
+-- | The configuration of the node's payload store: Merkle trees are stored
+-- unless @--store-merkle-trees false@. With the defaults it is
+-- 'defaultPayloadDbConfig', the payload store of chainweb-node 3.2.1.
+--
+chainwebPayloadDbConfig :: ChainwebConfiguration -> PayloadDbConfig
+chainwebPayloadDbConfig conf = PayloadDbConfig
+    { _payloadDbConfigStoreTrees = if _configStoreMerkleTrees conf
+        then StoreMerkleTrees
+        else DoNotStoreMerkleTrees
+    }
+
+-- | The tuning with which the node opens its RocksDB database:
+-- 'payloadCompressionTuning' of @--payload-compression@. With the defaults it
+-- is 'defaultTuning', which leaves the options of chainweb-node 3.2.1
+-- unchanged.
+--
+chainwebRocksDbTuning :: ChainwebConfiguration -> RocksDbTuning
+chainwebRocksDbTuning = payloadCompressionTuning . _configPayloadCompression
 
 defaultChainwebConfiguration :: ChainwebVersion -> ChainwebConfiguration
 defaultChainwebConfiguration v = ChainwebConfiguration

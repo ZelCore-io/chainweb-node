@@ -459,14 +459,7 @@ withChainwebInternal conf logger peer serviceSock rocksDb pactDbDir backupDir re
     cidsList = toList cids
 
     payloadDb :: PayloadDb RocksDbTable
-    payloadDb = newPayloadDbWith payloadStoreConfig rocksDb
-
-    payloadStoreConfig :: PayloadDbConfig
-    payloadStoreConfig = PayloadDbConfig
-        { _payloadDbConfigStoreTrees = if _configStoreMerkleTrees conf
-            then StoreMerkleTrees
-            else DoNotStoreMerkleTrees
-        }
+    payloadDb = newPayloadDbWith (chainwebPayloadDbConfig conf) rocksDb
 
     chainLogger :: ChainId -> logger
     chainLogger cid = addLabel ("chain", toText cid) logger

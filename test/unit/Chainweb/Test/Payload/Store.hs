@@ -85,6 +85,8 @@ tests = testGroup "Payload store"
         mixedFilesTest
     , testCase "--payload-compression parses snappy and zstd-dict; any other value fails naming both"
         payloadCompressionOptionTest
+    , testCase "node wiring: chainwebPayloadDbConfig and chainwebRocksDbTuning follow --store-merkle-trees and --payload-compression (defaults, CLI, JSON); the defaults are 3.2.1's"
+        nodeWiringTest
     , testCase "compact with --store-merkle-trees false leaves no tree entries" compactNoTreesTest
     ]
 
@@ -318,6 +320,39 @@ payloadCompressionOptionTest = do
     forM_ [minBound .. maxBound] $ \c -> do
         let cfg = def { _configPayloadCompression = c }
         (_configPayloadCompression <$> eitherDecode (encode cfg)) @?= Right c
+
+-- | The configuration that the node opens its database and its payload store
+-- with ('chainwebRocksDbTuning', 'chainwebPayloadDbConfig'), from the
+-- defaults, the command line and JSON. The defaults are chainweb-node
+-- 3.2.1's.
+--
+nodeWiringTest :: Assertion
+nodeWiringTest = do
+    let def = defaultChainwebConfiguration Mainnet01
+        trees = _payloadDbConfigStoreTrees . chainwebPayloadDbConfig
+        tuning = chainwebRocksDbTuning
+    -- defaults: 3.2.1
+    trees def @?= StoreMerkleTrees
+    assertBool "default payload store config" (chainwebPayloadDbConfig def == defaultPayloadDbConfig)
+    assertBool "default tuning is defaultTuning" (tuning def == defaultTuning)
+    -- each option alone, and both
+    trees def { _configStoreMerkleTrees = False } @?= DoNotStoreMerkleTrees
+    assertBool "trees off leaves the tuning" (tuning def { _configStoreMerkleTrees = False } == defaultTuning)
+    assertBool "zstd-dict tuning" (tuning def { _configPayloadCompression = PayloadZstdDict } == payloadZstdTuning)
+    trees def { _configPayloadCompression = PayloadZstdDict } @?= StoreMerkleTrees
+    -- from the command line
+    case ($ def) <$> parseArgs ["--store-merkle-trees", "false", "--payload-compression", "zstd-dict"] of
+        Nothing -> assertFailure "the options do not parse"
+        Just c -> do
+            trees c @?= DoNotStoreMerkleTrees
+            assertBool "zstd-dict from the command line" (tuning c == payloadZstdTuning)
+    -- from JSON
+    let cfg = def { _configStoreMerkleTrees = False, _configPayloadCompression = PayloadZstdDict }
+    case eitherDecode (encode cfg) of
+        Left e -> assertFailure e
+        Right c -> do
+            trees c @?= DoNotStoreMerkleTrees
+            assertBool "zstd-dict from JSON" (tuning (c `asTypeOf` cfg) == payloadZstdTuning)
 
 -- -------------------------------------------------------------------------- --
 -- Merkle trees in a RocksDB that the compact tool wrote
