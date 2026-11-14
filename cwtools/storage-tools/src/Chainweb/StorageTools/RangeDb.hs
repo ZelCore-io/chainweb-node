@@ -167,6 +167,13 @@ allNamespaces v = payloadNamespaces <> headerNamespaces v
 sortedChains :: ChainwebVersion -> [ChainId]
 sortedChains = sortOn (chainIdInt @Int) . toList . chainIds
 
+-- | The chains that exist at the height, that is those with a genesis height
+-- of at most the height, in chain order. On mainnet, chains 10 to 19 start at
+-- height 852,054.
+--
+chainsAtHeight :: ChainwebVersion -> BlockHeight -> [ChainId]
+chainsAtHeight v h = [c | c <- sortedChains v, genesisBlockHeight v c <= h]
+
 -- | A table without codecs, for the table with the given namespace, for
 -- instance @"BlockHeader/3/header"@. Keys and values are the stored bytes.
 --
@@ -245,6 +252,11 @@ withRangeDbWriting o path act =
 -- are included, so that a node that syncs only the Pact state never meets a
 -- missing payload.
 --
+-- Only the chains that exist at the height are included, that is the chains
+-- whose genesis height is at most the height (on mainnet, chains 10 to 19
+-- start at height 852,054). The cut has just those chains, like the cut of
+-- the network at that height.
+--
 newtype RangeSpec = RangeSpec { _rsMaxHeight :: BlockHeight }
     deriving (Show, Eq)
 
@@ -272,9 +284,10 @@ data RangeSummary = RangeSummary
 -- payload that the service returned does not hash to the key that was
 -- requested.
 --
--- The cut holds the canonical header at the height of each chain, that is the
--- ancestor at that height of the tip of the cut that the service reports (see
--- 'canonicalTips'). Orphan headers and their payloads, at that height and
+-- The cut holds the canonical header at the height of each chain that exists
+-- at the height, that is the ancestor at that height of the tip of the cut
+-- that the service reports (see 'canonicalTips'). Chains that start above the
+-- height have no headers, payloads, or cut entry. Orphan headers and their payloads, at that height and
 -- below, are copied like all others.
 --
 buildRangeDb :: Logger l => l -> PayloadDbConfig -> ServiceApi -> RangeSpec -> RocksDb -> IO RangeSummary
@@ -290,7 +303,7 @@ buildRangeDbWith l cfg api getSrcCut (RangeSpec maxHeight) rdb = do
     let pdb = newPayloadDbWith cfg rdb
     nHeaders <- newIORef (0 :: Int)
     nPayloads <- newIORef (0 :: Int)
-    forM_ (sortedChains v) $ \cid -> do
+    forM_ (chainsAtHeight v maxHeight) $ \cid -> do
         logg Info $ "chain " <> sshow cid <> ": copying headers and payloads up to height " <> sshow maxHeight
         bdb <- getWebBlockHeaderDb wdb cid
         pending <- newIORef []
@@ -329,11 +342,16 @@ buildRangeDbWith l cfg api getSrcCut (RangeSpec maxHeight) rdb = do
 -- limit of the cut endpoint is a cut height, which is only approximately a
 -- block height, and is not used.)
 --
--- Fails if a chain is not in the cut, if the tip of a chain is below the
--- height, or if the service has no ancestor of the tip at the height.
+-- Only the chains that exist at the height are included, that is the chains
+-- with a genesis height of at most the height (see 'chainsAtHeight'). Chains
+-- that start above the height are not looked up in the cut.
+--
+-- Fails if a chain that exists at the height is not in the cut, if the tip of
+-- such a chain is below the height, or if the service has no ancestor of the
+-- tip at the height.
 --
 canonicalTips :: ServiceApi -> CutHashes -> BlockHeight -> IO [(ChainId, BlockHeader)]
-canonicalTips api srcCut h = forM (sortedChains v) $ \cid -> do
+canonicalTips api srcCut h = forM (chainsAtHeight v h) $ \cid -> do
     let failWith :: String -> IO a
         failWith msg = throwIO $ userError $ "chain " <> show cid <> " " <> msg
     BlockHashWithHeight tipHeight tipHash <- case HM.lookup cid (_cutHashes srcCut) of
@@ -364,7 +382,7 @@ sampleTargets v seed count maxHeight
     | toInteger count >= total = allSlots
     | otherwise = draw S.empty [] (mkStdGen (fromIntegral seed)) count
   where
-    chains = [c | c <- sortedChains v, genesisBlockHeight v c <= maxHeight]
+    chains = chainsAtHeight v maxHeight
     nChains = length chains
     slotsOf c = int maxHeight - int (genesisBlockHeight v c) + 1 :: Integer
     total = sum $ slotsOf <$> chains
