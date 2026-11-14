@@ -202,7 +202,9 @@ allowedRequest prefix r = do
 -- | A @/local@ body is a command, which runs Pact code on the oracle. Like a
 -- generated one it must run at most what the generator sends (N1 of the P0-B
 -- re-review): a @cont@ at step 0 only (the step check fails before any code
--- of the defpact runs); exec code that 'codeProblems' accepts, as for a live
+-- of the defpact runs), and not a rollback (@rollback@ absent or @false@, as
+-- the generator writes it; a rollback would run the step's rollback code);
+-- exec code that 'codeProblems' accepts, as for a live
 -- entry of a Pact set; a @gasLimit@ at most the generator's, 'historyGasLimit'
 -- for History and 'localGasLimit' otherwise. A body that is not a command
 -- with one of the two payloads is refused too.
@@ -212,7 +214,8 @@ localCommandProblem cls body = do
     (code, step, gas) <- either (const (Left "the body is not a command with an exec or cont payload and a gasLimit")) Right $
         parseEither parseCommand =<< maybe (Left "cmd") Right (decodeStrict body)
     unless' (isJust code || isJust step) "the body is not a command with an exec or cont payload and a gasLimit"
-    unless' (maybe True (== 0) step) "a cont payload at a step other than 0"
+    unless' (maybe True ((== 0) . fst) step) "a cont payload at a step other than 0"
+    unless' (maybe True ((/= Just True) . snd) step) "a cont payload with rollback: true"
     case concatMap codeProblems code of
         [] -> Right ()
         ps -> Left (T.intercalate "; " ps)
@@ -221,7 +224,7 @@ localCommandProblem cls body = do
     cap = if cls == ClsHistory then historyGasLimit else localGasLimit
     unless' ok e = if ok then Right () else Left e
 
-    parseCommand :: Value -> Parser (Maybe T.Text, Maybe Integer, Integer)
+    parseCommand :: Value -> Parser (Maybe T.Text, Maybe (Integer, Maybe Bool), Integer)
     parseCommand = withObject "command" $ \c -> do
         cmd <- c .: "cmd"
         o <- either fail return (eitherDecodeStrict' (T.encodeUtf8 cmd))
@@ -231,7 +234,7 @@ localCommandProblem cls body = do
                 ex <- x .:? "exec"
                 ct <- x .:? "cont"
                 (,) <$> traverse (withObject "exec" (.: "code")) ex
-                    <*> traverse (withObject "cont" (.: "step")) ct
+                    <*> traverse (withObject "cont" $ \co -> (,) <$> co .: "step" <*> co .:? "rollback") ct
             gas <- po .: "meta" >>= withObject "meta" (.: "gasLimit")
             return (code, step, gas)
 

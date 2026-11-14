@@ -271,10 +271,12 @@ isGatewayFailure s = s == 502 || s == 504
 -- microseconds, and every request on a connection of its own. A pooled
 -- connection that the server closed while idle looks like a request without
 -- an answer, and http-client would send such a request again on its own; a
--- connection that is never reused rules both out.
+-- connection that is never reused rules both out. It is made with
+-- 'HTTP.newManager': 'HTTP.newTlsManagerWith' would replace
+-- @managerRetryableException@ with http-client-tls's own.
 --
 newCompareManager :: Int -> IO HTTP.Manager
-newCompareManager timeout = HTTP.newTlsManagerWith HTTP.tlsManagerSettings
+newCompareManager timeout = HTTP.newManager HTTP.tlsManagerSettings
     { HTTP.managerResponseTimeout = HTTP.responseTimeoutMicro timeout
     , HTTP.managerIdleConnectionCount = 0
     , HTTP.managerRetryableException = const False

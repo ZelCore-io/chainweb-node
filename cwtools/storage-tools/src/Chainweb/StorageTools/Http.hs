@@ -160,11 +160,19 @@ data ServiceApi = ServiceApi
 -- | A service API with a TLS capable connection manager. Every request is
 -- throttled by the limiter.
 --
+-- The manager never sends a request again by itself
+-- (@managerRetryableException@): by default http-client resends a request
+-- once when a pooled connection fails, which the server may have received.
+-- Such a failure is final here, as 'retriableClientError' rules. The manager
+-- is made with 'HTTP.newManager': 'HTTP.newTlsManagerWith' would replace
+-- @managerRetryableException@ with http-client-tls's own.
+--
 newServiceApi :: T.Text -> ChainwebVersion -> Limiter -> IO ServiceApi
 newServiceApi url v lim = do
     _ <- parseBaseUrl (T.unpack url)
-    mgr <- HTTP.newTlsManagerWith HTTP.tlsManagerSettings
+    mgr <- HTTP.newManager HTTP.tlsManagerSettings
         { HTTP.managerResponseTimeout = HTTP.responseTimeoutMicro 120_000_000
+        , HTTP.managerRetryableException = const False
         }
     return $ ServiceApi url v mgr lim
 

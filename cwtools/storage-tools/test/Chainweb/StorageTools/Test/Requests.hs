@@ -98,6 +98,7 @@ tests = testGroup "Requests"
     , testCase "--allow-reads-in-local takes a required true|false" allowReadsOption
     , testCase "--oracle-local-timeout takes 1 to 3600 seconds and reaches the run options" oracleLocalTimeoutOption
     , testCase "an oracle lookup is sent once after a status other than 429 or 503, a closed connection or a response timeout; 429, 503, 200 arrive 3 times" lookupNotResent
+    , testCase "an oracle lookup through oracleServiceApi on a reused connection that the server closes without an answer arrives once" lookupNotResentOnReusedConnection
     , testCase "a custom Pact set fails closed: a cont entry needs a step; a live entry needs a bound, step 0, no scan" customPactSet
     , testCase "a request file holds only the read requests of the 7 classes, pinned ones with {rewindDepth} and a target" requestFileAllowlist
     , testCase "a class whose every compared answer is the same non-2xx is at best PartialPass" sameNon2xxOnly
@@ -752,6 +753,30 @@ lookupNotResent = do
                 n <- readIORef arrivals
                 assertEqual (name <> ": arrivals") expected n
 
+-- | P0-C review M3: the manager of 'oracleServiceApi' does not resend. The
+-- first lookup leaves its connection in the pool; the server closes it
+-- without an answer to the second lookup, which http-client's default
+-- settings would send again on a new connection.
+--
+lookupNotResentOnReusedConnection :: Assertion
+lookupNotResentOnReusedConnection = do
+    arrivals <- newIORef (0 :: Int)
+    let app req respond = do
+            _ <- strictRequestBody req
+            n <- atomicModifyIORef' arrivals (\k -> (k + 1, k + 1))
+            if n == 1
+                then respond (responseLBS status200 [] "")
+                else respond $ responseRaw (\_ _ -> return ()) (responseLBS status500 [] "no raw")
+    testWithApplication (return app) $ \port -> do
+        hl <- newHostLimiters 1_000 Nothing
+        api <- oracleServiceApi hl mainnet ("http://127.0.0.1:" <> tshow port)
+        _ <- try @SomeException (gen api 1 ClsHeader 10)
+        readIORef arrivals >>= assertEqual "the first lookup arrives" 1
+        r <- try @SomeException (gen api 1 ClsHeader 10)
+        assertBool "the second lookup fails" (either (const True) (const False) r)
+        n2 <- readIORef arrivals
+        assertEqual ("the second lookup arrives once: " <> show r) 2 n2
+
 -- | Loads a Pact set from YAML text through a file, as @--pact-set@ does.
 --
 loadText :: B.ByteString -> IO (Either SomeException PactSet)
@@ -849,6 +874,15 @@ requestFileAllowlist = do
         meta = defaultLocalMeta
     refusedFor "a cont at step 1" "step other than 0" $
         withBody (localCommandWith mainnet cid0 meta (LocalCont "some-pact-id" 1) 1)
+    -- P0-C review M1: a rollback at step 0 runs the step's rollback code
+    let contAt0 = localCommandWith mainnet cid0 meta (LocalCont "some-pact-id" 0) 1
+        rollbackFalse = "\\\"rollback\\\":false"
+        (rbBefore, rbAfter) = B8.breakSubstring rollbackFalse contAt0
+        rollbackTrue = rbBefore <> "\\\"rollback\\\":true" <> B8.drop (B8.length rollbackFalse) rbAfter
+    assertBool ("the generator writes rollback false: " <> B8.unpack contAt0) (not (B8.null rbAfter))
+    refusedFor "a cont at step 0 with rollback true" "rollback: true" $ withBody rollbackTrue
+    refusedFor "a cont whose rollback is not a boolean" "not a command" $
+        withBody (rbBefore <> "\\\"rollback\\\":\\\"true\\\"" <> B8.drop (B8.length rollbackFalse) rbAfter)
     refusedFor "txids in an exec" "table scan" $
         withBody (localCommand mainnet cid0 "(txids coin.coin-table 0)" 1)
     refusedFor "keys on a large table in an exec" "coin.allocation-table" $
