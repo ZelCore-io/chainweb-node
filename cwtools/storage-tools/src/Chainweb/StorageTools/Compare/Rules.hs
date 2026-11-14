@@ -59,6 +59,7 @@ import qualified Data.ByteString.Char8 as B8
 import Data.Char (isAsciiLower, isAsciiUpper, isDigit)
 import Data.Maybe (isJust, isNothing)
 import qualified Data.Text as T
+import qualified Data.Text.Encoding as T
 import Data.MerkleLog (MerkleProof(..))
 
 -- internal modules
@@ -69,6 +70,7 @@ import Chainweb.MerkleUniverse (ChainwebMerkleHashAlgorithm)
 import Chainweb.Payload (BlockPayloadHash)
 import Chainweb.SPV (TransactionOutputProof(..))
 import Chainweb.SPV.VerifyProof (runTransactionOutputProof)
+import Chainweb.StorageTools.Compare.PactSet (codeProblems)
 import Chainweb.StorageTools.Compare.Types
 import Chainweb.Utils (decodeB64UrlNoPaddingText, fromText, toText)
 
@@ -133,7 +135,11 @@ allowedRequest prefix r = do
     unless' (length params == length (dedup (map fst params))) "a query parameter twice"
     case method of
         "GET" -> unless' (isNothing (_reqBody r)) "a GET with a body"
-        _ -> unless' (isJust (_reqBody r)) "a POST without a body"
+        _ -> case _reqBody r of
+            Nothing -> Left "a POST without a body"
+            Just body
+                | isLocalPath segs -> localCommandProblem (_reqClass r) body
+                | otherwise -> Right ()
     mapM_ (checkValue params) keys
   where
     cls = _reqClass r
@@ -149,6 +155,10 @@ allowedRequest prefix r = do
     param t = case T.splitOn "=" t of
         [k, v] -> Right (k, v)
         _ -> Left ("a query parameter that is not key=value: " <> t)
+
+    isLocalPath = \case
+        ("chain" : _ : xs) -> xs == ["pact", "api", "v1", "local"]
+        _ -> False
 
     pinned = [ClsLocal, ClsHistory, ClsPreflight]
     heights = ["minheight", "maxheight", "limit"]
@@ -188,6 +198,42 @@ allowedRequest prefix r = do
             | k == "rewindDepth", cls `elem` pinned, isNothing (_reqTarget r) ->
                 Left "a pinned request needs a target height"
             | otherwise -> Right ()
+
+-- | A @/local@ body is a command, which runs Pact code on the oracle. Like a
+-- generated one it must run at most what the generator sends (N1 of the P0-B
+-- re-review): a @cont@ at step 0 only (the step check fails before any code
+-- of the defpact runs); exec code that 'codeProblems' accepts, as for a live
+-- entry of a Pact set; a @gasLimit@ at most the generator's, 'historyGasLimit'
+-- for History and 'localGasLimit' otherwise. A body that is not a command
+-- with one of the two payloads is refused too.
+--
+localCommandProblem :: RequestClass -> B.ByteString -> Either T.Text ()
+localCommandProblem cls body = do
+    (code, step, gas) <- either (const (Left "the body is not a command with an exec or cont payload and a gasLimit")) Right $
+        parseEither parseCommand =<< maybe (Left "cmd") Right (decodeStrict body)
+    unless' (isJust code || isJust step) "the body is not a command with an exec or cont payload and a gasLimit"
+    unless' (maybe True (== 0) step) "a cont payload at a step other than 0"
+    case concatMap codeProblems code of
+        [] -> Right ()
+        ps -> Left (T.intercalate "; " ps)
+    unless' (gas <= fromIntegral cap) ("a gasLimit of " <> T.pack (show gas) <> ", above " <> T.pack (show cap))
+  where
+    cap = if cls == ClsHistory then historyGasLimit else localGasLimit
+    unless' ok e = if ok then Right () else Left e
+
+    parseCommand :: Value -> Parser (Maybe T.Text, Maybe Integer, Integer)
+    parseCommand = withObject "command" $ \c -> do
+        cmd <- c .: "cmd"
+        o <- either fail return (eitherDecodeStrict' (T.encodeUtf8 cmd))
+        flip (withObject "payload") o $ \po -> do
+            pl <- po .: "payload"
+            (code, step) <- flip (withObject "payload") pl $ \x -> do
+                ex <- x .:? "exec"
+                ct <- x .:? "cont"
+                (,) <$> traverse (withObject "exec" (.: "code")) ex
+                    <*> traverse (withObject "cont" (.: "step")) ct
+            gas <- po .: "meta" >>= withObject "meta" (.: "gasLimit")
+            return (code, step, gas)
 
 -- | The requests of a request file: one JSON request per line, blank lines
 -- skipped. Fails at the first line that does not decode, or whose request

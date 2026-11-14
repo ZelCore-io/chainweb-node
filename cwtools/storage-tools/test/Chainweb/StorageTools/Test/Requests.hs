@@ -22,6 +22,7 @@ import Data.Aeson
 import qualified Data.Aeson.Key as K
 import qualified Data.Aeson.KeyMap as KM
 import Data.Aeson.Types (parseMaybe)
+import Data.Either (isLeft)
 import Data.Bits (xor)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as B8
@@ -756,10 +757,18 @@ requestFileAllowlist = do
     let v = apiPrefix mainnet
     withOracle $ \_ _ api _ -> forM_ [1 .. 40] $ \s -> forM_ allRequestClasses $ \c -> do
         let h = if c == ClsHistory then 300 else 1 + (s * 37) `mod` 900
-        rs <- sequence [gen api s c h, genSnap api s c h]
-        forM_ rs $ \r -> allowedRequest v r @?= Right ()
+        live <- gen api s c h
+        snap <- genSnap api s c h
+        allowedRequest v live @?= Right ()
+        -- a request of a same-snapshot run holds a scan only in an entry that
+        -- is sameSnapshotOnly; a request file is never a same-snapshot run
+        let scans = maybe False (`elem` map _peName (filter _peSameSnapshotOnly (_pactEntries defaultPactSet)))
+                (_reqEntry snap)
+        if scans
+            then assertBool "a same-snapshot scan is refused" (isLeft (allowedRequest v snap))
+            else allowedRequest v snap @?= Right ()
     let local = Request ClsLocal cid0 (Just 300) methodPost
-            (prefix <> "/pact/api/v1/local?rewindDepth=" <> depthPlaceholder) (Just "{}") Nothing
+            (prefix <> "/pact/api/v1/local?rewindDepth=" <> depthPlaceholder) (Just (localCommand mainnet cid0 "(+ 1 2)" 1)) Nothing
         payload = Request ClsPayload cid0 (Just 300) methodGet (prefix <> "/payload/P300") Nothing Nothing
         file r = BL.toStrict (encode local) <> "\n\n" <> BL.toStrict (encode r) <> "\n"
         refused what r = case parseRequestFile v (file r) of
@@ -776,6 +785,32 @@ requestFileAllowlist = do
     refused "a payload path in the class local" $ payload { _reqClass = ClsLocal }
     refused "a GET with a body" $ payload { _reqBody = Just "{}" }
     refused "a POST /local without a body" $ local { _reqBody = Nothing }
+    -- N1: the body of a /local is a command that runs what the generator runs
+    let withBody b = local { _reqBody = Just b }
+        history b = (withBody b) { _reqClass = ClsHistory }
+        refusedFor what needle r = case parseRequestFile v (file r) of
+            Left e -> assertBool (what <> ": " <> e) ("3: not allowed: " `isInfixOf` e && needle `isInfixOf` e)
+            Right _ -> assertFailure (what <> ": allowed")
+        meta = defaultLocalMeta
+    refusedFor "a cont at step 1" "step other than 0" $
+        withBody (localCommandWith mainnet cid0 meta (LocalCont "some-pact-id" 1) 1)
+    refusedFor "txids in an exec" "table scan" $
+        withBody (localCommand mainnet cid0 "(txids coin.coin-table 0)" 1)
+    refusedFor "keys on a large table in an exec" "coin.allocation-table" $
+        withBody (localCommand mainnet cid0 "(keys coin.coin-table)" 1)
+    refusedFor "a gasLimit above the generator's" "gasLimit" $
+        withBody (localCommandWith mainnet cid0 meta { _lmGasLimit = localGasLimit + 1 } (LocalExec "(+ 1 2)") 1)
+    refusedFor "a History gasLimit above historyGasLimit" "gasLimit" $
+        history (localCommandWith mainnet cid0 meta { _lmGasLimit = historyGasLimit + 1 } (LocalExec "(+ 1 2)") 1)
+    refusedFor "a body that is not a command" "not a command" $ withBody "{}"
+    -- what the generator writes loads unchanged: a cont at step 0, keys on
+    -- coin.allocation-table, a History command at historyGasLimit
+    let fine = [ withBody (localCommandWith mainnet cid0 meta (LocalCont "some-pact-id" 0) 1)
+               , withBody (localCommand mainnet cid0 "(keys coin.allocation-table)" 1)
+               , withBody (localCommand mainnet cid0 "(length (keys coin.allocation-table))" 2)
+               , history (localCommandWith mainnet cid0 meta { _lmGasLimit = historyGasLimit } (LocalExec "(txlog coin.coin-table 1)") 1)
+               ]
+    parseRequestFile v (B8.unlines (map (BL.toStrict . encode) fine)) @?= Right fine
     refused "an unknown query parameter" $ payload { _reqPath = prefix <> "/payload/P300?foo=1" }
     refused "a height that is not a number" $ payload { _reqPath = prefix <> "/payload/P300?height=1;2" }
     refused "preflight=true in the class local" $

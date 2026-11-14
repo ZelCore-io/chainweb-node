@@ -22,6 +22,7 @@ module Chainweb.StorageTools.Compare.PactSet
 , decodePactSet
 , loadPactSet
 , pactSetProblems
+, codeProblems
 , liveEntries
 , entriesFor
 , generatedEntries
@@ -162,20 +163,31 @@ pactSetProblems s = concatMap problems (_pactEntries s)
         , [ "no \"Bound:\" in its why; an entry without a known bound needs sameSnapshotOnly: true"
           | live e, not ("Bound:" `T.isInfixOf` _peWhy e)
           ]
-        , [ "the code calls " <> f <> ", a table scan; it needs sameSnapshotOnly: true"
-          | live e, f <- ["txids", "keylog", "select", "fold-db"], calls f (_peCode e)
-          ]
-        , [ "the code calls keys on a table other than coin.allocation-table; it needs sameSnapshotOnly: true"
-          | live e
-          , any (not . ("coin.allocation-table)" `T.isPrefixOf`)) (drop 1 (T.splitOn "(keys " (normal (_peCode e))))
+        , [ p <> "; it needs sameSnapshotOnly: true"
+          | live e, p <- codeProblems (_peCode e)
           ]
         ]
     live = not . _peSameSnapshotOnly
-    calls f code = ("(" <> f <> " ") `T.isInfixOf` normal code
 
+-- | Why Pact code must not be sent to a live production oracle, one text per
+-- problem; empty if it may. The code part of 'pactSetProblems', shared with
+-- the request files of @cw-compare@: no table scan (@txids@, @keylog@,
+-- @select@, @fold-db@), and @keys@ only on the small
+-- @coin.allocation-table@.
+--
+codeProblems :: T.Text -> [T.Text]
+codeProblems code = concat
+    [ [ "the code calls " <> f <> ", a table scan"
+      | f <- ["txids", "keylog", "select", "fold-db"], ("(" <> f <> " ") `T.isInfixOf` n
+      ]
+    , [ "the code calls keys on a table other than coin.allocation-table"
+      | any (not . ("coin.allocation-table)" `T.isPrefixOf`)) (drop 1 (T.splitOn "(keys " n))
+      ]
+    ]
+  where
     -- whitespace collapsed to single spaces, none right after an opening
     -- parenthesis
-    normal = T.replace "( " "(" . T.unwords . T.words
+    n = T.replace "( " "(" (T.unwords (T.words code))
 
 -- | The entries of a set that may be sent to a live production oracle: those
 -- not marked 'sameSnapshotOnly'.

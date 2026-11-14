@@ -23,6 +23,8 @@ module Chainweb.StorageTools.Compare.Types
 , isPactClass
 , Request(..)
 , depthPlaceholder
+, localGasLimit
+, historyGasLimit
 , hasDepthPlaceholder
 , fillDepth
 
@@ -155,6 +157,22 @@ data Request = Request
         -- successes of each entry. Never sent.
     }
     deriving (Show, Eq)
+
+-- | The gas limit of every @/local@ command of the generator but History.
+-- Moved here from "Chainweb.StorageTools.Compare.Requests" so that the request
+-- file check can cap a body at it.
+--
+localGasLimit :: Int
+localGasLimit = 100000
+
+-- | The gas limit of a History command. Pact 4 charges 100,000 for each of
+-- @txids@, @txlog@ and @keylog@, so 'localGasLimit' always ends in a gas
+-- error (seen on a mainnet 3.2.1 node at a Pact 4 height). Plain @/local@ is
+-- not held to the block gas limit; preflight, which is, keeps
+-- 'localGasLimit'.
+--
+historyGasLimit :: Int
+historyGasLimit = 150000
 
 -- | The placeholder for the rewind depth in the path of a pinned request.
 --

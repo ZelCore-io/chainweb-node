@@ -132,18 +132,6 @@ defaultLocalMeta = LocalMeta "cw-compare" [] localCreationTime localGasLimit
 localCreationTime :: Int64
 localCreationTime = 1_600_000_000
 
-localGasLimit :: Int
-localGasLimit = 100_000
-
--- | The gas limit of a History command. Pact 4 charges 100,000 for each of
--- @txids@, @txlog@ and @keylog@, so 'localGasLimit' always ends in a gas
--- error (seen on a mainnet 3.2.1 node at a Pact 4 height). Plain @/local@ is
--- not held to the block gas limit; preflight, which is, keeps
--- 'localGasLimit'.
---
-historyGasLimit :: Int
-historyGasLimit = 150_000
-
 -- | One day, below Pact's maximum of two days.
 --
 localTtl :: Int
