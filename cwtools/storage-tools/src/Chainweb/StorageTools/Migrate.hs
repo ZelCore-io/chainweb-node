@@ -33,12 +33,16 @@
 -- does not rewrite such a file. Keys of a neighbouring namespace may
 -- therefore be rewritten as well, with the same compression.
 --
--- Before the work on a namespace, its check ('verifyNamespace') runs once: a
--- namespace that is already in the target state, for instance because the
--- compaction of an earlier namespace rewrote its files, is recorded as done
--- without a compaction. On a node's database, the files of the node's flushes
--- span almost every namespace, so the compaction of the first namespace of a
--- step rewrites most of the database. When the target is zstd-dict, run
+-- Before the work on a namespace, it is checked once: a tree namespace is in
+-- the target state if no live file overlaps it and it has no entries, a
+-- payload namespace if 'verifyNamespace' passes. A namespace that is already
+-- in the target state, for instance because the compaction of an earlier
+-- namespace rewrote its files, is recorded as done without a compaction; if
+-- the check fails, the namespace is compacted and then verified.
+--
+-- On a node's database, the files of the node's flushes span almost every
+-- namespace, so the compaction of the first namespace of a step rewrites most
+-- of the database. When the target is zstd-dict, run
 -- @trees --payload-compression zstd-dict@ first: that rewrite then writes
 -- zstd-dict, and @payloads@ finds most of its namespaces done.
 --
@@ -317,6 +321,11 @@ data MigrateOpts = MigrateOpts
         -- warns (see 'migrateTrees').
     , _moPauseFile :: !(Maybe FilePath)
         -- ^ no namespace is started while this file exists
+    , _moCompactAfterListing :: ![B.ByteString]
+        -- ^ test hook: for these namespaces, the live files that overlap the
+        -- namespace are compacted (a forced compaction of their key range)
+        -- after they were listed for the check before the work, and before
+        -- that check, as a background compaction can do.
     }
     deriving (Show, Eq)
 
@@ -331,6 +340,7 @@ defaultMigrateOpts = MigrateOpts
     , _moSkipCompaction = []
     , _moPayloadCompression = Nothing
     , _moPauseFile = Nothing
+    , _moCompactAfterListing = []
     }
 
 -- | The compression that @trees@ writes while no payload namespace is done:
@@ -626,9 +636,13 @@ migrate l db step opts = do
 
     migrateNamespace rdb ns = do
         -- the same check as after the compaction, so a namespace is still
-        -- done only once it is verified
+        -- done only once it is verified; for trees, no live file may overlap
+        -- the namespace either
         current <- filter (overlapsNamespace rdb ns) <$> liveFileRanges rdb
-        try (verifyNamespace rdb db step ns current) >>= \case
+        when (ns `elem` _moCompactAfterListing opts) $ do
+            logg Warn $ nsPrefix ns <> "test hook: the listed files are compacted before the check"
+            compactRawRangeForced rdb (compactionRange rdb ns current)
+        try (checkTargetState current) >>= \case
             Right () -> logg Info $ nsPrefix ns <> "already in the target state ("
                 <> targetState <> "), so it is not compacted"
             Left (CheckFailed _) -> do
@@ -639,6 +653,16 @@ migrate l db step opts = do
                     flushRocksDb rdb
                 compactAndVerify 1
       where
+        -- The check after the compaction alone is not enough for trees: with
+        -- the files listed now as the files before, it also passes if a
+        -- background compaction replaces every listed file between the
+        -- listing and the check while its output still overlaps the
+        -- namespace. A failure only means that the namespace is compacted.
+        checkTargetState current = do
+            when (step == MigrateTrees && not (null current)) $ throwIO $ CheckFailed $
+                sshow (length current) <> " live files overlap the namespace"
+            verifyNamespace rdb db step ns current
+
         targetState = case step of
             MigrateTrees -> "no entries, and no live file overlaps it"
             MigratePayloads -> "every live file that overlaps it is ZSTD with a dictionary"
@@ -883,7 +907,9 @@ backgroundErrors rdb = rocksDbProperty rdb "rocksdb.background-errors" >>= \case
 -- then repeated, up to five times.
 --
 -- The check also runs before the work on a namespace, with the live files
--- that overlap it then; if it passes, the namespace needs no work.
+-- that overlap it then; if it passes, the namespace needs no work. For
+-- @trees@, the check before the work first requires that no live file
+-- overlaps the namespace (see 'migrate').
 --
 verifyNamespace :: RocksDb -> FilePath -> MigrateStep -> B.ByteString -> [LiveFile] -> IO ()
 verifyNamespace rdb _ MigrateTrees ns before = do

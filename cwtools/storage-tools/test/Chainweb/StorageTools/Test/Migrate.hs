@@ -621,6 +621,46 @@ tests = testGroup "Migrate"
             assertEqual "progress after the rerun" (keysOf MigrateTrees treeNamespaces) done'
             assertTreeFilesGone "after the rerun" db treeNamespaces
 
+    , testCase "trees: a namespace whose range delete was flushed but not compacted, with a compaction that replaces its listed files before the check while a live file still overlaps it: compacted, not skipped" $
+        withMixedFixture $ \dir db -> do
+            let victim = "TransactionTree"
+            assertEqual "the victim is the first tree namespace" [victim] (take 1 treeNamespaces)
+            -- an earlier run stopped after the range delete and the flush of
+            -- the namespace, before its compaction
+            code <- runMigrate silent db MigrateTrees defaultMigrateOpts { _moSkipCompaction = [victim] }
+            assertEqual "exit code of the first run" (ExitFailure 1) code
+            done0 <- doneKeys db
+            assertEqual "nothing is done" S.empty done0
+            sizes <- namespaceSizes db [victim]
+            assertEqual "the tombstone hides the entries" [(victim, 0)] sizes
+            fs <- filesOverlapping db victim
+            assertBool "the files of the namespace are still live" (not $ null fs)
+            -- the race, on a copy: once a compaction has replaced the listed
+            -- files, the check after the compaction passes with them as the
+            -- files before, while a live file still overlaps the namespace
+            let race = dir </> "race"
+            copyDb db race
+            withRocksDb race modernDefaultOptions $ \rdb -> do
+                current <- filter (overlapsNamespace rdb victim) <$> liveFileRanges rdb
+                compactRawRangeForced rdb (compactionRange rdb victim current)
+                live <- liveFileRanges rdb
+                assertEqual "no listed file is live" [] [_lfName f | f <- current, _lfName f `elem` fmap _lfName live]
+                assertBool ("a live file overlaps the namespace: " <> show live) $
+                    any (overlapsNamespace rdb victim) live
+                try @SomeException (verifyNamespace rdb race MigrateTrees victim current) >>= \case
+                    Left e -> assertFailure $ "the check after the compaction fails: " <> show e
+                    Right () -> return ()
+            (code', logs) <- capturing $ \l ->
+                runMigrate l db MigrateTrees defaultMigrateOpts { _moCompactAfterListing = [victim] }
+            assertEqual "exit code of the rerun" ExitSuccess code'
+            assertLogged logs victim "test hook: the listed files are compacted"
+            assertEqual "not skipped" [] (loggedFor logs victim "already in the target state")
+            assertLogged logs victim "compaction 1: "
+            done <- doneKeys db
+            assertEqual "progress after the rerun" (keysOf MigrateTrees treeNamespaces) done
+            sizes' <- namespaceSizes db treeNamespaces
+            assertEqual "tree namespaces after the rerun" [(ns, 0) | ns <- treeNamespaces] sizes'
+
     , testCase "progress file and no IDENTITY: refused, and the error says to delete the progress file; after that, the step runs" $
         withFixture $ \_ db -> do
             migrateTrees silent db defaultMigrateOpts { _moStopAfter = Just 1 }
