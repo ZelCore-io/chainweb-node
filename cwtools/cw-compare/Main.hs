@@ -152,7 +152,7 @@ testDbOptions = DbSide
     <$> strOption
         ( long "test-db"
         <> metavar "DIR"
-        <> help "serve the test side in process from this node database directory (the one that holds rocksDb and sqlite, or its parent); RocksDB is opened read-only, but Pact opens the SQLite files read-write: use a copy or a stopped node's files only"
+        <> help "serve the test side in process from this node database directory (the one that holds rocksDb and sqlite, or its parent); RocksDB is opened read-only, but Pact opens the SQLite files read-write and rewinds them to the newest header at start: a copy or a snapshot only, never a production node's files"
         )
     <*> option chainsReader
         ( long "pact-chains"
@@ -288,7 +288,7 @@ main = do
         <> progDesc "Compare the answers of a test node with those of the oracle"
         <> footer (unwords
             [ "Exit codes: 0 pass; 4 partial pass (no difference, but not all 7 classes); 2 fail (a difference); 3 void (rerun); 1 bad arguments or a crash."
-            , "--test-db: use a copy or a stopped node's files only (Pact opens the SQLite files read-write)."
+            , "--test-db: a copy or a snapshot only, never a production node's files (Pact opens the SQLite files read-write and rewinds them at start)."
             ])
         )
     let logger = genericLogger Info (T.hPutStrLn stderr)

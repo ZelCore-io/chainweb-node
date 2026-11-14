@@ -25,10 +25,13 @@
 --   answer @/local@, @/poll@ and @/spv@ requests. Each Pact chain must have its
 --   SQLite file: a missing file is an error, not a new database.
 --
--- __Use a copy only__: point it at a copy of a node's database directory, or
--- at the files of a node that is stopped and stays stopped for the whole run.
--- Pact opens the SQLite files read-write (and may checkpoint their WAL), so
--- serving a live node's files can corrupt that node's database.
+-- __Use a copy or a snapshot only, never a production node's files__: point
+-- it at a copy of a node's database directory. Pact opens the SQLite files
+-- read-write (and may checkpoint their WAL), and at start it rewinds them to
+-- the newest header in RocksDB (@initializeLatestBlock@), so serving a
+-- node's own files, even a stopped one's, changes that node's database
+-- (Minor 4 of the P0 review; spec 13.5: the test node never opens
+-- production's files).
 --
 module Chainweb.StorageTools.Compare.InProcess
 ( InProcessSpec(..)

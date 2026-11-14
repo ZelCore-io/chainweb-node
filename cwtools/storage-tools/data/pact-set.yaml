@@ -17,6 +17,17 @@
 #
 # An entry of kind "cont" sends a continuation of {pactId} at the given step
 # (rollback false, no proof) instead of code; it reads the defpact state.
+# The step is required, and only step 0 is allowed: cw-compare refuses a set
+# with another step, as it refuses a set whose production-eligible entries
+# lack a bound or call a table scan.
+#
+# A read of a user table first makes the table-exists check, on Pact 4 and
+# Pact 5 alike: SELECT tablename FROM VersionedTableCreation WHERE
+# createBlockheight < ? AND lower(tablename) = lower(?). Because of lower(),
+# SQLite cannot seek the table name: it scans the (createBlockheight,
+# tablename) index over every table created below the target height. Its
+# cost grows with the number of tables on the chain, not with the rows of
+# any table; "the table-exists check" below means this scan.
 #
 # All entries are reads. /local never commits. Direct table reads (read,
 # keys, txids, txlog, keylog) succeed at Pact 4 heights only on a node with
@@ -53,8 +64,9 @@ entries:
       coin details for a sampled account; the read every wallet makes.
       Bound: one indexed read of one coin.coin-table row (rowkey = ? AND txid < ?
       ORDER BY txid DESC LIMIT 1 on the UNIQUE (rowkey, txid) index, Pact 4 and
-      Pact 5), the table-exists check (one VersionedTableCreation lookup) and the
-      load of the coin module and its interfaces (a few SYS:Modules rows of fixed
+      Pact 5), the table-exists check (a range scan over the
+      VersionedTableCreation index with lower(), one entry per table of the
+      chain) and the load of the coin module and its interfaces (a few SYS:Modules rows of fixed
       size); the module code runs under the gas limit of 100,000. Preflight adds
       buy-gas and redeem-gas on the sender's row: a few more indexed reads and
       writes of one row each, never committed. The preflight sender is a k:
@@ -69,7 +81,9 @@ entries:
       a direct row read of coin.coin-table, the largest table on every chain.
       Bound: one indexed read of one row (rowkey = ? AND txid < ? ORDER BY txid
       DESC LIMIT 1 on the UNIQUE (rowkey, txid) index, Pact 4 and Pact 5), O(log
-      n) whatever the table's size, and the table-exists check
+      n) whatever the table's size, and the table-exists check (a range scan
+      over the VersionedTableCreation index with lower(), one entry per table
+      of the chain)
 
   - name: coin-get-balance
     classes: [local, preflight]
@@ -130,8 +144,9 @@ entries:
       both sides must give the same table-missing error, above it the same
       row-not-found (the ledger's keys are token:account, so a bare account
       never hits; namespace-before-creation is the hit). Bound: the table-exists
-      check (one lookup in VersionedTableCreation, one row per table of the
-      chain) and at most one indexed row read
+      check (a range scan over the VersionedTableCreation index with lower(),
+      one entry per table of the chain created below the target height) and at
+      most one indexed row read
 
   - name: namespace-before-creation
     classes: [local]
@@ -148,7 +163,9 @@ entries:
     code: '(read ns.registry "free")'
     why: >-
       a row of a small, rarely written table of another module. Bound: one
-      indexed row read and the table-exists check
+      indexed row read and the table-exists check (a range scan over the
+      VersionedTableCreation index with lower(), one entry per table of the
+      chain)
 
   - name: defpact-state
     classes: [local]
