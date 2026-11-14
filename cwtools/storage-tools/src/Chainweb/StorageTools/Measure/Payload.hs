@@ -59,6 +59,7 @@ import Chainweb.Storage.Table.RocksDB
 import Chainweb.Storage.Table.RocksDB.Tuning
 import Chainweb.StorageTools.RangeDb
 import Chainweb.Utils (sshow)
+import Chainweb.Version (ChainwebVersion)
 
 -- -------------------------------------------------------------------------- --
 -- Sizes
@@ -92,18 +93,14 @@ data NamespaceSizes = NamespaceSizes
 newtype PayloadSizes = PayloadSizes { _psNamespaces :: [NamespaceSizes] }
     deriving (Show, Eq)
 
--- | The header, payload and metadata namespaces that are measured. Of the
--- header tables those of the chain ids 0 to 39 are considered.
+-- | The header, payload and metadata namespaces that are measured: the
+-- header tables are those of the chains in the version's chain graphs.
 --
-measuredNamespaces :: [B.ByteString]
-measuredNamespaces = payloadNamespaces <> legacyPayloadNamespaces <> metadataNamespaces <> headers
-  where
-    headers = concat
-        [ ["BlockHeader/" <> B8.pack (show c) <> "/header", "BlockHeader/" <> B8.pack (show c) <> "/rank"]
-        | c <- [0 .. 39 :: Int]
-        ]
+measuredNamespaces :: ChainwebVersion -> [B.ByteString]
+measuredNamespaces v =
+    payloadNamespaces <> legacyPayloadNamespaces <> metadataNamespaces <> headerNamespaces v
 
--- | @measurePayloadSizes dbPath workPath@ copies each non-empty header,
+-- | @measurePayloadSizes ver dbPath workPath@ copies each non-empty header,
 -- payload and metadata namespace of the database at @dbPath@ into fresh
 -- instances under 'defaultTuning' and under 'payloadZstdTuning', and
 -- reports the logical size of the namespace and the size of the SST files
@@ -116,12 +113,12 @@ measuredNamespaces = payloadNamespaces <> legacyPayloadNamespaces <> metadataNam
 -- written below @workPath@ one at a time and are removed after they were
 -- measured.
 --
-measurePayloadSizes :: FilePath -> FilePath -> IO PayloadSizes
-measurePayloadSizes dbPath workPath = do
+measurePayloadSizes :: ChainwebVersion -> FilePath -> FilePath -> IO PayloadSizes
+measurePayloadSizes ver dbPath workPath = do
     createdWork <- not <$> doesDirectoryExist workPath
     createDirectoryIfMissing True workPath
     r <- withReadOnlyRocksDbTuned dbPath modernDefaultOptions defaultTuning $ \src ->
-        fmap catMaybes $ forM measuredNamespaces $ \ns -> do
+        fmap catMaybes $ forM (measuredNamespaces ver) $ \ns -> do
             (n, logical) <- logicalSize src ns
             if n == 0
                 then return Nothing

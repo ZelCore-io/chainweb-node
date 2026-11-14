@@ -21,6 +21,7 @@ tested-with:
 extra-source-files:
    README.md
    LICENSE
+   storage-tools/data/pact-set.yaml
 
 source-repository head
     type: git
@@ -327,7 +328,16 @@ library storage-tools
     default-language: Haskell2010
     hs-source-dirs: storage-tools/src
     exposed-modules:
+        Chainweb.StorageTools.Compare.InProcess
+        Chainweb.StorageTools.Compare.PactSet
+        Chainweb.StorageTools.Compare.Report
+        Chainweb.StorageTools.Compare.Requests
+        Chainweb.StorageTools.Compare.Rules
+        Chainweb.StorageTools.Compare.Run
+        Chainweb.StorageTools.Compare.Sample
+        Chainweb.StorageTools.Compare.Types
         Chainweb.StorageTools.Http
+        Chainweb.StorageTools.Measure.Cold
         Chainweb.StorageTools.Measure.Payload
         Chainweb.StorageTools.Migrate
         Chainweb.StorageTools.RangeDb
@@ -338,20 +348,25 @@ library storage-tools
 
         -- external
         , aeson
+        , async
         , base >= 4.12 && < 5
         , base16-bytestring
         , bytestring
         , clock
         , containers
+        , direct-sqlite
         , directory
         , exceptions
+        , file-embed
         , filepath
         , http-client
         , http-client-tls
         , http-types
         , lens
         , loglevel
+        , merkle-log
         , optparse-applicative
+        , pact-tng
         , random
         , rocksdb-haskell-kadena
         , servant-client
@@ -360,6 +375,8 @@ library storage-tools
         , unix
         , unordered-containers
         , vector
+        , warp
+        , yaml
 
 executable cw-range-db
     import: warning-flags, debugging-flags
@@ -386,6 +403,30 @@ executable cw-range-db
         , optparse-applicative
         , text
         , yet-another-logger
+
+executable cw-compare
+    import: warning-flags, debugging-flags
+    default-language: Haskell2010
+    ghc-options:
+        -threaded
+        -rtsopts
+        "-with-rtsopts=-N -H1G -A64M"
+    hs-source-dirs: cw-compare
+    main-is: Main.hs
+    build-depends:
+        -- internal
+        , chainweb
+        , chainweb-storage
+        , cwtools:storage-tools
+
+        -- external
+        , aeson
+        , base
+        , bytestring
+        , containers
+        , loglevel
+        , optparse-applicative
+        , text
 
 executable storage-migrate
     import: warning-flags, debugging-flags
@@ -420,11 +461,15 @@ executable cw-measure
     main-is: Main.hs
     build-depends:
         -- internal
+        , chainweb
         , chainweb-storage
         , cwtools:storage-tools
 
         -- external
+        , aeson
         , base
+        , bytestring
+        , loglevel
         , optparse-applicative
         , text
 
@@ -439,9 +484,13 @@ test-suite storage-tools-tests
     hs-source-dirs: storage-tools/test
     main-is: StorageToolsTests.hs
     other-modules:
+        Chainweb.StorageTools.Test.Cold
+        Chainweb.StorageTools.Test.Compare
         Chainweb.StorageTools.Test.Http
+        Chainweb.StorageTools.Test.InProcess
         Chainweb.StorageTools.Test.Migrate
         Chainweb.StorageTools.Test.RangeDb
+        Chainweb.StorageTools.Test.Requests
     build-depends:
         -- internal
         , chainweb
@@ -450,17 +499,24 @@ test-suite storage-tools-tests
         , cwtools:storage-tools
 
         -- external
+        , aeson
         , async
         , base
         , bytestring
         , containers
+        , direct-sqlite
         , directory
         , filepath
         , http-client
+        , http-types
         , lens
         , loglevel
+        , merkle-log
         , optparse-applicative
+        , pact
+        , pact-tng
         , resourcet
+        , rocksdb-haskell-kadena
         , servant-client
         , streaming
         , tasty
@@ -469,4 +525,5 @@ test-suite storage-tools-tests
         , text
         , unordered-containers
         , vector
+        , wai
         , warp

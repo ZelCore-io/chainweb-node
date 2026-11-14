@@ -195,12 +195,15 @@ encodeKeyIdList = build . foldMap (\(KeyId i) -> varint i)
 -- | The inverse of 'encodeKeyIdList'. Nothing on a truncated varint, a value
 -- above 2^32 - 1, or a non-minimal encoding (so the encoding is canonical).
 decodeKeyIdList :: B.ByteString -> Maybe [KeyId]
-decodeKeyIdList s = case B.uncons s of
-    Nothing -> Just []
-    Just _ -> do
-        (i, rest) <- varint 0 0 s
-        (KeyId i :) <$> decodeKeyIdList rest
+decodeKeyIdList = go []
   where
+    go acc s
+        | B.null s = Just (reverse acc)
+        | otherwise = do
+            (i, rest) <- varint 0 0 s
+            let !k = KeyId i
+            go (k : acc) rest
+
     varint :: Int -> Word64 -> B.ByteString -> Maybe (Word32, B.ByteString)
     varint !n !acc b = do
         (x, rest) <- B.uncons b

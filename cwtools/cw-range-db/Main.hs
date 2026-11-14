@@ -99,6 +99,15 @@ heightReader = fromIntegral <$> (auto :: ReadM Word64)
 dbOption :: Parser FilePath
 dbOption = strOption (long "db" <> metavar "DIR" <> help "the range database")
 
+-- | A database that is only read.
+--
+readDbOption :: String -> String -> Parser FilePath
+readDbOption name what = strOption
+    ( long name
+    <> metavar "DIR"
+    <> help (what <> ", opened read-only: a copy or a snapshot only, never a production node's files")
+    )
+
 commands :: Parser Command
 commands = hsubparser $ mconcat
     [ cmd "range" "headers and payloads of all chains up to a height, and one cut"
@@ -113,12 +122,12 @@ commands = hsubparser $ mconcat
             <*> option (unsafeChainId <$> auto) (long "chain" <> metavar "CHAIN")
             <*> option heightReader (long "from" <> metavar "HEIGHT")
             <*> option heightReader (long "to" <> metavar "HEIGHT" <> help "inclusive")
-    , cmd "info" "highest cut and sizes of a range database (opens it read-write once, which applies its write ahead log)"
-        $ ShowInfo <$> dbOption
+    , cmd "info" "highest cut and sizes of a range database (opens it read-only; a write ahead log is replayed in memory)"
+        $ ShowInfo <$> readDbOption "db" "the range database"
     , cmd "diff" "compare two databases (exit code 1 if they differ)"
         $ Diff <$> versionOption
-            <*> strOption (long "left" <> metavar "DIR")
-            <*> strOption (long "right" <> metavar "DIR")
+            <*> readDbOption "left" "a database"
+            <*> readDbOption "right" "a database"
             <*> many (B8.pack <$> strOption
                 ( long "namespace"
                 <> metavar "NAMESPACE"

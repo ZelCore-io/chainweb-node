@@ -32,7 +32,7 @@ import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as B8
 import qualified Data.HashMap.Strict as HM
 import Data.IORef
-import Data.List (isInfixOf)
+import Data.List (isInfixOf, isPrefixOf, sort)
 import qualified Data.Set as S
 import qualified Data.Text as T
 import qualified Data.Vector as V
@@ -42,7 +42,7 @@ import Network.Wai.Handler.Warp (testWithApplication)
 
 import qualified Streaming.Prelude as SP
 
-import System.Directory (doesDirectoryExist)
+import System.Directory (doesDirectoryExist, getFileSize, listDirectory)
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import System.LogLevel (LogLevel(..))
@@ -81,6 +81,7 @@ import Chainweb.Time (second)
 import Chainweb.TreeDB (entries)
 import Chainweb.Utils (T2(..), int)
 import Chainweb.Version
+import Chainweb.Version.Mainnet (mainnet)
 import Chainweb.WebBlockHeaderDB (getWebBlockHeaderDb)
 
 -- -------------------------------------------------------------------------- --
@@ -333,10 +334,17 @@ tests = testGroup "Range DB"
     , testCase "rangeDbInfo prints the highest cut per chain" $
         withSource $ \src -> withSystemTempDirectory "storage-tools-info" $ \dir -> do
             let dbPath = dir </> "range-db"
-            -- no flush: rangeDbInfo applies the write ahead log
+            -- no flush: rangeDbInfo replays the write ahead log
             withRocksDb dbPath modernDefaultOptions $ \dst ->
                 void $ buildRangeDbWith silent defaultPayloadDbConfig (_srcApi src) (srcCut src) (RangeSpec maxH) dst
+            -- RocksDB's own info logs aside, the files and their sizes
+            let snapshot = do
+                    names <- filter (not . isPrefixOf "LOG") <$> listDirectory dbPath
+                    forM (sort names) $ \n -> (,) n <$> getFileSize (dbPath </> n)
+            filesBefore <- snapshot
             info <- rangeDbInfo dbPath
+            filesAfter <- snapshot
+            assertEqual "rangeDbInfo opens read-only: the files are unchanged" filesBefore filesAfter
             let ls = T.lines info
             assertBool ("highest cut in\n" <> T.unpack info) (any (T.isPrefixOf "highest cut: height ") ls)
             forM_ cids $ \cid -> do
@@ -422,6 +430,15 @@ tests = testGroup "Range DB"
             assertSubset src dst
             assertEqual "no cut" 0 =<< namespaceSize dst "CutHashes"
 
+    , testCase "measuredNamespaces: the header tables of the version's chains" $ do
+        let headersOf v = filter (B8.isPrefixOf "BlockHeader/") (measuredNamespaces v)
+        assertEqual "pair graph"
+            ["BlockHeader/0/header", "BlockHeader/0/rank", "BlockHeader/1/header", "BlockHeader/1/rank"]
+            (headersOf testVer)
+        assertEqual "mainnet: 20 chains" 40 (length (headersOf mainnet))
+        assertBool "mainnet: chain 19" ("BlockHeader/19/header" `elem` headersOf mainnet)
+        assertBool "mainnet: no chain 20" ("BlockHeader/20/header" `notElem` headersOf mainnet)
+
     , testCase "measurePayloadSizes: logical bytes equal the source's key+value bytes; SST bytes > 0 under both tunings" $
         withSource $ \src -> withSystemTempDirectory "storage-tools-measure" $ \dir -> do
             let dbPath = dir </> "range-db"
@@ -429,7 +446,7 @@ tests = testGroup "Range DB"
             withRocksDb dbPath modernDefaultOptions $ \dst -> do
                 _ <- buildRangeDbWith silent defaultPayloadDbConfig (_srcApi src) (srcCut src) (RangeSpec maxH) dst
                 flushRocksDb dst
-            sizes <- measurePayloadSizes dbPath workPath
+            sizes <- measurePayloadSizes testVer dbPath workPath
             let reported = _psNamespaces sizes
             assertBool "namespaces are reported" (not $ null reported)
             -- all non-empty namespaces are reported, and only those

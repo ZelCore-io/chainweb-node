@@ -33,6 +33,7 @@ module Chainweb.Storage.Table.RocksDB.Tuning
 
   -- * SST inspection
   , sstCompressionInfo
+  , readSstProperties
 
   -- * Foreign imports
   -- ** Opaque C types
@@ -274,6 +275,11 @@ invalid what v = ioError $ userError $
 -- take the lock and does not write. The C API of 8.3.2 has no access to table
 -- properties, so they are read from the properties block of each file, which
 -- RocksDB stores uncompressed.
+--
+-- Use it only on a quiescent database, best a closed one. The files are listed
+-- first and read afterwards, so a flush or compaction that runs meanwhile in
+-- another handle can delete a listed file before it is read (and then the
+-- call throws), and the files it writes are not seen.
 --
 sstCompressionInfo :: FilePath -> IO (M.Map FilePath (ByteString, ByteString))
 sstCompressionInfo dir = do
