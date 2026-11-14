@@ -22,7 +22,7 @@ import qualified Data.Text as T
 import GHC.Clock (getMonotonicTime)
 
 import qualified Network.HTTP.Client as HTTP
-import Network.HTTP.Types (status200, status429, status500, status503)
+import Network.HTTP.Types (status200, status429, status500, status502, status503, status504)
 import Network.Wai (Application, responseLBS, responseRaw)
 import Network.Wai.Handler.Warp (testWithApplication)
 
@@ -183,6 +183,14 @@ retryTests = testGroup "runServiceApi retries"
 
     , testCase "status 500 is final" $ do
         r <- requestsReceived $ \_ _ respond -> respond (responseLBS status500 [] "")
+        assertEqual "(requests received, failed)" (1, True) r
+
+    , testCase "status 502 is final" $ do
+        r <- requestsReceived $ \_ _ respond -> respond (responseLBS status502 [] "")
+        assertEqual "(requests received, failed)" (1, True) r
+
+    , testCase "status 504 is final" $ do
+        r <- requestsReceived $ \_ _ respond -> respond (responseLBS status504 [] "")
         assertEqual "(requests received, failed)" (1, True) r
 
     , testCase "status 429 and 503 are retried" $ do

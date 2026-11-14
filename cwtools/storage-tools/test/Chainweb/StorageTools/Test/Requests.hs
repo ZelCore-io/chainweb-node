@@ -16,6 +16,7 @@ module Chainweb.StorageTools.Test.Requests
 ( tests
 ) where
 
+import Control.Concurrent (threadDelay)
 import Control.Exception (SomeException, try)
 import Control.Monad
 import Data.Aeson
@@ -35,6 +36,7 @@ import Data.Maybe (fromMaybe, mapMaybe)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
 import qualified Data.Vector as V
+import qualified Network.HTTP.Client as HTTP
 import Data.Word (Word64)
 import Network.HTTP.Types
 import Network.Wai (Application, pathInfo, queryString, responseLBS, responseRaw, strictRequestBody)
@@ -65,7 +67,7 @@ import Chainweb.StorageTools.Compare.Rules
 import Chainweb.StorageTools.Compare.Run
 import Chainweb.StorageTools.Compare.Sample
 import Chainweb.StorageTools.Compare.Types
-import Chainweb.StorageTools.Http (ServiceApi, limiterPermits)
+import Chainweb.StorageTools.Http (ServiceApi(..), limiterPermits)
 import Chainweb.Utils (encodeB64UrlNoPaddingText, decodeB64UrlNoPaddingText)
 import Chainweb.Version.Mainnet (mainnet)
 
@@ -95,7 +97,7 @@ tests = testGroup "Requests"
     , testCase "spv: a target chain outside the coverage at the target height + 3 is NotCovered" spvTargetCoverage
     , testCase "--allow-reads-in-local takes a required true|false" allowReadsOption
     , testCase "--oracle-local-timeout takes 1 to 3600 seconds and reaches the run options" oracleLocalTimeoutOption
-    , testCase "an oracle lookup whose connection closes without an answer is sent once, never again" lookupNotResent
+    , testCase "an oracle lookup is sent once after a status other than 429 or 503, a closed connection or a response timeout; 429, 503, 200 arrive 3 times" lookupNotResent
     , testCase "a custom Pact set fails closed: a cont entry needs a step; a live entry needs a bound, step 0, no scan" customPactSet
     , testCase "a request file holds only the read requests of the 7 classes, pinned ones with {rewindDepth} and a target" requestFileAllowlist
     , testCase "a class whose every compared answer is the same non-2xx is at best PartialPass" sameNon2xxOnly
@@ -696,23 +698,59 @@ allowReadsOption = do
 -- -------------------------------------------------------------------------- --
 -- Fix P0-A
 
--- | An oracle that reads each request and closes the connection without an
--- answer.
+-- | How often an oracle lookup (@oracleCall@) arrives at one loopback stub,
+-- per kind of answer (N2 of the P0-B re-review). Only 429 and 503 are
+-- refusals, which did no work, and retried; a connection closed without an
+-- answer, a response timeout and any other status, the gateway answers 502
+-- and 504 included, are final: a lookup is sent once and never again to a
+-- production oracle.
 --
 lookupNotResent :: Assertion
 lookupNotResent = do
     arrivals <- newIORef (0 :: Int)
+    let status :: Status -> Application
+        status st _ respond = respond (responseLBS st [] "")
+    script <- newIORef (const (status status500))
     let app req respond = do
             _ <- strictRequestBody req
-            atomicModifyIORef' arrivals (\n -> (n + 1, ()))
-            respond $ responseRaw (\_ _ -> return ()) (responseLBS status500 [] "no raw")
+            n <- atomicModifyIORef' arrivals (\k -> (k + 1, k + 1))
+            f <- readIORef script
+            f n req respond
     testWithApplication (return app) $ \port -> do
         hl <- newHostLimiters 1_000 Nothing
-        api <- oracleServiceApi hl mainnet ("http://127.0.0.1:" <> tshow port)
-        r <- try @SomeException (gen api 1 ClsHeader 10)
-        assertBool "the lookup fails" (either (const True) (const False) r)
-        n <- readIORef arrivals
-        n @?= 1
+        lim <- limiterFor hl ("http://127.0.0.1:" <> tshow port)
+        forM_
+            [ ("status 500", const (status status500), 1)
+            , ("status 502", const (status status502), 1)
+            , ("status 504", const (status status504), 1)
+            , ("a connection closed without an answer"
+              , const (\_ respond -> respond $ responseRaw (\_ _ -> return ()) (responseLBS status500 [] "no raw"))
+              , 1
+              )
+            , ("429, then 503, then 200"
+              , \n -> case n of
+                    1 -> status status429
+                    2 -> status status503
+                    _ -> status status200
+              , 3
+              )
+            , ("an answer after the response timeout"
+              , const (\_ respond -> threadDelay 2_000_000 >> respond (responseLBS status200 [] ""))
+              , 1
+              )
+            ] $ \(name, f, expected :: Int) -> do
+                writeIORef arrivals 0
+                writeIORef script f
+                -- a new manager per row, so that no connection of an earlier
+                -- row is reused (http-client resends once on a stale one);
+                -- the response timeout is far below the stub's sleep
+                mgr <- HTTP.newManager HTTP.defaultManagerSettings
+                    { HTTP.managerResponseTimeout = HTTP.responseTimeoutMicro 300_000 }
+                let api = ServiceApi ("http://127.0.0.1:" <> tshow port) mainnet mgr lim
+                r <- try @SomeException (gen api 1 ClsHeader 10)
+                assertBool (name <> ": the lookup fails") (either (const True) (const False) r)
+                n <- readIORef arrivals
+                assertEqual (name <> ": arrivals") expected n
 
 -- | Loads a Pact set from YAML text through a file, as @--pact-set@ does.
 --
