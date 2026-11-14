@@ -16,7 +16,7 @@ module Chainweb.StorageTools.Test.RangeDb
 ) where
 
 import Control.Exception (IOException, try)
-import Control.Lens (view)
+import Control.Lens (view, (&), (.~))
 import Control.Monad
 
 import qualified Data.ByteString as B
@@ -50,7 +50,7 @@ import Chainweb.ChainId
 import Chainweb.Cut (_cutMap)
 import Chainweb.Cut.CutHashes
 import Chainweb.CutDB (cutHashesTable)
-import Chainweb.Graph (pairChainGraph)
+import Chainweb.Graph (pairChainGraph, singletonChainGraph)
 import Chainweb.Logger
 import Chainweb.Miner.Coordinator (MiningCoordination)
 import Chainweb.Pact.RestAPI.Server (PactServerData)
@@ -71,6 +71,7 @@ import Chainweb.Test.TestVersions (barebonesTestVersion)
 import Chainweb.Time (second)
 import Chainweb.TreeDB (entries)
 import Chainweb.Utils (T2(..), int)
+import Chainweb.Utils.Rule (Rule(..))
 import Chainweb.Version
 import Chainweb.Version.Mainnet (mainnet)
 import Chainweb.WebBlockHeaderDB (getWebBlockHeaderDb)
@@ -83,6 +84,21 @@ testVer = barebonesTestVersion pairChainGraph
 
 cids :: [ChainId]
 cids = [unsafeChainId 0, unsafeChainId 1]
+
+-- | The height at which chain 1 starts in 'lateVer'.
+--
+lateStart :: BlockHeight
+lateStart = 4
+
+-- | 'testVer' as the client sees a network where chain 1 starts at
+-- 'lateStart', like chains 10 to 19 of mainnet: the same name, but only chain
+-- 0 exists below that height. (The sources of the tests keep both chains, so
+-- a tool that asks for chain 1 below 'lateStart' gets headers instead of an
+-- error, and the tests check what the tool asks for.)
+--
+lateVer :: ChainwebVersion
+lateVer = testVer & versionGraphs .~
+    ((lateStart, pairChainGraph) `Above` Bottom (minBound, singletonChainGraph))
 
 -- | The height of the source.
 --
@@ -280,6 +296,43 @@ tests = testGroup "Range DB"
             assertBool ("tip below the height: " <> show (void r1)) $ failsNaming c0 r1
             r2 <- try @IOException $ canonicalTips (_srcApi src) missing maxH
             assertBool ("chain not in the cut: " <> show (void r2)) $ failsNaming c0 r2
+
+    , testCase "canonicalTips: only the chains that exist at the height, also if the cut has more" $
+        withForkedSource $ \src brA _ -> do
+            let c0 = unsafeChainId 0
+                c1 = unsafeChainId 1
+            let lateApi = (_srcApi src) { _saVersion = lateVer }
+            assertEqual "genesis height of chain 1" lateStart (genesisBlockHeight lateVer c1)
+            -- below the start of chain 1: chain 0 only
+            below <- canonicalTips lateApi (_brCut brA) (lateStart - 1)
+            assertEqual "chains below the start of chain 1" [c0] (fst <$> below)
+            forM_ below $ \(_, hdr) -> assertEqual "height" (lateStart - 1) (view blockHeight hdr)
+            -- at the start of chain 1: both
+            atStart <- canonicalTips lateApi (_brCut brA) lateStart
+            assertEqual "chains at the start of chain 1" cids (fst <$> atStart)
+            -- a cut without chain 1 is enough below its start
+            let withoutC1 = (_brCut brA) { _cutHashes = HM.delete c1 (_cutHashes $ _brCut brA) }
+            below' <- canonicalTips lateApi withoutC1 (lateStart - 1)
+            assertEqual "chains of a cut without chain 1" [c0] (fst <$> below')
+            -- but not at a height where chain 1 exists
+            r <- try @IOException $ canonicalTips lateApi withoutC1 lateStart
+            assertBool ("chain 1 missing at its start: " <> show (void r)) $ failsNaming c1 r
+
+    , testCase "range DB below the start of a chain has the headers, payloads and cut of the other chains only" $
+        withSource $ \src -> withTempRocksDb "storage-tools-range" $ \dst -> do
+            let h = lateStart - 1
+                lateApi = (_srcApi src) { _saVersion = lateVer }
+            -- the source cut has both chains, as a source that is above the start of chain 1 does
+            s <- buildRangeDbWith silent lateApi (srcCut src) (RangeSpec h) dst
+            -- chain 0 only, heights 0 .. h
+            assertEqual "headers" (int h + 1) (_rsHeaders s)
+            assertEqual "payloads" (int h + 1) (_rsPayloads s)
+            ch <- withTableIterator (unCasify $ cutHashesTable dst) $ \it -> iterLast it >> iterValue it
+            case ch of
+                Nothing -> assertFailure "no cut"
+                Just c -> do
+                    assertEqual "chains of the cut" (S.singleton $ unsafeChainId 0) (S.fromList $ HM.keys $ _cutHashes c)
+                    forM_ (HM.elems $ _cutHashes c) $ \bh -> assertEqual "height" h (_bhwhHeight bh)
 
     , testCase "range DB equals the source on header and payload namespaces" $
         withSource $ \src -> withTempRocksDb "storage-tools-range" $ \dst -> do
