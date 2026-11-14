@@ -83,6 +83,7 @@ module Chainweb.StorageTools.Migrate
 , migrateStepName
 , MigrateOpts(..)
 , defaultMigrateOpts
+, treesCompression
 , migrateTrees
 , migratePayloads
 , migrate
@@ -131,6 +132,7 @@ import Control.Exception
 import Control.Monad
 
 import Data.Aeson hiding (Error)
+import Data.Maybe (fromMaybe)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as B8
 import qualified Data.ByteString.Lazy as BL
@@ -304,26 +306,38 @@ data MigrateOpts = MigrateOpts
         -- ^ test hook: the compaction of these namespaces is skipped, as if
         -- it had done nothing without an error; for @trees@, the delete and
         -- the flush still happen. The check of the namespace must then fail.
-    , _moPayloadCompression :: !PayloadCompression
-        -- ^ @trees@: the compression of the node, with which the compaction
-        -- rewrites the files that hold tree entries and other entries. Once
-        -- a payload namespace is done, @trees@ uses zstd-dict.
+    , _moPayloadCompression :: !(Maybe PayloadCompression)
+        -- ^ @trees@: @--payload-compression@, the compression with which the
+        -- compaction rewrites the files that hold tree entries and other
+        -- entries; 'Nothing' if it was not given, and then Snappy, the node's
+        -- default ('treesCompression'). Once a payload namespace is done,
+        -- @trees@ uses zstd-dict. If it was not given and live files of the
+        -- payload tables are zstd-dict, @trees@ refuses to run; if it was
+        -- given and differs from the compression of those files, @trees@
+        -- warns (see 'migrateTrees').
     , _moPauseFile :: !(Maybe FilePath)
         -- ^ no namespace is started while this file exists
     }
     deriving (Show, Eq)
 
--- | The defaults of the command line: no test hook, the compression of
--- chainweb-node 3.2.1 (Snappy), no pause file.
+-- | The defaults of the command line: no test hook, no
+-- @--payload-compression@ (so the compression of chainweb-node 3.2.1,
+-- Snappy), no pause file.
 --
 defaultMigrateOpts :: MigrateOpts
 defaultMigrateOpts = MigrateOpts
     { _moStopAfter = Nothing
     , _moSkipWork = []
     , _moSkipCompaction = []
-    , _moPayloadCompression = PayloadSnappy
+    , _moPayloadCompression = Nothing
     , _moPauseFile = Nothing
     }
+
+-- | The compression that @trees@ writes while no payload namespace is done:
+-- @--payload-compression@, Snappy if it was not given.
+--
+treesCompression :: MigrateOpts -> PayloadCompression
+treesCompression = fromMaybe PayloadSnappy . _moPayloadCompression
 
 -- | The work on a namespace failed, or its check failed. The namespace is not
 -- marked as done, so that a rerun retries it.
@@ -452,6 +466,16 @@ fsyncPath path = bracket (openFd path ReadOnly defaultFileFlags) closeFd fileSyn
 -- default, as the node), or with zstd-dict once any payload namespace is done
 -- (see 'migratePayloads').
 --
+-- While no payload namespace is done, the compression of the live files that
+-- overlap the payload tables is read before the database is opened. If some
+-- are ZSTD with the dictionary (the node ran with
+-- @--payload-compression zstd-dict@) and @--payload-compression@ was not
+-- given, the step refuses to run: with the default it would rewrite them
+-- with Snappy, which undoes the node's conversion and grows the database. If
+-- it was given and the files differ from it, the step warns and runs. If a
+-- payload namespace is done and @--payload-compression snappy@ was given, the
+-- step warns that zstd-dict is used.
+--
 migrateTrees :: Logger l => l -> FilePath -> MigrateOpts -> IO ()
 migrateTrees l db = migrate l db MigrateTrees
 
@@ -477,6 +501,10 @@ migrate l db step opts = do
             <> T.pack (progressFile db) <> " lists every namespace of the step as done, so the database"
             <> " is not opened. To redo a step, delete that file; both steps then start from the beginning."
     else do
+        -- no namespace is started, and the database is not opened, while
+        -- the pause file exists
+        waitWhilePaused
+        when (step == MigrateTrees) $ checkTreesCompression done0
         logg Info $ "storage-migrate " <> stepName <> ": opening " <> T.pack db
             <> " read-write. This fails if a process has it open read-write (a node, another"
             <> " storage-migrate), which holds the RocksDB LOCK. A process that opens it read-only is"
@@ -491,6 +519,13 @@ migrate l db step opts = do
             ident <- dbIdentity db
             -- again, under the lock
             done1 <- checkedProgress db
+            -- the tuning was chosen from the progress before the lock
+            when (stepTuning done1 /= stepTuning done0) $ throwIO $ userError $
+                "storage-migrate " <> T.unpack stepName <> ": " <> progressFile db
+                <> " changed between its first read and the lock of the database (another"
+                <> " storage-migrate run?): a payload namespace is now done, so the step must write "
+                <> T.unpack (stepCompression done1) <> ", but the database was opened to write "
+                <> T.unpack (stepCompression done0) <> ". No namespace was started; run the step again."
             let todo = todoOf done1
                 todo' = maybe id take (_moStopAfter opts) todo
             forM_ (stepNamespaces step) $ \ns ->
@@ -523,16 +558,55 @@ migrate l db step opts = do
     stepCompression done = case step of
         MigratePayloads -> payloadCompressionToText PayloadZstdDict
         MigrateTrees
-            | any (\ns -> progressKey MigratePayloads ns `S.member` done) migratePayloadNamespaces ->
+            | payloadDone done ->
                 payloadCompressionToText PayloadZstdDict <> " (a payload namespace is done)"
-            | otherwise -> payloadCompressionToText (_moPayloadCompression opts)
+            | otherwise -> payloadCompressionToText (treesCompression opts)
 
     stepTuning done = case step of
         MigratePayloads -> payloadZstdTuning
         MigrateTrees
-            | any (\ns -> progressKey MigratePayloads ns `S.member` done) migratePayloadNamespaces ->
+            | payloadDone done ->
                 payloadZstdTuning
-            | otherwise -> payloadCompressionTuning (_moPayloadCompression opts)
+            | otherwise -> payloadCompressionTuning (treesCompression opts)
+
+    payloadDone done = any (\ns -> progressKey MigratePayloads ns `S.member` done) migratePayloadNamespaces
+
+    -- trees: the flag against the compression of the live payload files
+    checkTreesCompression done
+        | payloadDone done = when (_moPayloadCompression opts == Just PayloadSnappy) $
+            logg Warn $ "storage-migrate trees: --payload-compression snappy is ignored: a payload"
+                <> " namespace is done, so the files that trees rewrites are written with zstd-dict"
+        | otherwise = do
+            cs <- payloadFileCompressions
+            let zstdDict = length (filter isZstdDict cs)
+                other = length cs - zstdDict
+                counts n = sshow n <> " of the " <> sshow (length cs)
+                    <> " live files that overlap the payload tables"
+            case _moPayloadCompression opts of
+                Nothing | zstdDict > 0 -> throwIO $ userError $ T.unpack $
+                    "storage-migrate trees: " <> counts zstdDict <> " are ZSTD with a dictionary (the node"
+                    <> " ran with --payload-compression zstd-dict), and --payload-compression was not given."
+                    <> " With the default, snappy, trees would rewrite them with Snappy, which undoes that"
+                    <> " and grows the database. Give --payload-compression zstd-dict to keep zstd-dict"
+                    <> " (and run payloads next), or --payload-compression snappy to rewrite them with Snappy."
+                Just PayloadSnappy | zstdDict > 0 -> logg Warn $
+                    "storage-migrate trees: --payload-compression snappy, but " <> counts zstdDict
+                    <> " are ZSTD with a dictionary: the files that trees rewrites get Snappy, which"
+                    <> " grows the database. Run the node with --payload-compression snappy afterwards."
+                Just PayloadZstdDict | other > 0 -> logg Warn $
+                    "storage-migrate trees: --payload-compression zstd-dict, but " <> counts other
+                    <> " are not ZSTD with a dictionary: the files that trees rewrites get zstd-dict."
+                    <> " Run payloads next, and the node with --payload-compression zstd-dict afterwards."
+                _ -> return ()
+
+    -- the compression and its options of each live file that overlaps a
+    -- payload namespace, read without the lock
+    payloadFileCompressions = do
+        files <- withReadOnlyRocksDb db modernDefaultOptions $ \ro ->
+            filter (\f -> any (\ns -> overlapsNamespace ro ns f) migratePayloadNamespaces) <$> liveFileRanges ro
+        forM files $ \f -> sstFileCompression (liveFilePath db f)
+
+    isZstdDict (c, o) = c == "ZSTD" && dictOption `B.isInfixOf` o
 
     waitWhilePaused = forM_ (_moPauseFile opts) $ \f -> do
         paused <- doesFileExist f
@@ -676,7 +750,7 @@ migrateCommandParser = hsubparser $ mconcat
         <> " them). Afterwards run the node with --payload-compression zstd-dict, or it writes Snappy"
         <> " files again."
         )
-        (pure PayloadZstdDict)
+        (pure Nothing)
     ]
   where
     cmd step desc compression = command (T.unpack $ migrateStepName step) $ info
@@ -694,14 +768,14 @@ migrateCommandParser = hsubparser $ mconcat
         <> help "the --database-directory of the node (the RocksDB database is DIR/0/rocksDb), or the RocksDB directory itself"
         )
 
-    compressionOption = option payloadCompressionReader
+    compressionOption = optional $ option payloadCompressionReader
         ( long "payload-compression"
         <> metavar "snappy|zstd-dict"
-        <> value (_moPayloadCompression defaultMigrateOpts)
-        <> showDefaultWith (T.unpack . payloadCompressionToText)
         <> help
             ( "compression of the files that the compaction rewrites; use the value the node runs with,"
             <> " or zstd-dict when payloads runs next (the first compaction rewrites most of the database)."
+            <> " Default: snappy, but if live files of the payload tables are zstd-dict, trees refuses to run"
+            <> " without this option; given, it warns when those files differ from it."
             <> " Once the payloads step has done a namespace, zstd-dict is used whatever this says."
             )
         )

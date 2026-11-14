@@ -706,13 +706,17 @@ tests = testGroup "Migrate"
             dir = ["--database-directory", "d"]
             expect step o = Just (MigrateCommand step "d" o)
         assertEqual "trees, defaults" (expect MigrateTrees defaultMigrateOpts) (parse $ "trees" : dir)
-        assertEqual "the default is the node's" PayloadSnappy (_moPayloadCompression defaultMigrateOpts)
+        assertEqual "not given by default" Nothing (_moPayloadCompression defaultMigrateOpts)
+        assertEqual "the default is the node's" PayloadSnappy (treesCompression defaultMigrateOpts)
+        assertEqual "trees, snappy given"
+            (expect MigrateTrees defaultMigrateOpts { _moPayloadCompression = Just PayloadSnappy })
+            (parse $ "trees" : dir <> ["--payload-compression", "snappy"])
         assertEqual "trees, zstd-dict and a pause file"
-            (expect MigrateTrees defaultMigrateOpts { _moPayloadCompression = PayloadZstdDict, _moPauseFile = Just "p" })
+            (expect MigrateTrees defaultMigrateOpts { _moPayloadCompression = Just PayloadZstdDict, _moPauseFile = Just "p" })
             (parse $ "trees" : dir <> ["--payload-compression", "zstd-dict", "--pause-file", "p"])
         assertEqual "trees rejects zstd" Nothing (parse $ "trees" : dir <> ["--payload-compression", "zstd"])
         assertEqual "payloads, a pause file"
-            (expect MigratePayloads defaultMigrateOpts { _moPayloadCompression = PayloadZstdDict, _moPauseFile = Just "p" })
+            (expect MigratePayloads defaultMigrateOpts { _moPauseFile = Just "p" })
             (parse $ "payloads" : dir <> ["--pause-file", "p"])
         assertEqual "payloads takes no compression" Nothing (parse $ "payloads" : dir <> ["--payload-compression", "snappy"])
         let top = helpOf []
@@ -723,7 +727,7 @@ tests = testGroup "Migrate"
               , "compaction output is installed atomically", "Ctrl-C waits for the running compaction"
               , "approximate size" ] $ \t ->
             assertBool ("help: " <> show t <> " in " <> show top) (t `isInfixOf` top)
-        forM_ ["use the value the node runs with", "or zstd-dict when payloads runs next", "--store-merkle-trees false", "--pause-file"] $ \t ->
+        forM_ ["use the value the node runs with", "or zstd-dict when payloads runs next", "trees refuses to run without this option", "--store-merkle-trees false", "--pause-file"] $ \t ->
             assertBool ("trees help: " <> show t <> " in " <> show trees) (t `isInfixOf` trees)
         forM_ ["--payload-compression zstd-dict", "--pause-file"] $ \t ->
             assertBool ("payloads help: " <> show t <> " in " <> show payloads) (t `isInfixOf` payloads)
@@ -763,7 +767,7 @@ tests = testGroup "Migrate"
 
     , testCase "trees --payload-compression zstd-dict, then payloads: the first compaction of trees rewrites every file with zstd-dict, and payloads compacts no namespace" $
         withMixedFixture $ \_ mixed -> do
-            migrateTrees silent mixed defaultMigrateOpts { _moPayloadCompression = PayloadZstdDict }
+            migrateTrees silent mixed defaultMigrateOpts { _moPayloadCompression = Just PayloadZstdDict }
             assertAllZstd "after trees" mixed
             (code, logs) <- capturing $ \l -> runMigrate l mixed MigratePayloads defaultMigrateOpts
             assertEqual "exit code" ExitSuccess code
@@ -793,6 +797,80 @@ tests = testGroup "Migrate"
             assertEqual "progress: the namespaces before it, and not it"
                 (keysOf MigratePayloads (take 3 migratePayloadNamespaces)) done
 
+    , testCase "trees: live payload files that are zstd-dict and no --payload-compression: refused, naming both choices, nothing changed; given, it warns when the files differ and runs; a payload namespace done and snappy given: warns that zstd-dict is used" $
+        withFixture $ \dir db -> do
+            let snappyDb = dir </> "snappy"
+                partialDb = dir </> "partial"
+                victim = migratePayloadNamespaces !! 2
+            copyDb db snappyDb
+            copyDb db partialDb
+            -- the node wrote zstd-dict files of a payload namespace
+            withRocksDbTuned db modernDefaultOptions payloadZstdTuning $ \rdb ->
+                compactRawRangeForced rdb (namespaceBounds rdb victim)
+            assertNamespacesZstd "fixture" db [victim]
+            sizes0 <- namespaceSizes db treeNamespaces
+            (code, logs) <- capturing $ \l -> runMigrate l db MigrateTrees defaultMigrateOpts
+            assertEqual "exit code without the option" (ExitFailure 1) code
+            forM_ ["are ZSTD with a dictionary", "--payload-compression zstd-dict", "--payload-compression snappy"] $ \t ->
+                assertBool ("the refusal says " <> show t <> ": " <> show logs) (any (t `T.isInfixOf`) logs)
+            sizes1 <- namespaceSizes db treeNamespaces
+            assertEqual "tree namespaces after the refusal" sizes0 sizes1
+            noProgress <- not <$> doesFileExist (progressFile db)
+            assertBool "no progress file after the refusal" noProgress
+            -- given explicitly: a warning, and the step runs
+            (code', logs') <- capturing $ \l ->
+                runMigrate l db MigrateTrees defaultMigrateOpts { _moPayloadCompression = Just PayloadSnappy }
+            assertEqual "exit code with snappy given" ExitSuccess code'
+            assertBool ("warning with snappy given: " <> show logs') $
+                any (\l -> "[Warn]" `T.isInfixOf` l && "--payload-compression snappy, but" `T.isInfixOf` l) logs'
+            done <- doneKeys db
+            assertEqual "progress" (keysOf MigrateTrees treeNamespaces) done
+            -- Snappy files and zstd-dict given: a warning; nothing given: none
+            (codeZ, logsZ) <- capturing $ \l ->
+                runMigrate l snappyDb MigrateTrees defaultMigrateOpts { _moPayloadCompression = Just PayloadZstdDict, _moStopAfter = Just 1 }
+            assertEqual "exit code with zstd-dict given" ExitSuccess codeZ
+            assertBool ("warning with zstd-dict given: " <> show logsZ) $
+                any (\l -> "[Warn]" `T.isInfixOf` l && "--payload-compression zstd-dict, but" `T.isInfixOf` l) logsZ
+            (codeN, logsN) <- capturing $ \l -> runMigrate l partialDb MigrateTrees defaultMigrateOpts { _moStopAfter = Just 1 }
+            assertEqual "exit code on Snappy files, nothing given" ExitSuccess codeN
+            assertEqual "no warning on Snappy files, nothing given" [] (filter ("[Warn]" `T.isInfixOf`) logsN)
+            -- a payload namespace is done: zstd-dict, and snappy given is named as ignored
+            migratePayloads silent partialDb defaultMigrateOpts { _moStopAfter = Just 1 }
+            (codeP, logsP) <- capturing $ \l ->
+                runMigrate l partialDb MigrateTrees defaultMigrateOpts { _moPayloadCompression = Just PayloadSnappy }
+            assertEqual "exit code, a payload namespace done" ExitSuccess codeP
+            assertBool ("warning that snappy is ignored: " <> show logsP) $
+                any (\l -> "[Warn]" `T.isInfixOf` l && "--payload-compression snappy is ignored" `T.isInfixOf` l) logsP
+
+    , testCase "trees: the progress file changes between its first read and the lock (a payload namespace done meanwhile): fails, asks for a rerun, starts no namespace; the rerun writes zstd-dict" $
+        withFixture $ \dir db -> do
+            let pause = dir </> "PAUSE"
+            writeFile pause "pause"
+            -- the step reads the progress, then waits for the pause file
+            -- before it opens the database
+            withAsync (capturing $ \l -> runMigrate l db MigrateTrees defaultMigrateOpts { _moPauseFile = Just pause }) $ \a -> do
+                threadDelay 1_500_000
+                r <- poll a
+                assertBool "the run waits" (isNothing r)
+                ident <- dbIdentity db
+                writeProgress db (Progress ident (keysOf MigratePayloads (take 1 migratePayloadNamespaces)))
+                removeFile pause
+                finished <- timeout 60_000_000 (wait a)
+                case finished of
+                    Nothing -> assertFailure "the run does not end"
+                    Just (code, logs) -> do
+                        assertEqual "exit code" (ExitFailure 1) code
+                        assertBool ("the error asks for a rerun: " <> show logs) $
+                            any (\l -> "run the step again" `T.isInfixOf` l && "zstd-dict" `T.isInfixOf` l) logs
+                        assertEqual "no namespace started" [] (filter (": start" `T.isInfixOf`) logs)
+            sizes <- namespaceSizes db treeNamespaces
+            assertBool "the tree namespaces have their entries" (all ((> 0) . snd) sizes)
+            done <- doneKeys db
+            assertEqual "progress unchanged" (keysOf MigratePayloads (take 1 migratePayloadNamespaces)) done
+            code' <- runMigrate silent db MigrateTrees defaultMigrateOpts
+            assertEqual "exit code of the rerun" ExitSuccess code'
+            assertTreeFilesGone "after the rerun" db treeNamespaces
+
     , testCase "trees --payload-compression: files that trees rewrites get the node's compression (snappy by default, zstd-dict when given)" $
         withMixedFixture $ \dir mixed -> do
             let snappyDb = dir </> "snappy"
@@ -800,7 +878,7 @@ tests = testGroup "Migrate"
             migrateTrees silent snappyDb defaultMigrateOpts
             cs <- compressions snappyDb
             assertBool ("default: Snappy only: " <> show cs) (all (== "Snappy") cs && not (null cs))
-            migrateTrees silent mixed defaultMigrateOpts { _moPayloadCompression = PayloadZstdDict }
+            migrateTrees silent mixed defaultMigrateOpts { _moPayloadCompression = Just PayloadZstdDict }
             assertAllZstd "zstd-dict" mixed
             d <- diffDbs snappyDb mixed everyNamespace
             assertNoDiff "the compression changed an entry" d
@@ -817,6 +895,9 @@ tests = testGroup "Migrate"
                 assertEqual "no namespace is done while paused" mempty done
                 sizes <- namespaceSizes db treeNamespaces
                 assertBool "no tree namespace was deleted while paused" (all ((> 0) . snd) sizes)
+                -- the database is not opened while paused: its LOCK is free
+                locked <- try @IOException $ withRocksDb db modernDefaultOptions $ \_ -> return ()
+                assertEqual "the database is not locked while paused" (Right ()) (either (Left . show) Right locked)
                 removeFile pause
                 finished <- timeout 60_000_000 (wait a)
                 assertEqual "the run finishes after the removal" (Just ()) finished
