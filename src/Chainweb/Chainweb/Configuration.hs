@@ -32,6 +32,12 @@ module Chainweb.Chainweb.Configuration
 , chainDatabaseGcToText
 , chainDatabaseGcFromText
 
+, PayloadCompression(..)
+, payloadCompressionToText
+, payloadCompressionFromText
+, payloadCompressionReader
+, payloadCompressionTuning
+
 , CutConfig(..)
 , cutPruneChainDatabase
 , cutFetchTimeout
@@ -66,6 +72,8 @@ module Chainweb.Chainweb.Configuration
 , configThrottling
 , configReorgLimit
 , configFullHistoricPactState
+, configStoreMerkleTrees
+, configPayloadCompression
 , configBackup
 , configServiceApi
 , configOnlySyncPact
@@ -73,7 +81,10 @@ module Chainweb.Chainweb.Configuration
 , configEnableLocalTimeout
 , defaultChainwebConfiguration
 , pChainwebConfiguration
+, chainwebPayloadDbConfig
+, chainwebRocksDbTuning
 , validateChainwebConfiguration
+, boolValueReader
 
 ) where
 
@@ -113,7 +124,9 @@ import Chainweb.Mempool.P2pConfig
 import Chainweb.Miner.Config
 import Chainweb.Pact.Types (defaultReorgLimit, defaultModuleCacheLimit, defaultPreInsertCheckTimeout)
 import Chainweb.Pact.Types (RewindLimit(..))
+import Chainweb.Payload.PayloadStore (PayloadDbConfig(..), StoreMerkleTrees(..))
 import Chainweb.Payload.RestAPI (PayloadBatchLimit(..), defaultServicePayloadBatchLimit)
+import Chainweb.Storage.Table.RocksDB.Tuning (RocksDbTuning, defaultTuning, payloadZstdTuning)
 import Chainweb.Utils
 import Chainweb.Version
 import Chainweb.Version.Development
@@ -202,6 +215,62 @@ instance FromJSON ChainDatabaseGcConfig where
             True -> return GcHeaders
             False -> return GcNone
     {-# INLINE parseJSON #-}
+
+-- -------------------------------------------------------------------------- --
+-- Payload Compression
+
+-- | The compression of the RocksDB instance (spec 4.2). The options apply to
+-- the whole instance, so block headers get zstd too.
+--
+-- Compression is recorded per SST file: files written with one setting stay
+-- readable under the other. New settings only affect files written later.
+--
+data PayloadCompression
+    = PayloadSnappy
+        -- ^ the options of chainweb-node 3.2.1
+    | PayloadZstdDict
+        -- ^ zstd level 3 with a 64 KB dictionary per file, 32 KB blocks
+    deriving (Show, Eq, Ord, Enum, Bounded, Generic)
+
+payloadCompressionToText :: PayloadCompression -> T.Text
+payloadCompressionToText PayloadSnappy = "snappy"
+payloadCompressionToText PayloadZstdDict = "zstd-dict"
+
+payloadCompressionFromText :: MonadThrow m => T.Text -> m PayloadCompression
+payloadCompressionFromText = \case
+    "snappy" -> return PayloadSnappy
+    "zstd-dict" -> return PayloadZstdDict
+    x -> throwM $ TextFormatException
+        $ "unknown payload compression " <> sshow x <> ", expected snappy or zstd-dict"
+
+-- | Reads @snappy@ or @zstd-dict@. Any other value fails with a message that
+-- names both.
+--
+payloadCompressionReader :: ReadM PayloadCompression
+payloadCompressionReader = eitherReader $ \s ->
+    maybe (Left $ "unknown payload compression " <> show s <> ", expected snappy or zstd-dict") Right
+        $ payloadCompressionFromText (T.pack s)
+
+instance HasTextRepresentation PayloadCompression where
+    toText = payloadCompressionToText
+    fromText = payloadCompressionFromText
+    {-# INLINE toText #-}
+    {-# INLINE fromText #-}
+
+instance ToJSON PayloadCompression where
+    toJSON = toJSON . payloadCompressionToText
+    {-# INLINE toJSON #-}
+
+instance FromJSON PayloadCompression where
+    parseJSON = parseJsonFromText "PayloadCompression"
+    {-# INLINE parseJSON #-}
+
+-- | The RocksDB tuning of a 'PayloadCompression'. 'PayloadSnappy' is
+-- 'defaultTuning', which changes no option.
+--
+payloadCompressionTuning :: PayloadCompression -> RocksDbTuning
+payloadCompressionTuning PayloadSnappy = defaultTuning
+payloadCompressionTuning PayloadZstdDict = payloadZstdTuning
 
 data CutConfig = CutConfig
     { _cutPruneChainDatabase :: !ChainDatabaseGcConfig
@@ -395,6 +464,11 @@ data ChainwebConfiguration = ChainwebConfiguration
     , _configPreInsertCheckTimeout :: !Micros
     , _configAllowReadsInLocal :: !Bool
     , _configFullHistoricPactState :: !Bool
+    , _configStoreMerkleTrees :: !Bool
+        -- ^ write the Merkle trees of block payloads. Nothing reads them: SPV
+        -- proofs rebuild the trees from the payloads.
+    , _configPayloadCompression :: !PayloadCompression
+        -- ^ compression of the RocksDB instance; it applies to new files only
     , _configBackup :: !BackupConfig
     , _configServiceApi :: !ServiceApiConfig
     , _configReadOnlyReplay :: !Bool
@@ -442,6 +516,25 @@ validateBackupConfig c =
         unless (writable perms) $
             throwError $ "Backup directory " <> T.pack dir <> " is not writable"
 
+-- | The configuration of the node's payload store: Merkle trees are stored
+-- unless @--store-merkle-trees false@. With the defaults it is
+-- 'defaultPayloadDbConfig', the payload store of chainweb-node 3.2.1.
+--
+chainwebPayloadDbConfig :: ChainwebConfiguration -> PayloadDbConfig
+chainwebPayloadDbConfig conf = PayloadDbConfig
+    { _payloadDbConfigStoreTrees = if _configStoreMerkleTrees conf
+        then StoreMerkleTrees
+        else DoNotStoreMerkleTrees
+    }
+
+-- | The tuning with which the node opens its RocksDB database:
+-- 'payloadCompressionTuning' of @--payload-compression@. With the defaults it
+-- is 'defaultTuning', which leaves the options of chainweb-node 3.2.1
+-- unchanged.
+--
+chainwebRocksDbTuning :: ChainwebConfiguration -> RocksDbTuning
+chainwebRocksDbTuning = payloadCompressionTuning . _configPayloadCompression
+
 defaultChainwebConfiguration :: ChainwebVersion -> ChainwebConfiguration
 defaultChainwebConfiguration v = ChainwebConfiguration
     { _configChainwebVersion = v
@@ -460,6 +553,8 @@ defaultChainwebConfiguration v = ChainwebConfiguration
     , _configPreInsertCheckTimeout = defaultPreInsertCheckTimeout
     , _configAllowReadsInLocal = False
     , _configFullHistoricPactState = True
+    , _configStoreMerkleTrees = True
+    , _configPayloadCompression = PayloadSnappy
     , _configServiceApi = defaultServiceApiConfig
     , _configOnlySyncPact = False
     , _configReadOnlyReplay = False
@@ -487,6 +582,8 @@ instance ToJSON ChainwebConfiguration where
         , "preInsertCheckTimeout" .= _configPreInsertCheckTimeout o
         , "allowReadsInLocal" .= _configAllowReadsInLocal o
         , "fullHistoricPactState" .= _configFullHistoricPactState o
+        , "storeMerkleTrees" .= _configStoreMerkleTrees o
+        , "payloadCompression" .= _configPayloadCompression o
         , "serviceApi" .= _configServiceApi o
         , "onlySyncPact" .= _configOnlySyncPact o
         , "readOnlyReplay" .= _configReadOnlyReplay o
@@ -518,6 +615,8 @@ instance FromJSON (ChainwebConfiguration -> ChainwebConfiguration) where
         <*< configAllowReadsInLocal ..: "allowReadsInLocal" % o
         <*< configPreInsertCheckTimeout ..: "preInsertCheckTimeout" % o
         <*< configFullHistoricPactState ..: "fullHistoricPactState" % o
+        <*< configStoreMerkleTrees ..: "storeMerkleTrees" % o
+        <*< configPayloadCompression ..: "payloadCompression" % o
         <*< configServiceApi %.: "serviceApi" % o
         <*< configOnlySyncPact ..: "onlySyncPact" % o
         <*< configReadOnlyReplay ..: "readOnlyReplay" % o
@@ -564,6 +663,14 @@ pChainwebConfiguration = id
     <*< configFullHistoricPactState .:: boolOption_
         % long "full-historic-pact-state"
         <> help "Write full historic Pact state; only enable for custodial or archival nodes."
+    <*< configStoreMerkleTrees .:: option boolValueReader
+        % long "store-merkle-trees"
+        <> metavar "true|false"
+        <> help "Write the Merkle trees of block payloads. Nothing reads them: SPV proofs rebuild them from the payloads. false saves disk."
+    <*< configPayloadCompression .:: option payloadCompressionReader
+        % long "payload-compression"
+        <> metavar "snappy|zstd-dict"
+        <> help "Compression of the RocksDB instance: snappy, or zstd-dict for zstd with a dictionary per file. It applies to files written from then on; files of either kind stay readable."
     <*< configCuts %:: pCutConfig
     <*< configServiceApi %:: pServiceApiConfig
     <*< configMining %:: pMiningConfig
@@ -585,6 +692,17 @@ pChainwebConfiguration = id
     <*< configEnableLocalTimeout .:: option auto
         % long "enable-local-timeout"
         <> help "Enable timeout support on /local endpoints"
+
+-- | Reads @true@ or @false@ and fails on any other value.
+--
+-- Unlike 'boolOption_' the option takes a value, so that it can be set
+-- either way on the command line, for the node and the tools alike.
+--
+boolValueReader :: ReadM Bool
+boolValueReader = eitherReader $ \case
+    "true" -> Right True
+    "false" -> Right False
+    s -> Left $ "expected true or false, got " <> show s
 
 parseVersion :: MParser ChainwebVersion
 parseVersion = constructVersion

@@ -51,7 +51,10 @@ newTransactionDb = TransactionDb
     oldBlockTransactionsStore = Casify <$> HashMapTable.emptyTable
 
 newPayloadDb :: IO (PayloadDb HashMapTable)
-newPayloadDb = PayloadDb <$> newTransactionDb <*> newPayloadCache
+newPayloadDb = PayloadDb
+    <$> newTransactionDb
+    <*> newPayloadCache
+    <*> pure defaultPayloadDbConfig
   where
     newPayloadCache :: IO (PayloadCache HashMapTable)
     newPayloadCache = PayloadCache

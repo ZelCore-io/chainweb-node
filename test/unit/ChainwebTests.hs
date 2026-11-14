@@ -36,7 +36,7 @@ import Chainweb.Version.Registry
 -- chainweb-test-tools modules
 
 import Chainweb.Test.Utils
-    (independentSequentialTestGroup, toyChainId, withToyDB)
+    (independentSequentialTestGroup, testStorageTuning, toyChainId, withToyDB)
 
 -- internal modules
 
@@ -57,7 +57,9 @@ import qualified Chainweb.Test.MinerReward (tests)
 import qualified Chainweb.Test.Mining (tests)
 import qualified Chainweb.Test.Misc (tests)
 import qualified Chainweb.Test.Pact.Store.Characterization (tests)
+import qualified Chainweb.Test.Pact.Store.ColdKey (tests)
 import qualified Chainweb.Test.Pact.Store.SQLite (tests)
+import qualified Chainweb.Test.Payload.Store (tests)
 import qualified Chainweb.Test.Pact4.Checkpointer (tests)
 import qualified Chainweb.Test.Pact4.DbCacheTest (tests)
 import qualified Chainweb.Test.Pact4.GrandHash (tests)
@@ -103,7 +105,8 @@ main :: IO ()
 main = do
     registerVersion RecapDevelopment
     registerVersion Development
-    withTempRocksDb "chainweb-tests" $ \rdb ->
+    tuning <- testStorageTuning
+    withTempRocksDbTuned "chainweb-tests" tuning $ \rdb ->
         runResourceT $ do
             (h0, db) <- withToyDB rdb toyChainId
             liftIO
@@ -184,6 +187,8 @@ suite rdb =
         , Chainweb.Test.Mining.tests rdb
         , Chainweb.Test.MinerReward.tests
         , Chainweb.Test.Misc.tests
+        , Chainweb.Test.Pact.Store.ColdKey.tests
+        , Chainweb.Test.Payload.Store.tests
         , Chainweb.Test.BlockHeader.Genesis.tests
         , Chainweb.Test.BlockHeader.Validation.tests
         , Chainweb.Test.Version.tests

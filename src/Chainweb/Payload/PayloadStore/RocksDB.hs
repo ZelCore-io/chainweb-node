@@ -13,6 +13,7 @@
 module Chainweb.Payload.PayloadStore.RocksDB
 ( newTransactionDb
 , newPayloadDb
+, newPayloadDbWith
 ) where
 
 -- internal modules
@@ -71,8 +72,14 @@ newTransactionDb db = TransactionDb
         (Codec (runPutS . encodeBlockTransactionsHash) (runGetS decodeBlockTransactionsHash))
         ["BlockTransactions"]
 
+-- | A payload store with 'defaultPayloadDbConfig', the configuration of
+-- chainweb-node 3.2.1.
+--
 newPayloadDb :: RocksDb -> PayloadDb RocksDbTable
-newPayloadDb db = PayloadDb (newTransactionDb db) newPayloadCache
+newPayloadDb = newPayloadDbWith defaultPayloadDbConfig
+
+newPayloadDbWith :: PayloadDbConfig -> RocksDb -> PayloadDb RocksDbTable
+newPayloadDbWith config db = PayloadDb (newTransactionDb db) newPayloadCache config
   where
     newPayloadCache :: PayloadCache RocksDbTable
     newPayloadCache = PayloadCache blockOutputsStore transactionTreeStore outputTreeStore

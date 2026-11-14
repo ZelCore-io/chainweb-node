@@ -43,6 +43,7 @@ package chainweb-node
     ghc-options: -Wno-missed-extra-shared-lib
 
 package cwtools
+    tests: True
     ghc-options: -Wno-missed-extra-shared-lib
 
 package chainweb-storage

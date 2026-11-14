@@ -27,6 +27,10 @@ module Chainweb.Pact.Backend.Compaction
   -- * Exported for testing
   , doCompactPactState
   , doCompactRocksDb
+  , doCompactRocksDbWith
+  , Config(..)
+  , configParserInfo
+  , compactPayloadDbConfig
   , Retainment(..)
   , defaultRetainment
 
@@ -78,8 +82,9 @@ import Chainweb.Pact4.Backend.ChainwebPactDb ()
 import Chainweb.Pact.Backend.PactState
 import Chainweb.Pact.Backend.Types
 import Chainweb.Pact.Backend.Utils
-import Chainweb.Payload.PayloadStore (initializePayloadDb, addNewPayload, lookupPayloadWithHeight)
-import Chainweb.Payload.PayloadStore.RocksDB (newPayloadDb)
+import Chainweb.Chainweb.Configuration (boolValueReader)
+import Chainweb.Payload.PayloadStore (initializePayloadDb, addNewPayload, lookupPayloadWithHeight, PayloadDbConfig(..), StoreMerkleTrees(..), defaultPayloadDbConfig)
+import Chainweb.Payload.PayloadStore.RocksDB (newPayloadDb, newPayloadDbWith)
 import Chainweb.Utils (sshow, fromText, toText, int)
 import Chainweb.Version (ChainId, ChainwebVersion(..), chainIdToText)
 import Chainweb.Version.Guards (minimumBlockHeaderHistory)
@@ -156,6 +161,18 @@ data Config = Config
   , compactTransactionIndex :: Bool
     -- ^ Compact the TransactionIndex table in the Pact state?
     -- Some APIs (e.g. /poll) rely on this table, so the default is False.
+  , storeMerkleTrees :: Bool
+    -- ^ Write the Merkle trees of the payloads that are copied to the target
+    -- RocksDB? The default is True, as in chainweb-node 3.2.1.
+  }
+
+-- | The payload store configuration of the target RocksDB.
+--
+compactPayloadDbConfig :: Config -> PayloadDbConfig
+compactPayloadDbConfig cfg = PayloadDbConfig
+  { _payloadDbConfigStoreTrees = if cfg.storeMerkleTrees
+      then StoreMerkleTrees
+      else DoNotStoreMerkleTrees
   }
 
 data Retainment = Retainment
@@ -175,8 +192,12 @@ data CompactThese = CompactOnlyRocksDb | CompactOnlyPactState | CompactBoth | Co
 data ConcurrentChains = SingleChain | ManyChainsAtOnce
 
 getConfig :: IO Config
-getConfig = do
-  O.execParser opts
+getConfig = O.execParser configParserInfo
+
+-- | The command line of the compaction tool.
+--
+configParserInfo :: O.ParserInfo Config
+configParserInfo = opts
   where
     opts :: O.ParserInfo Config
     opts = O.info (parser O.<**> O.helper)
@@ -201,6 +222,13 @@ getConfig = do
       compactTransactionIndex <- O.switch
         (O.long "compact-transaction-index"
         <> O.help "Compact the TransactionIndex table in the Pact state. For historical blocks, the /poll Pact endpoint relies on this table, so it is not compacted by default."
+        )
+      storeMerkleTrees <- O.option boolValueReader
+        (O.long "store-merkle-trees"
+        <> O.metavar "true|false"
+        <> O.value True
+        <> O.showDefaultWith (\b -> if b then "true" else "false")
+        <> O.help "Write the Merkle trees of the payloads that are copied to the target RocksDB (with --compact-rocksdb). Nothing reads them: SPV proofs rebuild the trees from the payloads."
         )
       return Config {..}
 
@@ -394,7 +422,7 @@ compact cfg = do
     withRocksDbFileLogger cfg.logDir LL.Debug $ \logger -> do
       withReadOnlyRocksDb (rocksDir cfg.fromDir) modernDefaultOptions $ \srcRocksDb -> do
         withRocksDb (rocksDir cfg.toDir) (modernDefaultOptions { compression = NoCompression }) $ \targetRocksDb -> do
-          doCompactRocksDb (set setLoggerLevel (l2l LL.Info) logger) cfg.chainwebVersion cids (targetBlockHeight - blockHeightKeepDepth) srcRocksDb targetRocksDb
+          doCompactRocksDbWith (compactPayloadDbConfig cfg) (set setLoggerLevel (l2l LL.Info) logger) cfg.chainwebVersion cids (targetBlockHeight - blockHeightKeepDepth) srcRocksDb targetRocksDb
 
   -- Compact the pact state.
   let retainment = Retainment
@@ -713,6 +741,7 @@ rocksDir :: FilePath -> FilePath
 rocksDir db = db </> "0/rocksDb"
 
 -- | Copy over all CutHashes, all BlockHeaders, and only some Payloads.
+-- The payloads are written with 'defaultPayloadDbConfig'.
 doCompactRocksDb :: (Logger logger)
   => logger
   -> ChainwebVersion -- ^ cw version
@@ -721,7 +750,20 @@ doCompactRocksDb :: (Logger logger)
   -> RocksDb -- ^ source db, should be opened read-only
   -> RocksDb -- ^ target db
   -> IO ()
-doCompactRocksDb logger cwVersion cids minBlockHeight srcDb targetDb = do
+doCompactRocksDb = doCompactRocksDbWith defaultPayloadDbConfig
+
+-- | 'doCompactRocksDb' with the payload store configuration of the target.
+-- Only the writes to the target depend on it.
+doCompactRocksDbWith :: (Logger logger)
+  => PayloadDbConfig -- ^ payload store configuration of the target db
+  -> logger
+  -> ChainwebVersion -- ^ cw version
+  -> [ChainId] -- ^ ChainIds
+  -> BlockHeight -- ^ minBlockHeight for payload copying
+  -> RocksDb -- ^ source db, should be opened read-only
+  -> RocksDb -- ^ target db
+  -> IO ()
+doCompactRocksDbWith targetPayloadConfig logger cwVersion cids minBlockHeight srcDb targetDb = do
   let logfun = logFunctionText logger
 
   -- Copy over entirety of CutHashes table
@@ -742,7 +784,7 @@ doCompactRocksDb logger cwVersion cids minBlockHeight srcDb targetDb = do
 
   -- Migrate BlockHeaders and Payloads
   let srcPayloads = newPayloadDb srcDb
-  let targetPayloads = newPayloadDb targetDb
+  let targetPayloads = newPayloadDbWith targetPayloadConfig targetDb
 
   -- The target payload db has to be initialised.
   logfun LL.Info "Initializing payload db"
