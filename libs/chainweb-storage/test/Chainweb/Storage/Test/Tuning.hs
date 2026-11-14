@@ -1,5 +1,6 @@
 {-# LANGUAGE ImportQualifiedPost #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE TypeApplications #-}
 
 -- |
 -- Module: Chainweb.Storage.Test.Tuning
@@ -19,7 +20,7 @@ import Chainweb.Storage.Table.RocksDB.Tuning
 import Chainweb.Storage.Table (tableInsertBatch)
 
 import Control.Concurrent.Async (mapConcurrently_)
-import Control.Exception (Exception, bracket, finally, throwIO)
+import Control.Exception (Exception, IOException, bracket, finally, throwIO, try)
 import Control.Monad (forM_, unless, when)
 import Control.Monad.Catch (throwM)
 
@@ -200,6 +201,8 @@ tuningTests = forM_ tests $ \(name, test) -> do
         , ("blockSizeReachesSstTest", blockSizeReachesSstTest)
         , ("blockCacheReachesDbTest", blockCacheReachesDbTest)
         , ("directReadsReachOptionsTest", directReadsReachOptionsTest)
+        , ("maxSubcompactionsReachOptionsTest", maxSubcompactionsReachOptionsTest)
+        , ("sstFileCompressionTest", sstFileCompressionTest)
         ]
 
 -- | Every foreign import of "Chainweb.Storage.Table.RocksDB.Tuning" resolves
@@ -213,6 +216,7 @@ tuningLinkTest = do
         c_rocksdb_options_set_compression_options opts (-14) 3 0 65536
         c_rocksdb_options_set_compression_options_zstd_max_train_bytes opts 6553600
         c_rocksdb_options_set_use_direct_reads opts 0
+        c_rocksdb_options_set_max_subcompactions opts 2
         bracket c_rocksdb_block_based_options_create c_rocksdb_block_based_options_destroy $ \tbl ->
             bracket (c_rocksdb_cache_create_lru (1 `shiftL` 20)) c_rocksdb_cache_destroy $ \cache -> do
                 c_rocksdb_block_based_options_set_block_size tbl 32768
@@ -263,6 +267,7 @@ tuningValuesTest = do
         , _tuningBloomBitsPerKey = Nothing
         , _tuningBlockCacheBytes = Nothing
         , _tuningDirectReads = False
+        , _tuningMaxSubcompactions = Nothing
         }
     assertBool "payloadZstdTuning" $ payloadZstdTuning == defaultTuning
         { _tuningCompression = Zstd
@@ -488,3 +493,43 @@ directReadsReachOptionsTest =
         assertBool ("no OPTIONS file in " <> dir) (not (null optionFiles))
         options <- B.readFile (dir <> "/" <> last optionFiles)
         assertContains (last optionFiles) expected options
+
+-- | @max_subcompactions@ reaches the options of the database (its OPTIONS
+-- file); without it, RocksDB's default of 1 stays. A value that does not fit
+-- @uint32_t@ is refused before the open.
+--
+maxSubcompactionsReachOptionsTest :: IO ()
+maxSubcompactionsReachOptionsTest = do
+    forM_ [(Just 3, "max_subcompactions=3"), (Nothing, "max_subcompactions=1")] $ \(n, expected) ->
+        withTestDir "tuning-subcompactions" $ \dir -> do
+            let tuning = payloadZstdTuning { _tuningMaxSubcompactions = n }
+            withRocksDbTuned dir modernDefaultOptions tuning $ \db -> do
+                writeEntries (bytesTable db "t") [0 .. 99]
+                flushRocksDb db
+            optionFiles <- L.sort . filter ("OPTIONS-" `L.isPrefixOf`) <$> listDirectory dir
+            assertBool ("no OPTIONS file in " <> dir) (not (null optionFiles))
+            options <- B.readFile (dir <> "/" <> last optionFiles)
+            assertContains (last optionFiles) expected options
+    forM_ [0, -1] $ \n -> withTestDir "tuning-subcompactions-invalid" $ \dir -> do
+        r <- try @IOException $
+            withRocksDbTuned dir modernDefaultOptions defaultTuning { _tuningMaxSubcompactions = Just n } $ \_ ->
+                return ()
+        assertBool ("max subcompactions " <> show n <> " is refused") (either (const True) (const False) r)
+
+-- | 'sstFileCompression' of each live file equals its entry in
+-- 'sstCompressionInfo', for Snappy and zstd files.
+--
+sstFileCompressionTest :: IO ()
+sstFileCompressionTest = withTestDir "tuning-file-compression" $ \dir -> do
+    withRocksDb dir modernDefaultOptions $ \db -> do
+        writeEntries (bytesTable db "t") [0 .. 99]
+        flushRocksDb db
+    withRocksDbTuned dir modernDefaultOptions payloadZstdTuning $ \db -> do
+        writeEntries (bytesTable db "u") [0 .. 99]
+        flushRocksDb db
+    info <- sstCompressionInfo dir
+    assertBool "Snappy and zstd files" $
+        L.sort (L.nub (fst <$> M.elems info)) == ["Snappy", "ZSTD"]
+    forM_ (M.toList info) $ \(path, expected) -> do
+        c <- sstFileCompression path
+        assertBool ("sstFileCompression " <> path <> ": " <> show c <> " /= " <> show expected) (c == expected)
