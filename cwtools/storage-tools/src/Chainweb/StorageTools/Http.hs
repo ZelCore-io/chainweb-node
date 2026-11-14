@@ -18,6 +18,7 @@ module Chainweb.StorageTools.Http
 , newLimiter
 , throttled
 , limiterPermits
+, pausePollMicros
 
   -- * Service API
 , ServiceApi(..)

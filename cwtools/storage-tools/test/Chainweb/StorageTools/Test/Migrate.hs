@@ -1,4 +1,5 @@
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE NumericUnderscores #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TypeApplications #-}
@@ -13,6 +14,10 @@
 -- @OutputTree@), which 'addNewPayload' never writes. Each namespace of the
 -- fixture sits in SST files of its own, so the tests see which namespaces a
 -- step rewrote.
+--
+-- The leveled fixtures ('withLeveledFixture') are the database of a node
+-- instead: the old-layout tables are empty, and files at several levels span
+-- them with keys of their neighbours.
 --
 module Chainweb.StorageTools.Test.Migrate
 ( tests
@@ -34,6 +39,9 @@ import qualified Data.Set as S
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
+
+import Foreign.C (CInt(..), CUChar(..))
+import Foreign.Ptr (Ptr)
 
 import Options.Applicative
 
@@ -121,6 +129,106 @@ withMixedFixture act = withSource $ \src -> withSystemTempDirectory "storage-mig
     assertNonEmpty db
     act dir db
 
+-- | A part of a namespace of the fixture: the namespace and some of the four
+-- quarters (1 to 4) of its entries in key order.
+--
+type Part = (B.ByteString, [Int])
+
+-- | A closed database at @<dir>/db@ with the given parts of the fixture's
+-- namespaces; a namespace that no part names is empty. The parts of a group
+-- are written together and flushed, so they share SST files:
+--
+-- * a group for level 0 stays in the file of the flush;
+-- * a group for level 1 is compacted ('compactRawRangeForced' of its keys),
+--   which puts it at level 1;
+-- * a group for a deeper level is compacted, and the result is moved to that
+--   level (@change_level@). This moves every file of level 1 and needs the
+--   levels in between to be empty, so such a group comes first.
+--
+-- The sentinel key of the open (@.@) is flushed alone and then compacted to
+-- level 1, so that level 0 holds the groups for level 0 only.
+--
+withLeveledFixture :: [(Int, [Part])] -> (FilePath -> FilePath -> IO a) -> IO a
+withLeveledFixture groups act = withMixedFixture $ \dir mixed -> do
+    let db = dir </> "db"
+    withReadOnlyRocksDb mixed modernDefaultOptions $ \from ->
+        withRocksDb db modernDefaultOptions $ \rdb -> do
+            flushRocksDb rdb
+            forM_ groups $ \(level, parts) -> do
+                keys <- fmap concat $ forM parts $ \(ns, qs) -> do
+                    es <- readNamespace from ns
+                    let es' = concat [quarter q es | q <- qs]
+                    updateBatch [RocksDbInsert (rawTable rdb ns) k v | (k, v) <- es']
+                    return [fst (namespaceBounds rdb ns) <> k | (k, _) <- es']
+                assertBool ("fixture: a group without entries: " <> show parts) (not $ null keys)
+                flushRocksDb rdb
+                let range = (minimum keys, maximum keys)
+                if
+                    | level == 0 -> return ()
+                    | level == 1 -> compactRawRangeForced rdb range
+                    | otherwise -> compactRawRangeWith (toLevel level) rdb range
+            compactRawRangeForced rdb (".", ".")
+    act dir db
+  where
+    quarter q es = take (hi - lo) (drop lo es)
+      where
+        n = length es
+        lo = (q - 1) * n `div` 4
+        hi = q * n `div` 4
+    toLevel level copts = do
+        c_rocksdb_compactoptions_set_change_level copts 1
+        c_rocksdb_compactoptions_set_target_level copts (fromIntegral level)
+
+-- | @void rocksdb_compactoptions_set_change_level(rocksdb_compactoptions_t*,
+-- unsigned char);@
+foreign import ccall safe "rocksdb_compactoptions_set_change_level"
+    c_rocksdb_compactoptions_set_change_level
+        :: Ptr CompactOptions -> CUChar -> IO ()
+
+-- | @void rocksdb_compactoptions_set_target_level(rocksdb_compactoptions_t*,
+-- int);@
+foreign import ccall safe "rocksdb_compactoptions_set_target_level"
+    c_rocksdb_compactoptions_set_target_level
+        :: Ptr CompactOptions -> CInt -> IO ()
+
+-- | A node's payload tables: the old-layout @BlockPayload@ is empty, and files
+-- at levels 3, 1 and 0 span it, each with keys of @BlockOutputs2@ and
+-- @BlockPayload2@ (the namespaces before and after it). @BlockPayloadIndex@
+-- and @BlockTransactions2@ sit in files of their own.
+--
+payloadStraddle :: [(Int, [Part])]
+payloadStraddle =
+    [ (3, [("BlockOutputs2", [1]), ("BlockPayload2", [4])])
+    , (1, [("BlockOutputs2", [4]), ("BlockPayload2", [1])])
+    , (1, [("BlockPayloadIndex", [1 .. 4])])
+    , (1, [("BlockTransactions2", [1 .. 4])])
+    , (0, [("BlockOutputs2", [2, 3]), ("BlockPayload2", [2, 3])])
+    ]
+
+-- | A node's tree tables: the old-layout @TransactionTree@ is empty, and files
+-- at levels 3, 1 and 0 span it, each with keys of @OutputTree2@ and
+-- @TransactionTree2@. The file at level 0 also holds @CutHashes@, so it spans
+-- the empty @OutputTree@ as well.
+--
+treeStraddle :: [(Int, [Part])]
+treeStraddle =
+    [ (3, [("OutputTree2", [1]), ("TransactionTree2", [4])])
+    , (1, [("OutputTree2", [4]), ("TransactionTree2", [1])])
+    , (0, [("CutHashes", [1 .. 4]), ("OutputTree2", [2, 3]), ("TransactionTree2", [2, 3])])
+    ]
+
+-- | The empty namespace has no entries, and the live files that overlap it
+-- sit at the given levels and are Snappy.
+--
+assertSpanned :: FilePath -> B.ByteString -> [Int] -> Assertion
+assertSpanned db ns levels = do
+    sizes <- namespaceSizes db [ns]
+    assertEqual ("fixture: " <> B8.unpack ns <> " is empty") [(ns, 0)] sizes
+    fs <- filesOverlapping db ns
+    assertEqual ("fixture: levels of the files that span " <> B8.unpack ns <> ": " <> show fs)
+        (S.fromList levels) (S.fromList $ _lfLevel <$> fs)
+    assertNamespacesSnappy "fixture" db [ns]
+
 -- | Every namespace has entries, so no check of a test is vacuous.
 --
 assertNonEmpty :: FilePath -> Assertion
@@ -192,6 +300,23 @@ assertAllZstd msg db = do
         assertBool (msg <> ": dictionary of " <> f <> ": " <> show o)
             ("max_dict_bytes=65536;" `B.isInfixOf` o)
 
+-- | Every live SST file is ZSTD with a dictionary, except the files that hold
+-- only the sentinel key of an open (@.@), which no step rewrites.
+--
+assertAllZstdButSentinel :: String -> FilePath -> Assertion
+assertAllZstdButSentinel msg db = do
+    files <- withReadOnlyRocksDb db modernDefaultOptions liveFileRanges
+    info' <- sstCompressionInfo db
+    let sentinel f = _lfSmallestKey f == "." && _lfLargestKey f == "."
+        checked = filter (not . sentinel) files
+    assertBool (msg <> ": no SST files") (not $ null checked)
+    forM_ checked $ \f -> case M.lookup (liveFilePath db f) info' of
+        Nothing -> assertFailure $ msg <> ": no SST info for " <> show f
+        Just (c, o) -> do
+            assertEqual (msg <> ": compression of " <> show f) "ZSTD" c
+            assertBool (msg <> ": dictionary of " <> show f <> ": " <> show o)
+                ("max_dict_bytes=65536;" `B.isInfixOf` o)
+
 -- | The live SST files whose key ranges overlap a namespace.
 --
 filesOverlapping :: FilePath -> B.ByteString -> IO [LiveFile]
@@ -259,7 +384,15 @@ capturing act = do
 --
 assertLogged :: [Text] -> B.ByteString -> Text -> Assertion
 assertLogged logs ns txt = assertBool ("a log line names " <> B8.unpack ns <> " and says " <> show txt <> ": " <> show logs) $
-    any (\l -> T.decodeUtf8 ns `T.isInfixOf` l && txt `T.isInfixOf` l) logs
+    not $ null $ loggedFor logs ns txt
+
+-- | The log lines of a namespace (@<namespace>: @, or the error line that
+-- names it) that contain the text.
+--
+loggedFor :: [Text] -> B.ByteString -> Text -> [Text]
+loggedFor logs ns txt = filter (\l -> any (`T.isInfixOf` l) names && txt `T.isInfixOf` l) logs
+  where
+    names = [T.decodeUtf8 ns <> ": ", "namespace " <> T.decodeUtf8 ns <> " "]
 
 keysOf :: MigrateStep -> [B.ByteString] -> S.Set Text
 keysOf step = S.fromList . fmap (progressKey step)
@@ -354,6 +487,13 @@ tests = testGroup "Migrate"
             (code, logs) <- capturing $ \l -> runMigrate l db MigratePayloads skip
             assertEqual "exit code" (ExitFailure 1) code
             assertLogged logs victim "not ZSTD"
+            -- the check failed after each of the compactions: two more, then
+            -- the namespace fails, with the names of the files
+            assertEqual "compactions after a failed check" (compactionAttempts - 1)
+                (length $ loggedFor logs victim "compacting again")
+            assertLogged logs victim ("after " <> T.pack (show compactionAttempts) <> " compactions")
+            assertLogged logs victim ".sst"
+            assertEqual "no backtrace in the log" [] (filter ("HasCallStack" `T.isInfixOf`) logs)
             r <- try @MigrateException $ migratePayloads silent db skip
             case r of
                 Left (NamespaceFailed step ns _) -> assertEqual "the failure" (MigratePayloads, victim) (step, ns)
@@ -412,6 +552,76 @@ tests = testGroup "Migrate"
             done' <- doneKeys db
             assertEqual "progress after the rerun" (keysOf MigratePayloads payloadNamespaces) done'
             assertNamespacesZstd "after the rerun" db payloadNamespaces
+
+    , testCase "payloads, a node's database: the empty BlockPayload is spanned by files of BlockOutputs2 and BlockPayload2 at levels 0, 1 and 3: the run completes, all seven done, every file ZSTD" $
+        withLeveledFixture payloadStraddle $ \dir db -> do
+            assertSpanned db "BlockPayload" [0, 1, 3]
+            let pre = dir </> "pre"
+            copyDb db pre
+            (code, logs) <- capturing $ \l -> runMigrate l db MigratePayloads defaultMigrateOpts
+            assertEqual ("exit code: " <> show logs) ExitSuccess code
+            assertLogged logs "BlockPayload" "3 live files overlap the namespace; the compaction covers their keys"
+            done <- doneKeys db
+            assertEqual "progress" (keysOf MigratePayloads payloadNamespaces) done
+            assertAllZstdButSentinel "after" db
+            d <- diffDbs pre db payloadNamespaces
+            assertNoDiff "payloads changed a payload" d
+
+    , testCase "trees, a node's database: the empty TransactionTree and OutputTree are spanned by files of CutHashes, OutputTree2 and TransactionTree2, at levels 0, 1 and 3: the run completes, all four done, no file overlaps a tree namespace" $
+        withLeveledFixture treeStraddle $ \dir db -> do
+            assertSpanned db "TransactionTree" [0, 1, 3]
+            assertSpanned db "OutputTree" [0]
+            let pre = dir </> "pre"
+            copyDb db pre
+            (code, logs) <- capturing $ \l -> runMigrate l db MigrateTrees defaultMigrateOpts
+            assertEqual ("exit code: " <> show logs) ExitSuccess code
+            done <- doneKeys db
+            assertEqual "progress" (keysOf MigrateTrees treeNamespaces) done
+            sizes <- namespaceSizes db treeNamespaces
+            assertEqual "tree namespaces" [(ns, 0) | ns <- treeNamespaces] sizes
+            assertTreeFilesGone "after trees" db treeNamespaces
+            d <- diffDbs pre db ["CutHashes"]
+            assertNoDiff "trees changed CutHashes" d
+            assertBool "CutHashes is compared" (all ((> 0) . _ndLeft) (_dsNamespaces d))
+
+    , testCase "trees: a namespace that is deleted but whose compaction did not happen fails its check (its files are still live): exit 1, named, not marked done; a rerun completes" $
+        withFixture $ \_ db -> do
+            let victim = treeNamespaces !! 2
+                skip = defaultMigrateOpts { _moSkipCompaction = [victim] }
+            assertEqual "the victim" "OutputTree" victim
+            (code, logs) <- capturing $ \l -> runMigrate l db MigrateTrees skip
+            assertEqual "exit code" (ExitFailure 1) code
+            assertLogged logs victim "are still live, so the compaction did not rewrite them"
+            done <- doneKeys db
+            assertEqual "progress: the namespaces before it, and not it"
+                (keysOf MigrateTrees (take 2 treeNamespaces)) done
+            -- the range tombstone hides the entries, which an iterator check
+            -- alone would accept; the files of the namespace are still there
+            sizes <- namespaceSizes db [victim]
+            assertEqual "the tombstone hides the entries" [(victim, 0)] sizes
+            fs <- filesOverlapping db victim
+            assertBool "the files of the namespace are still live" (not $ null fs)
+            code' <- runMigrate silent db MigrateTrees defaultMigrateOpts
+            assertEqual "exit code of the rerun" ExitSuccess code'
+            done' <- doneKeys db
+            assertEqual "progress after the rerun" (keysOf MigrateTrees treeNamespaces) done'
+            assertTreeFilesGone "after the rerun" db treeNamespaces
+
+    , testCase "progress file and no IDENTITY: refused, and the error says to delete the progress file; after that, the step runs" $
+        withFixture $ \_ db -> do
+            migrateTrees silent db defaultMigrateOpts { _moStopAfter = Just 1 }
+            removeFile (db </> "IDENTITY")
+            r <- try @IOException $ migrateTrees silent db defaultMigrateOpts
+            case r of
+                Left e -> assertBool ("the error: " <> show e) $ all (`isInfixOf` show e)
+                    ["no IDENTITY file in " <> db, progressFile db, "Delete the progress file to migrate this database from the start"]
+                Right () -> assertFailure "a progress file without IDENTITY is not refused"
+            code <- runMigrate silent db MigrateTrees defaultMigrateOpts
+            assertEqual "exit code" (ExitFailure 1) code
+            removeFile (progressFile db)
+            migrateTrees silent db defaultMigrateOpts
+            done <- doneKeys db
+            assertEqual "progress" (keysOf MigrateTrees treeNamespaces) done
 
     , testCase "rerun after completion changes nothing" $
         withFixture $ \dir db -> do
