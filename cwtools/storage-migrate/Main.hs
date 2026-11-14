@@ -12,8 +12,17 @@
 --
 -- @trees@ deletes the Merkle-tree tables, @payloads@ rewrites the payload
 -- tables with zstd-dict. Run @trees@ first: @payloads@ then has less to
--- rewrite. Both resume where an interrupted run stopped, from
--- @storage-migrate.progress.json@ in the RocksDB directory.
+-- rewrite. When the target is zstd-dict, run
+-- @trees --payload-compression zstd-dict@: the first compaction of @trees@
+-- rewrites most of the database, it then writes zstd-dict, and @payloads@
+-- skips the namespaces that are already zstd-dict. Both resume where an
+-- interrupted run stopped, from @storage-migrate.progress.json@ in the RocksDB
+-- directory.
+--
+-- A compaction can take hours on a large database; the log gives its
+-- approximate size before it starts. SIGTERM or kill is safe at any time;
+-- compaction output is installed atomically. Ctrl-C waits for the running
+-- compaction.
 --
 -- A process that has the database open read-write (a node, another
 -- @storage-migrate@) holds the RocksDB @LOCK@, and a step then fails without

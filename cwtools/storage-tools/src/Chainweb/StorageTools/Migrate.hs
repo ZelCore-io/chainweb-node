@@ -14,7 +14,7 @@
 -- * 'migrateTrees' deletes the Merkle-tree tables of the payload store
 --   ('treeNamespaces'), which nothing reads: SPV proofs rebuild the trees
 --   from the payloads.
--- * 'migratePayloads' rewrites the payload tables ('payloadNamespaces') with
+-- * 'migratePayloads' rewrites the payload tables ('migratePayloadNamespaces') with
 --   the zstd-dict compression of @--payload-compression zstd-dict@.
 --
 -- Each step works on one namespace at a time and records the namespaces that
@@ -22,7 +22,8 @@
 -- run that is interrupted resumes with the first namespace that is not done;
 -- the work on a namespace is idempotent, so a namespace that was interrupted
 -- is simply done again. No namespace outside of the two lists is deleted or
--- written.
+-- changed (files that hold their keys may be rewritten, with the same keys and
+-- values).
 --
 -- The compaction of a namespace covers every live file whose key range
 -- overlaps the namespace, not only the keys of the namespace (see
@@ -31,6 +32,21 @@
 -- spans the empty old-layout @BlockPayload@, and RocksDB's range compaction
 -- does not rewrite such a file. Keys of a neighbouring namespace may
 -- therefore be rewritten as well, with the same compression.
+--
+-- Before the work on a namespace, its check ('verifyNamespace') runs once: a
+-- namespace that is already in the target state, for instance because the
+-- compaction of an earlier namespace rewrote its files, is recorded as done
+-- without a compaction. On a node's database, the files of the node's flushes
+-- span almost every namespace, so the compaction of the first namespace of a
+-- step rewrites most of the database. When the target is zstd-dict, run
+-- @trees --payload-compression zstd-dict@ first: that rewrite then writes
+-- zstd-dict, and @payloads@ finds most of its namespaces done.
+--
+-- Each compaction is logged first, with the approximate size of the files it
+-- covers. A compaction can take hours on a large database. SIGTERM or kill is
+-- safe at any time; compaction output is installed atomically. Ctrl-C waits
+-- for the running compaction. Manual compactions use up to four threads
+-- (@max_subcompactions@ is the number of cores, at most 4).
 --
 -- A namespace is recorded as done only after its work was verified (see
 -- 'compactRangeChecked' and 'verifyNamespace'): the compaction did not raise
@@ -81,6 +97,7 @@ module Chainweb.StorageTools.Migrate
   -- * Compaction and checks
 , compactionRange
 , compactionAttempts
+, migrateMaxSubcompactions
 , compactRawRangeForced
 , compactRawRangeWith
 , compactRangeChecked
@@ -88,7 +105,7 @@ module Chainweb.StorageTools.Migrate
 
   -- * Namespaces
 , treeNamespaces
-, payloadNamespaces
+, migratePayloadNamespaces
 , stepNamespaces
 
   -- * Live files
@@ -109,6 +126,7 @@ module Chainweb.StorageTools.Migrate
 ) where
 
 import Control.Concurrent (threadDelay)
+import GHC.Conc (getNumProcessors)
 import Control.Exception
 import Control.Monad
 
@@ -116,10 +134,12 @@ import Data.Aeson hiding (Error)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as B8
 import qualified Data.ByteString.Lazy as BL
-import qualified Data.Map.Strict as M
 import qualified Data.Set as S
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
+import Data.Word (Word64)
+
+import Numeric (showFFloat)
 
 import Options.Applicative
 
@@ -167,8 +187,8 @@ treeNamespaces = ["TransactionTree","TransactionTree2","OutputTree","OutputTree2
 -- | The payload tables of the payload store, old and new layout, without the
 -- Merkle trees (@Chainweb.Payload.PayloadStore.RocksDB@).
 --
-payloadNamespaces :: [B.ByteString]
-payloadNamespaces = ["BlockPayloadIndex","BlockPayload","BlockPayload2","BlockTransactions","BlockTransactions2","BlockOutputs","BlockOutputs2"]
+migratePayloadNamespaces :: [B.ByteString]
+migratePayloadNamespaces = ["BlockPayloadIndex","BlockPayload","BlockPayload2","BlockTransactions","BlockTransactions2","BlockOutputs","BlockOutputs2"]
 
 -- -------------------------------------------------------------------------- --
 -- Live files
@@ -270,7 +290,7 @@ migrateStepName MigratePayloads = "payloads"
 --
 stepNamespaces :: MigrateStep -> [B.ByteString]
 stepNamespaces MigrateTrees = treeNamespaces
-stepNamespaces MigratePayloads = payloadNamespaces
+stepNamespaces MigratePayloads = migratePayloadNamespaces
 
 data MigrateOpts = MigrateOpts
     { _moStopAfter :: !(Maybe Int)
@@ -435,7 +455,7 @@ fsyncPath path = bracket (openFd path ReadOnly defaultFileFlags) closeFd fileSyn
 migrateTrees :: Logger l => l -> FilePath -> MigrateOpts -> IO ()
 migrateTrees l db = migrate l db MigrateTrees
 
--- | Rewrites the namespaces of 'payloadNamespaces', one after the other, with
+-- | Rewrites the namespaces of 'migratePayloadNamespaces', one after the other, with
 -- a forced compaction of the files that overlap the namespace (see
 -- 'compactionRange') under 'payloadZstdTuning', so that every such file is
 -- written with zstd and a dictionary. The namespace is marked as done once
@@ -463,7 +483,11 @@ migrate l db step opts = do
             <> " not detected: stop it first."
         when (step == MigrateTrees) $
             logg Info $ "storage-migrate trees: rewritten files are written with " <> stepCompression done0
-        withRocksDbTuned db modernDefaultOptions (stepTuning done0) $ \rdb -> do
+        subcompactions <- migrateMaxSubcompactions
+        logg Info $ "storage-migrate " <> stepName <> ": manual compactions use up to "
+            <> sshow subcompactions <> " threads (max_subcompactions)"
+        let tuning = (stepTuning done0) { _tuningMaxSubcompactions = Just subcompactions }
+        withRocksDbTuned db modernDefaultOptions tuning $ \rdb -> do
             ident <- dbIdentity db
             -- again, under the lock
             done1 <- checkedProgress db
@@ -499,14 +523,14 @@ migrate l db step opts = do
     stepCompression done = case step of
         MigratePayloads -> payloadCompressionToText PayloadZstdDict
         MigrateTrees
-            | any (\ns -> progressKey MigratePayloads ns `S.member` done) payloadNamespaces ->
+            | any (\ns -> progressKey MigratePayloads ns `S.member` done) migratePayloadNamespaces ->
                 payloadCompressionToText PayloadZstdDict <> " (a payload namespace is done)"
             | otherwise -> payloadCompressionToText (_moPayloadCompression opts)
 
     stepTuning done = case step of
         MigratePayloads -> payloadZstdTuning
         MigrateTrees
-            | any (\ns -> progressKey MigratePayloads ns `S.member` done) payloadNamespaces ->
+            | any (\ns -> progressKey MigratePayloads ns `S.member` done) migratePayloadNamespaces ->
                 payloadZstdTuning
             | otherwise -> payloadCompressionTuning (_moPayloadCompression opts)
 
@@ -527,13 +551,24 @@ migrate l db step opts = do
         | otherwise -> throwIO $ NamespaceFailed step ns (T.pack $ displayPlain e)
 
     migrateNamespace rdb ns = do
-        if skipWork
-        then logg Warn $ nsPrefix ns <> "test hook: the work is skipped"
-        else when (step == MigrateTrees) $ do
-            deleteRangeRocksDb (rawTable rdb ns) (Nothing, Nothing)
-            flushRocksDb rdb
-        compactAndVerify 1
+        -- the same check as after the compaction, so a namespace is still
+        -- done only once it is verified
+        current <- filter (overlapsNamespace rdb ns) <$> liveFileRanges rdb
+        try (verifyNamespace rdb db step ns current) >>= \case
+            Right () -> logg Info $ nsPrefix ns <> "already in the target state ("
+                <> targetState <> "), so it is not compacted"
+            Left (CheckFailed _) -> do
+                if skipWork
+                then logg Warn $ nsPrefix ns <> "test hook: the work is skipped"
+                else when (step == MigrateTrees) $ do
+                    deleteRangeRocksDb (rawTable rdb ns) (Nothing, Nothing)
+                    flushRocksDb rdb
+                compactAndVerify 1
       where
+        targetState = case step of
+            MigrateTrees -> "no entries, and no live file overlaps it"
+            MigratePayloads -> "every live file that overlaps it is ZSTD with a dictionary"
+
         skipWork = ns `elem` _moSkipWork opts
         skipCompaction = skipWork || ns `elem` _moSkipCompaction opts
 
@@ -546,10 +581,13 @@ migrate l db step opts = do
                 | skipWork -> return ()
                 | skipCompaction -> logg Warn $ nsPrefix ns <> "test hook: the compaction is skipped"
                 | otherwise -> do
-                    when (range /= namespaceBounds rdb ns) $
-                        logg Info $ nsPrefix ns <> sshow (length before)
-                            <> " live files overlap the namespace; the compaction covers their keys, from "
-                            <> sshow (fst range) <> " to " <> sshow (snd range)
+                    -- the end of the range is inclusive
+                    size <- approximateSize rdb (fst range) (snd range <> "\0")
+                    logg Info $ nsPrefix ns <> "compaction " <> sshow i <> ": " <> sshow (length before)
+                        <> " live files overlap the namespace; compacting their keys, from "
+                        <> sshow (fst range) <> " to " <> sshow (snd range) <> ", approximately "
+                        <> showSize size <> " of SST files. SIGTERM or kill is safe at any time;"
+                        <> " Ctrl-C waits for the running compaction"
                     compactRangeChecked rdb range
             try (verifyNamespace rdb db step ns before) >>= \case
                 Right () -> return ()
@@ -562,6 +600,16 @@ migrate l db step opts = do
                         reason <> " (after " <> sshow i <> " compactions of the namespace)"
 
     nsPrefix ns = "storage-migrate " <> stepName <> ": " <> nsText ns <> ": "
+
+    showSize :: Word64 -> T.Text
+    showSize b = sshow b <> " bytes (" <> T.pack (showFFloat (Just 2) (fromIntegral b / 2 ^ (30 :: Int) :: Double) "")
+        <> " GiB)"
+
+-- | The @max_subcompactions@ of the steps: the number of processors, at most
+-- 4, so that a manual compaction runs on up to 4 threads.
+--
+migrateMaxSubcompactions :: IO Int
+migrateMaxSubcompactions = min 4 . max 1 <$> getNumProcessors
 
 -- | 'migrate' for a command line: a failure is logged at level 'Error' and
 -- gives @ExitFailure 1@.
@@ -605,6 +653,12 @@ migrateParserInfo = info (migrateCommandParser <**> helper)
         <> " After the migration, run the node with --store-merkle-trees false and"
         <> " --payload-compression zstd-dict: with the node's defaults (true and snappy) it writes"
         <> " the trees and Snappy files again."
+        <> " Order: trees, then payloads; when the target is zstd-dict, run"
+        <> " trees --payload-compression zstd-dict, so that the first compaction of trees, which"
+        <> " rewrites most of the database, writes zstd-dict, and payloads skips the namespaces that"
+        <> " are already zstd-dict. A compaction can take hours; the log gives its approximate size first."
+        <> " SIGTERM or kill is safe at any time; compaction output is installed atomically."
+        <> " Ctrl-C waits for the running compaction."
         )
     )
 
@@ -612,7 +666,8 @@ migrateCommandParser :: Parser MigrateCommand
 migrateCommandParser = hsubparser $ mconcat
     [ cmd MigrateTrees
         ( "delete the Merkle-tree tables (TransactionTree, TransactionTree2, OutputTree,"
-        <> " OutputTree2). Run it first: payloads then has less to rewrite. Afterwards run the node with"
+        <> " OutputTree2). Run it first: payloads then has less to rewrite. When the target is zstd-dict,"
+        <> " run it with --payload-compression zstd-dict. Afterwards run the node with"
         <> " --store-merkle-trees false, or it writes the trees again."
         )
         compressionOption
@@ -645,7 +700,8 @@ migrateCommandParser = hsubparser $ mconcat
         <> value (_moPayloadCompression defaultMigrateOpts)
         <> showDefaultWith (T.unpack . payloadCompressionToText)
         <> help
-            ( "compression of the files that the compaction rewrites; use the value the node runs with."
+            ( "compression of the files that the compaction rewrites; use the value the node runs with,"
+            <> " or zstd-dict when payloads runs next (the first compaction rewrites most of the database)."
             <> " Once the payloads step has done a namespace, zstd-dict is used whatever this says."
             )
         )
@@ -653,7 +709,8 @@ migrateCommandParser = hsubparser $ mconcat
     pauseOption = optional $ strOption
         ( long "pause-file"
         <> metavar "FILE"
-        <> help "no namespace is started while this file exists; the namespace in progress is finished first"
+        <> help ("no namespace is started while this file exists; the namespace in progress is finished first"
+            <> " (the first namespace of a step can compact most of the database)")
         )
 
 -- -------------------------------------------------------------------------- --
@@ -747,9 +804,12 @@ backgroundErrors rdb = rocksDbProperty rdb "rocksdb.background-errors" >>= \case
 --   ZSTD with the dictionary of 'payloadZstdTuning'.
 --
 -- The compression of the files is read from their table properties
--- ('sstCompressionInfo', which opens a read-only instance of the database).
--- An automatic compaction can replace live files while they are read; the
--- check is then repeated, up to five times.
+-- ('sstFileCompression'), for the files that overlap the namespace only. An
+-- automatic compaction can delete a live file before it is read; the check is
+-- then repeated, up to five times.
+--
+-- The check also runs before the work on a namespace, with the live files
+-- that overlap it then; if it passes, the namespace needs no work.
 --
 verifyNamespace :: RocksDb -> FilePath -> MigrateStep -> B.ByteString -> [LiveFile] -> IO ()
 verifyNamespace rdb _ MigrateTrees ns before = do
@@ -766,24 +826,20 @@ verifyNamespace rdb db MigratePayloads ns _ = go (1 :: Int)
     attempts = 5
     go i = do
         files <- filter (overlapsNamespace rdb ns) <$> liveFileRanges rdb
-        unless (null files) $ try @IOException (sstCompressionInfo db) >>= \case
+        try @IOException (forM files $ \f -> (,) (_lfName f) <$> sstFileCompression (liveFilePath db f)) >>= \case
             Left e
                 | i < attempts -> retry i
                 | otherwise -> throwIO $ CheckFailed $
                     "cannot read the compression of the live files: " <> T.pack (displayException e)
-            Right props -> do
-                let found = [(f, M.lookup (liveFilePath db f) props) | f <- files]
-                    notZstd = [(_lfName f, c) | (f, Just (c, o)) <- found, c /= "ZSTD" || not (dictOption `B.isInfixOf` o)]
-                    missing = [_lfName f | (f, Nothing) <- found]
-                if
-                    | not (null notZstd) -> throwIO $ CheckFailed $
-                        "live files of the namespace are not ZSTD with a dictionary (" <> T.decodeUtf8 dictOption
-                        <> ") after the compaction: " <> sshow notZstd
-                    | not (null missing) && i < attempts -> retry i
-                    | not (null missing) -> throwIO $ CheckFailed $
-                        "the live files changed while their compression was read: " <> sshow missing
-                    | otherwise -> return ()
+            Right found -> do
+                let notZstd = [(f, describe c o) | (f, (c, o)) <- found, c /= "ZSTD" || not (dictOption `B.isInfixOf` o)]
+                unless (null notZstd) $ throwIO $ CheckFailed $
+                    "live files of the namespace are not ZSTD with a dictionary (" <> T.decodeUtf8 dictOption
+                    <> "): " <> sshow notZstd
     retry i = threadDelay 1_000_000 >> go (i + 1)
+    describe c o
+        | c == "ZSTD" = T.decodeUtf8 c <> " without a dictionary: " <> T.decodeUtf8 o
+        | otherwise = T.decodeUtf8 c
 
 -- | The dictionary size of 'payloadZstdTuning' as it appears in the property
 -- @rocksdb.compression_options@ of a file, for instance

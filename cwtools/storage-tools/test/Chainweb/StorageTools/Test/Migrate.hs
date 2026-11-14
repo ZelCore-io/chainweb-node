@@ -32,7 +32,7 @@ import Data.Bits (complement)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as B8
 import Data.IORef
-import Data.List (isInfixOf)
+import Data.List (isInfixOf, isPrefixOf, sortOn)
 import Data.Maybe (isNothing)
 import qualified Data.Map.Strict as M
 import qualified Data.Set as S
@@ -41,6 +41,8 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
 
 import Foreign.C (CInt(..), CUChar(..))
+
+import GHC.Conc (getNumProcessors)
 import Foreign.Ptr (Ptr)
 
 import Options.Applicative
@@ -76,7 +78,7 @@ import Chainweb.StorageTools.Test.RangeDb hiding (tests)
 -- | Every namespace of a range database that is not a tree namespace.
 --
 otherNamespaces :: [B.ByteString]
-otherNamespaces = payloadNamespaces <> headerNamespaces testVer <> metadataNamespaces
+otherNamespaces = migratePayloadNamespaces <> headerNamespaces testVer <> metadataNamespaces
 
 -- | Every namespace of a range database.
 --
@@ -111,7 +113,7 @@ withFixture act = withMixedFixture $ \dir mixed -> do
         return [(f, filter (\ns -> overlapsNamespace rdb ns f) everyNamespace) | f <- fs]
     forM_ files $ \(f, nss) ->
         assertBool ("fixture: " <> show f <> " overlaps " <> show nss) (length nss <= 1)
-    forM_ (treeNamespaces <> payloadNamespaces) $ \ns -> do
+    forM_ (treeNamespaces <> migratePayloadNamespaces) $ \ns -> do
         fs <- filesOverlapping db ns
         assertBool ("fixture: no file for " <> B8.unpack ns) (not $ null fs)
     act dir db
@@ -366,6 +368,18 @@ assertTreeFilesGone msg db nss = forM_ nss $ \ns -> do
     fs <- filesOverlapping db ns
     assertEqual (msg <> ": live files that overlap " <> B8.unpack ns) [] fs
 
+-- | The newest OPTIONS file of a closed database.
+--
+latestOptionsFile :: FilePath -> IO B.ByteString
+latestOptionsFile dir = do
+    fs <- filter isOptions <$> listDirectory dir
+    case sortOn (read @Int . drop (length prefix)) fs of
+        [] -> assertFailure ("no OPTIONS file in " <> dir)
+        xs -> B.readFile (dir </> last xs)
+  where
+    prefix = "OPTIONS-"
+    isOptions f = prefix `isPrefixOf` f && all (`elem` ['0' .. '9']) (drop (length prefix) f)
+
 -- | The namespaces in the progress file.
 --
 doneKeys :: FilePath -> IO (S.Set Text)
@@ -423,10 +437,10 @@ tests = testGroup "Migrate"
             before <- compressions db
             assertBool ("before: Snappy only: " <> show before) (all (== "Snappy") before && not (null before))
             migratePayloads silent db defaultMigrateOpts
-            assertNamespacesZstd "after" db payloadNamespaces
+            assertNamespacesZstd "after" db migratePayloadNamespaces
             -- the files of the other namespaces were not rewritten
             assertNamespacesSnappy "after" db (treeNamespaces <> headerNamespaces testVer <> metadataNamespaces)
-            d <- diffDbs pre db payloadNamespaces
+            d <- diffDbs pre db migratePayloadNamespaces
             assertNoDiff "payloads changed a payload" d
             assertEqual "the seven payload namespaces are compared" 7 (length $ _dsNamespaces d)
             forM_ (_dsNamespaces d) $ \n ->
@@ -435,7 +449,7 @@ tests = testGroup "Migrate"
             d' <- diffDbs pre db (treeNamespaces <> headerNamespaces testVer <> metadataNamespaces)
             assertNoDiff "payloads changed another namespace" d'
             done <- doneKeys db
-            assertEqual "progress" (keysOf MigratePayloads payloadNamespaces) done
+            assertEqual "progress" (keysOf MigratePayloads migratePayloadNamespaces) done
 
     , testCase "stop after namespace 2, rerun: final state equals an uninterrupted run; progress lists all" $
         withFixture $ \dir db -> do
@@ -455,10 +469,10 @@ tests = testGroup "Migrate"
             migratePayloads silent db stop2
             p2 <- doneKeys db
             assertEqual "progress after the second stop"
-                (keysOf MigrateTrees treeNamespaces <> keysOf MigratePayloads (take 2 payloadNamespaces)) p2
+                (keysOf MigrateTrees treeNamespaces <> keysOf MigratePayloads (take 2 migratePayloadNamespaces)) p2
             -- the files of the first two namespaces were rewritten, those of
             -- the other five were not
-            forM_ (zip [1 :: Int ..] payloadNamespaces) $ \(i, ns) -> do
+            forM_ (zip [1 :: Int ..] migratePayloadNamespaces) $ \(i, ns) -> do
                 cs <- namespaceCompressions db ns
                 assertBool ("files of " <> B8.unpack ns) (not $ null cs)
                 let expected = if i <= 2 then "ZSTD" else "Snappy"
@@ -471,17 +485,17 @@ tests = testGroup "Migrate"
 
             d <- diffDbs other db everyNamespace
             assertNoDiff "interrupted and uninterrupted runs differ" d
-            let allKeys = keysOf MigrateTrees treeNamespaces <> keysOf MigratePayloads payloadNamespaces
+            let allKeys = keysOf MigrateTrees treeNamespaces <> keysOf MigratePayloads migratePayloadNamespaces
             done <- doneKeys db
             assertEqual "progress lists all" allKeys done
             done' <- doneKeys other
             assertEqual "progress of the uninterrupted run" allKeys done'
-            assertNamespacesZstd "interrupted" db payloadNamespaces
-            assertNamespacesZstd "uninterrupted" other payloadNamespaces
+            assertNamespacesZstd "interrupted" db migratePayloadNamespaces
+            assertNamespacesZstd "uninterrupted" other migratePayloadNamespaces
 
     , testCase "payloads: a namespace whose compaction did not happen fails its check: exit 1, named, not marked done; a rerun completes" $
         withFixture $ \_ db -> do
-            let victim = payloadNamespaces !! 2
+            let victim = migratePayloadNamespaces !! 2
                 skip = defaultMigrateOpts { _moSkipWork = [victim] }
             assertEqual "the victim" "BlockPayload2" victim
             (code, logs) <- capturing $ \l -> runMigrate l db MigratePayloads skip
@@ -500,13 +514,13 @@ tests = testGroup "Migrate"
                 Right () -> assertFailure "migratePayloads did not fail"
             done <- doneKeys db
             assertEqual "progress: the namespaces before it, and not it"
-                (keysOf MigratePayloads (take 2 payloadNamespaces)) done
+                (keysOf MigratePayloads (take 2 migratePayloadNamespaces)) done
             assertNamespacesSnappy "the namespace that failed" db [victim]
             code' <- runMigrate silent db MigratePayloads defaultMigrateOpts
             assertEqual "exit code of the rerun" ExitSuccess code'
             done' <- doneKeys db
-            assertEqual "progress after the rerun" (keysOf MigratePayloads payloadNamespaces) done'
-            assertNamespacesZstd "after the rerun" db payloadNamespaces
+            assertEqual "progress after the rerun" (keysOf MigratePayloads migratePayloadNamespaces) done'
+            assertNamespacesZstd "after the rerun" db migratePayloadNamespaces
 
     , testCase "trees: a namespace whose delete and compaction did not happen fails its check: exit 1, named, not marked done; a rerun completes" $
         withFixture $ \_ db -> do
@@ -531,7 +545,7 @@ tests = testGroup "Migrate"
 
     , testCase "payloads: a compaction that fails (a corrupt block) raises rocksdb.background-errors: exit 1, named, not marked done; a rerun after the repair completes" $
         withFixture $ \_ db -> do
-            let victim = payloadNamespaces !! 4
+            let victim = migratePayloadNamespaces !! 4
             assertEqual "the victim" "BlockTransactions2" victim
             f <- filesOverlapping db victim >>= \case
                 f : _ -> return $ liveFilePath db f
@@ -545,13 +559,13 @@ tests = testGroup "Migrate"
             assertLogged logs victim "rocksdb.background-errors went from 0 to 1"
             done <- doneKeys db
             assertEqual "progress: the namespaces before it, and not it"
-                (keysOf MigratePayloads (take 4 payloadNamespaces)) done
+                (keysOf MigratePayloads (take 4 migratePayloadNamespaces)) done
             B.writeFile f original
             code' <- runMigrate silent db MigratePayloads defaultMigrateOpts
             assertEqual "exit code of the rerun" ExitSuccess code'
             done' <- doneKeys db
-            assertEqual "progress after the rerun" (keysOf MigratePayloads payloadNamespaces) done'
-            assertNamespacesZstd "after the rerun" db payloadNamespaces
+            assertEqual "progress after the rerun" (keysOf MigratePayloads migratePayloadNamespaces) done'
+            assertNamespacesZstd "after the rerun" db migratePayloadNamespaces
 
     , testCase "payloads, a node's database: the empty BlockPayload is spanned by files of BlockOutputs2 and BlockPayload2 at levels 0, 1 and 3: the run completes, all seven done, every file ZSTD" $
         withLeveledFixture payloadStraddle $ \dir db -> do
@@ -560,11 +574,11 @@ tests = testGroup "Migrate"
             copyDb db pre
             (code, logs) <- capturing $ \l -> runMigrate l db MigratePayloads defaultMigrateOpts
             assertEqual ("exit code: " <> show logs) ExitSuccess code
-            assertLogged logs "BlockPayload" "3 live files overlap the namespace; the compaction covers their keys"
+            assertLogged logs "BlockPayload" "compaction 1: 3 live files overlap the namespace; compacting their keys"
             done <- doneKeys db
-            assertEqual "progress" (keysOf MigratePayloads payloadNamespaces) done
+            assertEqual "progress" (keysOf MigratePayloads migratePayloadNamespaces) done
             assertAllZstdButSentinel "after" db
-            d <- diffDbs pre db payloadNamespaces
+            d <- diffDbs pre db migratePayloadNamespaces
             assertNoDiff "payloads changed a payload" d
 
     , testCase "trees, a node's database: the empty TransactionTree and OutputTree are spanned by files of CutHashes, OutputTree2 and TransactionTree2, at levels 0, 1 and 3: the run completes, all four done, no file overlaps a tree namespace" $
@@ -704,12 +718,80 @@ tests = testGroup "Migrate"
         let top = helpOf []
             trees = helpOf ["trees"]
             payloads = helpOf ["payloads"]
-        forM_ ["--store-merkle-trees false", "--payload-compression zstd-dict", "read-only", "LOCK", "storage-migrate.progress.json"] $ \t ->
+        forM_ [ "--store-merkle-trees false", "--payload-compression zstd-dict", "read-only", "LOCK", "storage-migrate.progress.json"
+              , "trees --payload-compression zstd-dict", "SIGTERM or kill is safe at any time"
+              , "compaction output is installed atomically", "Ctrl-C waits for the running compaction"
+              , "approximate size" ] $ \t ->
             assertBool ("help: " <> show t <> " in " <> show top) (t `isInfixOf` top)
-        forM_ ["use the value the node runs with", "--store-merkle-trees false", "--pause-file"] $ \t ->
+        forM_ ["use the value the node runs with", "or zstd-dict when payloads runs next", "--store-merkle-trees false", "--pause-file"] $ \t ->
             assertBool ("trees help: " <> show t <> " in " <> show trees) (t `isInfixOf` trees)
         forM_ ["--payload-compression zstd-dict", "--pause-file"] $ \t ->
             assertBool ("payloads help: " <> show t <> " in " <> show payloads) (t `isInfixOf` payloads)
+
+    , testCase "a namespace already in the target state is not compacted again; each compaction is logged first, with its approximate size; the steps open the database with max_subcompactions = min 4 cores" $
+        withFixture $ \_ db -> do
+            forM_ [(MigrateTrees, treeNamespaces), (MigratePayloads, migratePayloadNamespaces)] $ \(step, nss) -> do
+                (code, logs) <- capturing $ \l -> runMigrate l db step defaultMigrateOpts
+                assertEqual "exit code" ExitSuccess code
+                forM_ nss $ \ns -> do
+                    let compactions = loggedFor logs ns "approximately"
+                    assertEqual ("one compaction of " <> B8.unpack ns <> ": " <> show logs) 1 (length compactions)
+                    assertBool ("the size is given: " <> show compactions) $
+                        all (\l -> " bytes (" `T.isInfixOf` l && not ("approximately 0 bytes" `T.isInfixOf` l)) compactions
+                    assertLogged logs ns "SIGTERM or kill is safe at any time"
+                    assertEqual "not in the target state before" [] (loggedFor logs ns "already in the target state")
+                -- as after a stop between the compaction of a namespace and
+                -- the write of the progress file: all but the first namespace
+                -- are done, but not recorded
+                done0 <- doneKeys db
+                ident <- dbIdentity db
+                writeProgress db (Progress ident (done0 `S.difference` keysOf step (drop 1 nss)))
+                files0 <- forM nss (filesOverlapping db)
+                (code', logs') <- capturing $ \l -> runMigrate l db step defaultMigrateOpts
+                assertEqual "exit code of the rerun" ExitSuccess code'
+                forM_ (drop 1 nss) $ \ns -> do
+                    assertLogged logs' ns "already in the target state"
+                    assertEqual ("no compaction of " <> B8.unpack ns) [] (loggedFor logs' ns "approximately")
+                files1 <- forM nss (filesOverlapping db)
+                assertEqual "the live files of the namespaces are unchanged" files0 files1
+                done1 <- doneKeys db
+                assertEqual "progress after the rerun" done0 done1
+            n <- min 4 <$> getNumProcessors
+            opts <- latestOptionsFile db
+            assertBool ("max_subcompactions=" <> show n <> " in the OPTIONS file") $
+                B8.pack ("max_subcompactions=" <> show n <> "\n") `B.isInfixOf` opts
+
+    , testCase "trees --payload-compression zstd-dict, then payloads: the first compaction of trees rewrites every file with zstd-dict, and payloads compacts no namespace" $
+        withMixedFixture $ \_ mixed -> do
+            migrateTrees silent mixed defaultMigrateOpts { _moPayloadCompression = PayloadZstdDict }
+            assertAllZstd "after trees" mixed
+            (code, logs) <- capturing $ \l -> runMigrate l mixed MigratePayloads defaultMigrateOpts
+            assertEqual "exit code" ExitSuccess code
+            forM_ migratePayloadNamespaces $ \ns -> do
+                assertLogged logs ns "already in the target state"
+                assertEqual ("no compaction of " <> B8.unpack ns) [] (loggedFor logs ns "approximately")
+            done <- doneKeys mixed
+            assertEqual "progress" (keysOf MigrateTrees treeNamespaces <> keysOf MigratePayloads migratePayloadNamespaces) done
+
+    , testCase "payloads: a namespace whose files are ZSTD without a dictionary fails its check: exit 1, named, not marked done" $
+        withFixture $ \_ db -> do
+            let victim = migratePayloadNamespaces !! 3
+                noDict = payloadZstdTuning
+                    { _tuningCompression = Zstd { _zstdLevel = 3, _zstdMaxDictBytes = 0, _zstdMaxTrainBytes = 0 } }
+            assertEqual "the victim" "BlockTransactions" victim
+            withRocksDbTuned db modernDefaultOptions noDict $ \rdb ->
+                compactRawRangeForced rdb (namespaceBounds rdb victim)
+            info' <- namespaceSstInfo db victim
+            assertBool ("the files of the victim are ZSTD without a dictionary: " <> show info') $
+                not (null info') && all (\(_, (c, o)) -> c == "ZSTD" && not ("max_dict_bytes=65536;" `B.isInfixOf` o)) info'
+            (code, logs) <- capturing $ \l ->
+                runMigrate l db MigratePayloads defaultMigrateOpts { _moSkipWork = [victim] }
+            assertEqual "exit code" (ExitFailure 1) code
+            assertLogged logs victim "ZSTD without a dictionary"
+            assertEqual "not in the target state" [] (loggedFor logs victim "already in the target state")
+            done <- doneKeys db
+            assertEqual "progress: the namespaces before it, and not it"
+                (keysOf MigratePayloads (take 3 migratePayloadNamespaces)) done
 
     , testCase "trees --payload-compression: files that trees rewrites get the node's compression (snappy by default, zstd-dict when given)" $
         withMixedFixture $ \dir mixed -> do
