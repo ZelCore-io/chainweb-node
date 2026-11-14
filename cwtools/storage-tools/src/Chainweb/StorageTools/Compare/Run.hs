@@ -643,9 +643,10 @@ runCompareClasses logger opts cov oracle test reqs = do
                 worker
     replicateConcurrently_ compareWorkers worker
     result <- readMVar rep
-    logg Info $ "verdict: " <> sshow (reportVerdict result)
-        <> ", compared " <> sshow (reportCompared result)
-        <> ", differences " <> sshow (reportDiffCount result)
+    -- no verdict here: the caller still adds the classes and entries of the
+    -- run and the skips at generation, which change it
+    logg Info $ "compared " <> sshow (reportCompared result)
+        <> " of " <> sshow (length reqs) <> " requests, differences " <> sshow (reportDiffCount result)
     return result
   where
     logg = logFunctionText logger

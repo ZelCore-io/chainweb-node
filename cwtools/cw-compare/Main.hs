@@ -342,6 +342,7 @@ main = do
         TestUrl url -> limiterFor hl url >>= compareWith . Side "test" url
         TestDb td -> withInProcessSide logger (inProcessSpec o td) compareWith
     let rep = reportSettings settings $ gen $ reportExpectClasses classes rep0
+    logFunctionText logger Info $ "verdict: " <> T.pack (show (reportVerdict rep))
     writeReport (_optReport o) rep
     T.putStr (reportSummary rep)
     exitWith (gateExitCode (reportVerdict rep))

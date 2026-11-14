@@ -877,6 +877,18 @@ runTests = testGroup "runCompare"
         map isRefusal [429, 503, 500, 502, 504] @?= [True, True, False, False, False]
         map isGatewayFailure [429, 503, 500, 502, 504] @?= [False, False, False, True, True]
 
+    , testCase "the runner logs no verdict: the classes and skips of the run are not applied yet" $
+        withStubs 1_000 oracleConf testConf $ \o t _ _ -> do
+            logs <- newIORef []
+            let logger = genericLogger Info (\m -> atomicModifyIORef' logs (\ms -> (m : ms, ())))
+            rep <- runCompare logger cov o t [payloadReqFor payloadA]
+            ms <- readIORef logs
+            assertBool ("no verdict in " <> show ms) (not (any ("verdict" `T.isInfixOf`) ms))
+            assertBool ("the counts are logged: " <> show ms) (any ("compared 1 of 1 requests" `T.isInfixOf`) ms)
+            -- the verdict that the runner would have logged is not the final one
+            reportVerdict rep @?= PartialPass
+            reportVerdict (reportExpectClasses [ClsPayload, ClsLocal] rep) @?= Void
+
     , testCase "only a call that never reached the server is tried again" $ do
         let failure = HTTP.HttpExceptionRequest HTTP.defaultRequest
         map (isPreSendFailure . failure)
