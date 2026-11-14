@@ -25,7 +25,7 @@ module Chainweb.StorageTools.Test.Migrate
 
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (poll, wait, withAsync)
-import Control.Exception (IOException, try)
+import Control.Exception (IOException, SomeException, try)
 import Control.Monad
 
 import Data.Bits (complement)
@@ -796,6 +796,25 @@ tests = testGroup "Migrate"
             done <- doneKeys db
             assertEqual "progress: the namespaces before it, and not it"
                 (keysOf MigratePayloads (take 3 migratePayloadNamespaces)) done
+
+    , testCase "payloads: the check of a namespace reads the files that overlap it only: ZSTD files of one namespace pass while the files of another are still Snappy, and that other namespace fails" $
+        withFixture $ \_ db -> do
+            let done = migratePayloadNamespaces !! 3
+                pending = migratePayloadNamespaces !! 0
+            withRocksDbTuned db modernDefaultOptions payloadZstdTuning $ \rdb ->
+                compactRawRangeForced rdb (namespaceBounds rdb done)
+            doneCs <- namespaceCompressions db done
+            pendingCs <- namespaceCompressions db pending
+            assertBool ("the files of the namespace are ZSTD: " <> show doneCs) $
+                not (null doneCs) && all (== "ZSTD") doneCs
+            assertBool ("the files of the other namespace are not ZSTD: " <> show pendingCs) $
+                not (null pendingCs) && all (== "Snappy") pendingCs
+            withReadOnlyRocksDb db modernDefaultOptions $ \rdb -> do
+                verifyNamespace rdb db MigratePayloads done []
+                r <- try @SomeException (verifyNamespace rdb db MigratePayloads pending [])
+                case r of
+                    Left e -> assertBool ("the error names the compression: " <> show e) ("Snappy" `isInfixOf` show e)
+                    Right () -> assertFailure "the check of a Snappy namespace passed"
 
     , testCase "trees: live payload files that are zstd-dict and no --payload-compression: refused, naming both choices, nothing changed; given, it warns when the files differ and runs; a payload namespace done and snappy given: warns that zstd-dict is used" $
         withFixture $ \dir db -> do
