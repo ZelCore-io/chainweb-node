@@ -81,7 +81,7 @@ tests = testGroup "Payload store"
         storeMerkleTreesConfigTest
     , testCase "zstd-dict: payloads added then flushed live only in ZSTD SSTs with level 3, max_dict_bytes 65536, zstd_max_train_bytes 6553600, 32 KB blocks"
         zstdDictFilesTest
-    , testCase "mixed files: Snappy half, zstd half, reopened under each setting: every payload byte-equal"
+    , testCase "mixed files: Snappy, then zstd, then Snappy again, reopened under each setting: every payload byte-equal"
         mixedFilesTest
     , testCase "--payload-compression parses snappy and zstd-dict; any other value fails naming both"
         payloadCompressionOptionTest
@@ -284,14 +284,21 @@ mixedFilesTest = withSystemTempDirectory "payload-store-mixed" $ \dir -> do
     withPayloadRocksDb dir PayloadZstdDict $ \rdb -> do
         addIndexedPayloads (newPayloadDb rdb) [100 .. 199]
         flushRocksDb rdb
+    -- switched back off: Snappy after zstd
+    withPayloadRocksDb dir PayloadSnappy $ \rdb -> do
+        addIndexedPayloads (newPayloadDb rdb) [200 .. 299]
+        flushRocksDb rdb
     info' <- sstCompressionInfo dir
     assertEqual ("compression of the SST files: " <> show info')
         ["Snappy", "ZSTD"] (L.sort $ L.nub $ fst <$> M.elems info')
+    -- file numbers grow: the newest file is the last flush, Snappy
+    assertEqual ("compression of the newest SST file: " <> show info')
+        (Just "Snappy") (fst . snd <$> M.lookupMax info')
 
     expected <- withTempRocksDb "payload-store-mixed-reference" $ \ref -> do
-        addIndexedPayloads (newPayloadDb ref) [0 .. 199]
+        addIndexedPayloads (newPayloadDb ref) [0 .. 299]
         rawEntries ref
-    length expected @?= 1200
+    length expected @?= 1800
     forM_ [PayloadSnappy, PayloadZstdDict] $ \c ->
         withPayloadRocksDb dir c $ \rdb -> do
             es <- rawEntries rdb
