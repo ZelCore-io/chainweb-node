@@ -332,7 +332,7 @@ tests = testGroup "Range DB"
             let h = lateStart - 1
                 lateApi = (_srcApi src) { _saVersion = lateVer }
             -- the source cut has both chains, as a source that is above the start of chain 1 does
-            s <- buildRangeDbWith silent lateApi (srcCut src) (RangeSpec h) dst
+            s <- buildRangeDbWith silent defaultPayloadDbConfig lateApi (srcCut src) (RangeSpec h) dst
             -- chain 0 only, heights 0 .. h
             assertEqual "headers" (int h + 1) (_rsHeaders s)
             assertEqual "payloads" (int h + 1) (_rsPayloads s)
