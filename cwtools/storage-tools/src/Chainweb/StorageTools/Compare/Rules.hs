@@ -8,7 +8,8 @@
 --
 -- Never allowed to differ: payload bytes; headers; any pinned @/local@ result,
 -- including gas, logs hash, events, error text and metadata; @keys@ contents
--- and order; @txlog@ contents and order; @txids@; @/poll@ results for covered
+-- and order; @txlog@ contents (but not the order of its rows, see below);
+-- @txids@; @/poll@ results for covered
 -- heights; "not found" versus found. Answers are compared as bytes: status
 -- and body, nothing is parsed or normalised before the comparison.
 --
@@ -17,6 +18,11 @@
 -- * Tip skew: a pinned answer is compared only when both sides report the
 --   same block height and parent hash, at the target height. Otherwise the
 --   runner retries; a request that never pins is 'Skipped', never passed.
+-- * @txlog@ row order ('OrderOnly'): the rows are the same, byte for byte, as a
+--   multiset, in another order. @txlog@ is a @SELECT@ without an @ORDER BY@
+--   over rows that stock nodes commit in @HashMap@ order, so the order is not
+--   a property of the data (ruling of M0c). Never 'Same', never 'Differ'; any
+--   row content or count difference is 'Differ'.
 -- * Not covered: requests for a chain or height the test side does not hold
 --   are 'Skipped' and counted, never passed.
 -- * Orphan payloads ('AllowOrphanPayload'): found on the oracle, not found on
@@ -31,6 +37,7 @@ module Chainweb.StorageTools.Compare.Rules
   judge
 , preJudge
 , compareBytes
+, orderOnlyRows
 
   -- * Request files
 , allowedRequest
@@ -50,13 +57,14 @@ module Chainweb.StorageTools.Compare.Rules
 ) where
 
 import Control.Applicative ((<|>))
-import Control.Monad ((>=>))
+import Control.Monad (guard, (>=>))
 
 import Data.Aeson
 import Data.Aeson.Types (Parser, parseEither, parseMaybe)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as B8
 import Data.Char (isAsciiLower, isAsciiUpper, isDigit)
+import qualified Data.List as L
 import Data.Maybe (isJust, isNothing)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
@@ -294,8 +302,8 @@ judgePinned r a b = case (_ansPin a, _ansPin b) of
     (Just pa, Just pb)
         | pa /= pb -> RetryPinMismatch
         | Just (_pinHeight pa) /= _reqTarget r -> RetryPinMismatch
-        | otherwise -> Final (compareBytes a b)
-    (Nothing, Nothing) -> Final (compareBytes a b)
+        | otherwise -> Final (compareFor r a b)
+    (Nothing, Nothing) -> Final (compareFor r a b)
     (Just pa, Nothing) -> Final $ Differ $
         "only the oracle answered with block metadata (height " <> sshow (_pinHeight pa) <> "); " <> bytesDetail a b
     (Nothing, Just pb) -> Final $ Differ $
@@ -319,6 +327,20 @@ judgeSpv a b
     , _ansBody a /= _ansBody b = CompareSpvSubjects
     | otherwise = Final (compareBytes a b)
 
+-- | The verdict on two answers of one request: 'compareBytes', except that the
+-- rows of a @txlog@ may come in another order (see 'orderOnlyRows').
+--
+compareFor :: Request -> Answer -> Answer -> Verdict
+compareFor r a b = case compareBytes a b of
+    Differ d
+        | Just (table, txid) <- txlogOfRequest r
+        , _ansStatus a == 200
+        , _ansStatus b == 200
+        , Just n <- orderOnlyRows (_ansBody a) (_ansBody b) ->
+            OrderOnly $ "txlog " <> table <> " " <> txid <> ": " <> sshow n <> " rows in another order"
+        | otherwise -> Differ d
+    v -> v
+
 -- | Status and body, byte for byte.
 --
 compareBytes :: Answer -> Answer -> Verdict
@@ -337,6 +359,126 @@ bytesDetail a b
     ba = _ansBody a
     bb = _ansBody b
     firstDiff = length $ takeWhile id $ B.zipWith (==) ba bb
+
+-- -------------------------------------------------------------------------- --
+-- txlog rows
+
+-- | The bytes of two History answers of one @txlog@, compared by 'compareFor'
+-- when they differ.
+--
+-- A @txlog@ is a @SELECT@ without an @ORDER BY@, and Pact 4's commit writes
+-- a block's rows in the order of a @HashMap@, so two stock nodes can return
+-- the rows of one block in different orders (ruling of M0c). The rows are
+-- compared as a multiset of byte-equal rows: the answers must be equal
+-- byte for byte outside the array @result.data@, and the rows in it must be
+-- the same bytes the same number of times, in another order. The rows are
+-- cut out of the bytes of the answer, not parsed and written again, so a row
+-- that differs in a key order or a number format is a different row.
+--
+-- Returns the number of rows, or 'Nothing' if the answers are not that: not
+-- both a JSON object with an array at @result.data@, the array not written
+-- as the rows joined by commas, the rest of the answers different, or the
+-- rows in the same order (then the bodies differ elsewhere).
+--
+orderOnlyRows :: B.ByteString -> B.ByteString -> Maybe Int
+orderOnlyRows a b = do
+    (pa, ra, sa) <- splitRows a
+    (pb, rb, sb) <- splitRows b
+    guard (pa == pb && sa == sb)
+    guard (ra /= rb && L.sort ra == L.sort rb)
+    return (length ra)
+
+-- | An answer cut into the bytes before @result.data@'s array, its rows and
+-- the bytes after it. 'Nothing' if there is no such array or it is not
+-- written as @[row,row,...]@ without any other byte.
+--
+splitRows :: B.ByteString -> Maybe (B.ByteString, [B.ByteString], B.ByteString)
+splitRows body = do
+    (s, e) <- memberSpan ["result", "data"] body
+    guard (B.index body s == 0x5b && B.index body (e - 1) == 0x5d)
+    let inner = B.take (e - s - 2) (B.drop (s + 1) body)
+    rows <- if B.null inner then Just [] else elements inner
+    guard (B.intercalate "," rows == inner)
+    return (B.take s body, rows, B.drop e body)
+
+-- | The elements of the inside of a JSON array, each as the bytes between
+-- the commas at depth 0.
+--
+elements :: B.ByteString -> Maybe [B.ByteString]
+elements inner = go 0
+  where
+    n = B.length inner
+    go i
+        | i >= n = Just []
+        | otherwise = do
+            e <- skipValue inner i
+            let row = B.take (e - i) (B.drop i inner)
+            if e == n
+                then Just [row]
+                else do
+                    guard (B.index inner e == 0x2c)
+                    (row :) <$> go (e + 1)
+
+-- | The byte range @[start, end)@ of the value at a path of object keys,
+-- the first member of that name at each level. A key written with an escape
+-- never matches.
+--
+memberSpan :: [B.ByteString] -> B.ByteString -> Maybe (Int, Int)
+memberSpan path s = go path 0
+  where
+    go [] i = (,) i <$> skipValue s i
+    go (k : ks) i = do
+        guard (at i == Just 0x7b)
+        members k ks (skipWs (i + 1))
+    members k ks i = do
+        guard (at i == Just 0x22)
+        ke <- skipString s i
+        let key = B.take (ke - i - 2) (B.drop (i + 1) s)
+            c = skipWs ke
+        guard (at c == Just 0x3a)
+        let v = skipWs (c + 1)
+        ve <- skipValue s v
+        if key == k
+            then go ks v
+            else do
+                let d = skipWs ve
+                guard (at d == Just 0x2c)
+                members k ks (skipWs (d + 1))
+    at i = fst <$> B.uncons (B.drop i s)
+    skipWs i = i + B.length (B.takeWhile (`B.elem` " \t\r\n") (B.drop i s))
+
+-- | The end of the string that starts at a quote.
+--
+skipString :: B.ByteString -> Int -> Maybe Int
+skipString s i0 = go (i0 + 1)
+  where
+    go i = case B.indexMaybe s i of
+        Nothing -> Nothing
+        Just 0x22 -> Just (i + 1)
+        Just 0x5c -> go (i + 2)
+        Just _ -> go (i + 1)
+
+-- | The end of the JSON value that starts at an index: a string, an object or
+-- an array (to the bracket that closes it), or a literal or number (to the
+-- next comma, bracket or white space).
+--
+skipValue :: B.ByteString -> Int -> Maybe Int
+skipValue s i = case B.indexMaybe s i of
+    Nothing -> Nothing
+    Just 0x22 -> skipString s i
+    Just c
+        | c == 0x7b || c == 0x5b -> nested (1 :: Int) (i + 1)
+        | c == 0x7d || c == 0x5d || c == 0x2c -> Nothing
+        | otherwise -> Just (i + B.length (B.takeWhile (not . (`B.elem` ",]} \t\r\n")) (B.drop i s)))
+  where
+    nested 0 j = Just j
+    nested d j = case B.indexMaybe s j of
+        Nothing -> Nothing
+        Just 0x22 -> skipString s j >>= nested d
+        Just c
+            | c == 0x7b || c == 0x5b -> nested (d + 1) (j + 1)
+            | c == 0x7d || c == 0x5d -> nested (d - 1) (j + 1)
+            | otherwise -> nested d (j + 1)
 
 -- -------------------------------------------------------------------------- --
 -- Pins

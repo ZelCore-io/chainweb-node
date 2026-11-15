@@ -117,6 +117,47 @@ historyReqAt h = (localReqAt h)
     , _reqBody = Just "{\"code\":\"(txids coin.coin-table 0)\"}"
     }
 
+-- | A History request for @(txlog coin.coin-table TXID)@ in the shape the
+-- generator builds: a command whose @cmd@ is a JSON string with the Pact code.
+--
+txlogReqAt :: BlockHeight -> T.Text -> Request
+txlogReqAt h txid = (localReqAt h)
+    { _reqClass = ClsHistory
+    , _reqBody = Just (cmdBody ("(txlog coin.coin-table " <> txid <> ")"))
+    }
+
+cmdBody :: T.Text -> B.ByteString
+cmdBody code = BL.toStrict $ encode $ object
+    [ "cmd" .= T.decodeUtf8 (BL.toStrict (encode (object
+        [ "payload" .= object [ "exec" .= object [ "code" .= code, "data" .= object [] ] ] ])))
+    , "hash" .= ("h" :: T.Text)
+    ]
+
+-- | Rows of a @txlog@ answer, each as the bytes a node wrote.
+--
+rowA, rowB, rowC, rowD :: B.ByteString
+rowA = "{\"key\":\"KEzk\",\"table\":\"coin_coin-table\",\"txid\":7,\"value\":{\"balance\":1.5,\"guard\":{\"pred\":\"keys-all\"}}}"
+rowB = "{\"key\":\"k:4f95\",\"table\":\"coin_coin-table\",\"txid\":7,\"value\":{\"balance\":2.0}}"
+rowC = "{\"key\":\"k:77aa\",\"table\":\"coin_coin-table\",\"txid\":7,\"value\":{\"balance\":3.25}}"
+-- | A row whose key holds a comma, a closing bracket and an escaped quote, which
+-- a splitter of the rows must not take for the end of a row or of the array.
+rowD = "{\"key\":\"a,]\\\"x\",\"txid\":7}"
+
+-- | A pinned answer at the target of 'txlogReqAt' 100 with these rows.
+--
+txlogAnswer :: [B.ByteString] -> Answer
+txlogAnswer rows = found (localBody 100 'A' ("[" <> B.intercalate "," rows <> "]"))
+
+isOrderOnly :: Judgement -> Bool
+isOrderOnly = \case
+    Final (OrderOnly _) -> True
+    _ -> False
+
+preflightReq, pollReq, spvReqAt :: Request
+preflightReq = (localReqAt 100) { _reqClass = ClsPreflight }
+pollReq = (payloadReqFor payloadA) { _reqClass = ClsPoll }
+spvReqAt = (payloadReqFor payloadA) { _reqClass = ClsSpv }
+
 localReq, keysReq :: Request
 localReq = localReqAt 100
 keysReq = keysReqAt 100
@@ -193,6 +234,61 @@ rulesTests = testGroup "rules"
         judge cov localReq (Answer 400 "e" Nothing) (Answer 400 "e" Nothing) @?= Final Same
         assertBool "body" $ isDiffer (judge cov localReq (Answer 400 "e" Nothing) (Answer 400 "f" Nothing))
         assertBool "status" $ isDiffer (judge cov localReq (Answer 400 "e" Nothing) (Answer 500 "e" Nothing))
+    , testCase "txlog rows in another order: OrderOnly, naming the table, the txid and the rows" $ do
+        let j = judge cov (txlogReqAt 100 "7") (txlogAnswer [rowA, rowB, rowC, rowD]) (txlogAnswer [rowD, rowC, rowA, rowB])
+        assertBool ("OrderOnly: " <> show j) (isOrderOnly j)
+        case j of
+            Final (OrderOnly ev) -> assertBool ("evidence: " <> T.unpack ev) $
+                all (`T.isInfixOf` ev) ["coin.coin-table", "7", "4 rows"]
+            _ -> return ()
+        -- a row with a comma, a bracket and an escaped quote in a string: one byte of it changed is a Differ
+        let rowD' = B.take 9 rowD <> "y" <> B.drop 10 rowD
+        assertBool "a changed byte in the row with the special characters" $ isDiffer
+            (judge cov (txlogReqAt 100 "7") (txlogAnswer [rowA, rowD, rowB]) (txlogAnswer [rowB, rowD', rowA]))
+    , testCase "txlog rows in the same order: Same" $
+        judge cov (txlogReqAt 100 "7") (txlogAnswer [rowA, rowB]) (txlogAnswer [rowA, rowB]) @?= Final Same
+    , testCase "txlog: one byte of one row changed, in another order or not: Differ" $ do
+        let changed = B.take 20 rowB <> "X" <> B.drop 21 rowB
+        assertBool "same order" $ isDiffer
+            (judge cov (txlogReqAt 100 "7") (txlogAnswer [rowA, rowB]) (txlogAnswer [rowA, changed]))
+        assertBool "other order" $ isDiffer
+            (judge cov (txlogReqAt 100 "7") (txlogAnswer [rowA, rowB]) (txlogAnswer [changed, rowA]))
+    , testCase "txlog: an extra row or a missing row: Differ" $ do
+        assertBool "extra row" $ isDiffer
+            (judge cov (txlogReqAt 100 "7") (txlogAnswer [rowA, rowB]) (txlogAnswer [rowB, rowC, rowA]))
+        assertBool "missing row" $ isDiffer
+            (judge cov (txlogReqAt 100 "7") (txlogAnswer [rowA, rowB, rowC]) (txlogAnswer [rowB, rowA]))
+        assertBool "a duplicate in place of another row" $ isDiffer
+            (judge cov (txlogReqAt 100 "7") (txlogAnswer [rowA, rowA, rowB]) (txlogAnswer [rowA, rowB, rowB]))
+    , testCase "txlog: only rows in a row differ by bytes (key order inside a row): Differ" $ do
+        let reordered = "{\"table\":\"coin_coin-table\",\"key\":\"k:4f95\",\"txid\":7,\"value\":{\"balance\":2.0}}"
+        assertBool "key order inside a row" $ isDiffer
+            (judge cov (txlogReqAt 100 "7") (txlogAnswer [rowA, rowB]) (txlogAnswer [reordered, rowA]))
+    , testCase "txlog: the rest of the answer must be byte-equal" $ do
+        let other = found (localBody 100 'A' ("[" <> B.intercalate "," [rowB, rowA] <> "]") <> " ")
+        assertBool "trailing byte" $ isDiffer
+            (judge cov (txlogReqAt 100 "7") (txlogAnswer [rowA, rowB]) other)
+        let st = Answer 500 (_ansBody (txlogAnswer [rowB, rowA])) (_ansPin (txlogAnswer [rowB, rowA]))
+        assertBool "status" $ isDiffer
+            (judge cov (txlogReqAt 100 "7") (txlogAnswer [rowA, rowB]) st)
+    , testCase "txlog: a failure answer or no rows array is compared as bytes" $ do
+        let failure b = found (localBody 100 'A' "null" <> b)
+        assertBool "equal failures stay Same" $ judge cov (txlogReqAt 100 "7") (failure "") (failure "") == Final Same
+        assertBool "different failures" $ isDiffer
+            (judge cov (txlogReqAt 100 "7") (failure "") (failure "x"))
+    , testCase "order is not forgiven for other history functions, keys or plain local" $ do
+        let dat xs = found (localBody 100 'A' ("[" <> B.intercalate "," xs <> "]"))
+        assertBool "txids" $ isDiffer
+            (judge cov (historyReqAt 100) (dat ["1", "2"]) (dat ["2", "1"]))
+        assertBool "keys" $ isDiffer
+            (judge cov keysReq (dat ["\"a\"", "\"b\""]) (dat ["\"b\"", "\"a\""]))
+        assertBool "local" $ isDiffer
+            (judge cov localReq (dat [rowA, rowB]) (dat [rowB, rowA]))
+    , testCase "txlogOfRequest reads the table and the txid from the Pact code" $ do
+        txlogOfRequest (txlogReqAt 100 "2610493") @?= Just ("coin.coin-table", "2610493")
+        txlogOfRequest (historyReqAt 100) @?= Nothing
+        txlogOfRequest (txlogReqAt 100 "7") { _reqClass = ClsLocal } @?= Nothing
+        txlogOfRequest (txlogReqAt 100 "7") { _reqBody = Just (cmdBody "(txlog coin.coin-table x)") } @?= Nothing
     , testCase "orphanVerdict: failed lookups and references on one side are differences" $ do
         let o = HeaderRef (hashText 'U') (toText payloadC)
             t = HeaderRef (hashText 'W') (toText payloadC)
@@ -336,7 +432,7 @@ sampleTests = testGroup "sampling"
 -- | An outcome without depths or transport failure.
 --
 out :: Int -> Request -> Verdict -> Maybe Answer -> Maybe Answer -> Int -> Outcome
-out i r v a b n = Outcome i r v a b n Nothing Nothing
+out i r v a b n = Outcome i r v a b n Nothing Nothing False
 
 outcome :: Int -> Request -> Verdict -> Outcome
 outcome i r v = out i r v Nothing Nothing 1
@@ -357,6 +453,44 @@ reportTests = testGroup "report"
         reportVerdict (run 2) @?= PartialPass
         reportVerdict (run 3) @?= Void
         reportPinned (run 3) @?= 200
+    , testCase "retriedSame counts the re-reads that end Same or OrderOnly, not those that stay Differ" $ do
+        let retried v = (out 0 localReq v (Just (ok "p")) (Just (ok "p")) 2) { _outRetried = True }
+            plain v = out 0 localReq v (Just (ok "p")) (Just (ok "p")) 1
+            rep = foldl addOutcome emptyReport
+                [ retried Same, retried (OrderOnly "rows"), retried (Differ "x"), plain Same, plain (OrderOnly "rows") ]
+        reportRetried rep @?= 3
+        reportRetriedSame rep @?= 2
+        assertBool "json" $ "\"retriedSame\":2" `B.isInfixOf` BL.toStrict (encode rep)
+        assertBool "summary" $ "oracle re-read after a difference: 3, of which Same or order-only: 2" `T.isInfixOf` reportSummary rep
+    , testCase "OrderOnly passes: its own count per class, its txids in the report, exit 0; any Differ still fails" $ do
+        let sameRun = [ out i r Same (Just (ok "p")) (Just (ok "p")) 1
+                      | (i, r) <- zip [0 ..] (concat (replicate 3 [payloadReq, headerReq, localReq, historyReqAt 100])) ]
+            orderOnly i txid = out i (txlogReqAt 100 txid) (OrderOnly ("txlog coin.coin-table " <> txid <> ": 2 rows in another order"))
+                (Just (txlogAnswer [rowA, rowB])) (Just (txlogAnswer [rowB, rowA])) 1
+            ooRep = foldl addOutcome emptyReport (sameRun <> [ orderOnly 100 "7", orderOnly 101 "7", orderOnly 102 "9" ])
+            json = BL.toStrict (encode ooRep)
+        reportCount ooRep ClsHistory KindOrderOnly @?= 3
+        reportCount ooRep ClsHistory KindDiffer @?= 0
+        reportCount ooRep ClsHistory KindSame @?= 3
+        reportDiffCount ooRep @?= 0
+        reportCompared ooRep @?= length sameRun + 3
+        reportOrderOnlyTxids ooRep @?= ["7", "9"]
+        reportVerdict ooRep @?= PartialPass  -- poll, spv and preflight are not in this run
+        gateExitCode (reportVerdict ooRep) @?= ExitFailure 4
+        assertBool "json per class" $ "\"orderOnly\":3" `B.isInfixOf` json
+        assertBool "json txids" $ "\"txids\":[\"7\",\"9\"]" `B.isInfixOf` json
+        assertBool "summary" $ "order-only (txlog rows in another order, a pass): 3, txids 7, 9" `T.isInfixOf` reportSummary ooRep
+        -- the verdict of a run with every class is Pass with OrderOnly outcomes, Fail with a Differ
+        let allClasses = [ out i r Same (Just (ok "p")) (Just (ok "p")) 1
+                         | (i, r) <- zip [0 ..] [payloadReq, headerReq, localReq, historyReqAt 100, preflightReq] ]
+                         <> [ out 10 pollReq Same (Just (ok "{\"k\":{}}")) (Just (ok "{\"k\":{}}")) 1
+                            , out 11 spvReqAt Same (Just (ok "p")) (Just (ok "p")) 1 ]
+            passRep = foldl addOutcome emptyReport (allClasses <> [ orderOnly 100 "7", orderOnly 101 "9" ])
+        reportVerdict passRep @?= Pass
+        gateExitCode (reportVerdict passRep) @?= ExitSuccess
+        let failRep = addOutcome passRep (out 102 (txlogReqAt 100 "7") (Differ "d") Nothing Nothing 1)
+        reportVerdict failRep @?= Fail
+        gateExitCode (reportVerdict failRep) @?= ExitFailure 2
     , testCase "a run that compared nothing is void" $
         reportVerdict (addOutcome emptyReport (out 0 uncoveredReq (Skipped NotCovered) Nothing Nothing 0)) @?= Void
     , testCase "every History request ends Unpinned and every payload request is Same: Void, not Pass" $ do
@@ -417,7 +551,7 @@ reportTests = testGroup "report"
     , testCase "no answer from the oracle above 1% of the requests sent voids the run" $ do
         let run k = foldl addOutcome emptyReport
                 [ if i < k
-                    then Outcome i payloadReq (Skipped NoOracleAnswer) Nothing Nothing 1 Nothing (Just NoAnswerOracle)
+                    then Outcome i payloadReq (Skipped NoOracleAnswer) Nothing Nothing 1 Nothing (Just NoAnswerOracle) False
                     else out i payloadReq Same Nothing Nothing 1
                 | i <- [0 .. 199]
                 ]
@@ -425,7 +559,7 @@ reportTests = testGroup "report"
         reportVerdict (run 3) @?= Void
         reportNoAnswer (run 3) NoAnswerOracle @?= 3
     , testCase "one 1% budget for every inconclusive outcome over the requests sent, with counts per kind" $ do
-        let skipped i r na = Outcome i localReq (Skipped r) Nothing Nothing 1 Nothing na
+        let skipped i r na = Outcome i localReq (Skipped r) Nothing Nothing 1 Nothing na False
             rep = reportGeneration 400 [ (ClsLocal, "an oracle lookup failed") | _ <- [1 .. 3 :: Int] ] $
                 foldl addOutcome emptyReport $
                     [ skipped 0 PinUnstable Nothing
@@ -453,10 +587,10 @@ reportTests = testGroup "report"
 
     , testCase "transport failures are counted per side, in the summary and the JSON" $ do
         let rep = foldl addOutcome emptyReport
-                [ Outcome 0 payloadReq (Differ "no answer") (Just (ok "p")) Nothing 1 Nothing (Just NoAnswerTest)
-                , Outcome 1 payloadReq (Skipped NoOracleAnswer) Nothing Nothing 1 Nothing (Just NoAnswerOracle)
-                , Outcome 2 payloadReq (Skipped NoOracleAnswer) Nothing Nothing 1 Nothing (Just NoAnswerBoth)
-                , Outcome 3 payloadReq (Skipped NoOracleAnswer) Nothing Nothing 1 Nothing (Just NoAnswerBoth)
+                [ Outcome 0 payloadReq (Differ "no answer") (Just (ok "p")) Nothing 1 Nothing (Just NoAnswerTest) False
+                , Outcome 1 payloadReq (Skipped NoOracleAnswer) Nothing Nothing 1 Nothing (Just NoAnswerOracle) False
+                , Outcome 2 payloadReq (Skipped NoOracleAnswer) Nothing Nothing 1 Nothing (Just NoAnswerBoth) False
+                , Outcome 3 payloadReq (Skipped NoOracleAnswer) Nothing Nothing 1 Nothing (Just NoAnswerBoth) False
                 ]
         map (reportNoAnswer rep) [NoAnswerTest, NoAnswerOracle, NoAnswerBoth] @?= [1, 1, 2]
         reportVerdict rep @?= Fail
@@ -468,7 +602,7 @@ reportTests = testGroup "report"
                 [ "payload" .= object [ "exec" .= object [ "code" .= code ] ] ]
             req = localReq { _reqBody = Just (BL.toStrict (encode (object [ "cmd" .= cmd, "hash" .= ("h" :: T.Text) ]))) }
             rep = addOutcome emptyReport
-                (Outcome 7 req (Differ "d") (Just (ok "a")) (Just (ok "b")) 1 (Just (900, 890)) Nothing)
+                (Outcome 7 req (Differ "d") (Just (ok "a")) (Just (ok "b")) 1 (Just (900, 890)) Nothing False)
             summary = reportSummary rep
         assertBool "depths" $ "(depth oracle 900, test 890)" `T.isInfixOf` summary
         assertBool "code" $ ("body: " <> T.take 120 code <> "...") `T.isInfixOf` summary
@@ -521,6 +655,16 @@ data StubConfig = StubConfig
     , _scPayloadStatuses :: ![Int]
         -- ^ the statuses of the first payload answers, in order, before the
         -- payloads themselves
+    , _scBlockInData :: !Bool
+        -- ^ @/local@ answers (not the tip probes) carry no block metadata and
+        -- hold the height of the block they were computed at as their data
+    , _scRows :: !(Maybe (Integer -> [B.ByteString]))
+        -- ^ with '_scBlockInData': the data of a @/local@ answer is these rows,
+        -- as a JSON array, for the height of the block it was computed at
+    , _scDriftOnce :: !Integer
+        -- ^ the tip of the service moves by this many blocks right after it
+        -- answered its first tip probe, as a node's tip does between a probe
+        -- and the request that follows it
     }
 
 -- | Arrival time and path with query of every request a stub saw.
@@ -544,6 +688,9 @@ oracleConf = StubConfig
     , _scDelay = 0
     , _scDropLocal = False
     , _scPayloadStatuses = []
+    , _scBlockInData = False
+    , _scRows = Nothing
+    , _scDriftOnce = 0
     }
 
 -- | The same answers as the oracle at a different tip, without the orphan.
@@ -556,8 +703,8 @@ testConf = oracleConf
 
 -- | A stub service. History code (@txids@) fails at the tip, as on Pact 5.
 --
-stubApp :: Seen -> IORef Int -> IORef Int -> StubConfig -> Application
-stubApp seen probes payloadHits sc req respond = do
+stubApp :: Seen -> IORef Int -> IORef Int -> IORef BlockHeight -> StubConfig -> Application
+stubApp seen probes payloadHits tipRef sc req respond = do
     body <- BL.toStrict <$> strictRequestBody req
     t <- getMonotonicTime
     let full = T.decodeUtf8 (rawPathInfo req <> rawQueryString req)
@@ -566,9 +713,23 @@ stubApp seen probes payloadHits sc req respond = do
             _ -> Nothing
         reply s b = respond $ responseLBS (mkStatus s "") [] (BL.fromStrict b)
         dat = if B.null (_scDataTag sc) then body else "[" <> body <> ",\"" <> _scDataTag sc <> "\"]"
+        withMeta d = do
+            tip <- readIORef tipRef
+            reply 200 (localBody (tip - fromIntegral d) (_scParent sc) dat)
         local d
-            | _scLocalMeta sc = reply 200 (localBody (_scTip sc - fromIntegral d) (_scParent sc) dat)
+            | _scBlockInData sc = do
+                tip <- readIORef tipRef
+                let h = B8.pack (show (tip - fromIntegral d))
+                    dd = case _scRows sc of
+                        Just f -> "[" <> B.intercalate "," (f (fromIntegral tip - fromIntegral d)) <> "]"
+                        Nothing | B.null (_scDataTag sc) -> h
+                                | otherwise -> "[" <> h <> ",\"" <> _scDataTag sc <> "\"]"
+                reply 200 ("{\"result\":{\"status\":\"success\",\"data\":" <> dd <> "},\"metaData\":null}")
+            | _scLocalMeta sc = withMeta d
             | otherwise = reply 200 "{\"result\":{\"status\":\"success\",\"data\":1},\"metaData\":null}"
+        probe d
+            | _scLocalMeta sc || _scBlockInData sc = withMeta d
+            | otherwise = local d
     atomicModifyIORef' seen (\xs -> ((t, full) : xs, ()))
     when (_scDelay sc > 0) $ threadDelay (_scDelay sc)
     case drop 3 (pathInfo req) of
@@ -596,7 +757,12 @@ stubApp seen probes payloadHits sc req respond = do
             Just d
                 | "(+ 1 1)" `B.isInfixOf` body -> do
                     n <- atomicModifyIORef' probes (\k -> (k + 1, k))
-                    if n < _scProbeFailures sc then reply 500 "probe failed" else local d
+                    if n < _scProbeFailures sc
+                        then reply 500 "probe failed"
+                        else do
+                            r <- probe d
+                            when (n == 0) (modifyIORef' tipRef (+ fromInteger (_scDriftOnce sc)))
+                            return r
                 | d == 0, "txids" `B.isInfixOf` body -> reply 500 "history functions are not available at the tip"
                 | _scDropLocal sc -> respond $ responseRaw (\_ _ -> return ()) (responseLBS status500 [] "no raw")
                 | otherwise -> local d
@@ -648,7 +814,8 @@ serve :: Seen -> Maybe StubConfig -> (Int -> IO a) -> IO a
 serve seen (Just sc) k = do
     probes <- newIORef 0
     payloadHits <- newIORef 0
-    testWithApplication (return (stubApp seen probes payloadHits sc)) k
+    tipRef <- newIORef (_scTip sc)
+    testWithApplication (return (stubApp seen probes payloadHits tipRef sc)) k
 serve _ Nothing k = do
     closed <- testWithApplication (return (\_ respond -> respond (responseLBS status200 [] ""))) return
     k closed
@@ -684,6 +851,82 @@ runTests = testGroup "runCompare"
         n2 @?= 1
         n3 @?= 0
 
+    , testCase "stale oracle tip, answers without block metadata: the oracle is read again with a fresh tip, Same, retried 1" $
+        withStubs 1_000
+            oracleConf { _scLocalMeta = False, _scBlockInData = True, _scDriftOnce = 1 }
+            testConf { _scLocalMeta = False, _scBlockInData = True } $ \o t so st -> do
+            rep <- runCompare quietLogger cov o t [localReqAt 500]
+            reportVerdict rep @?= PartialPass
+            reportCount rep ClsLocal KindSame @?= 1
+            reportDiffCount rep @?= 0
+            reportRetried rep @?= 1
+            reportRetriedSame rep @?= 1
+            ps <- seenPaths so
+            probeCount ps @?= 2
+            deepLocals ps @?= 2
+            pt <- seenPaths st
+            deepLocals pt @?= 1
+            assertBool "json" $ "\"retried\":1" `B.isInfixOf` BL.toStrict (encode rep)
+            assertBool "json, retriedSame" $ "\"retriedSame\":1" `B.isInfixOf` BL.toStrict (encode rep)
+            assertBool "summary" $ "oracle re-read after a difference: 1, of which Same or order-only: 1" `T.isInfixOf` reportSummary rep
+    , testCase "stale oracle tip, txlog: the re-read answer holds the rows in another order: OrderOnly, retried 1, retriedSame 1" $
+        withStubs 1_000
+            oracleConf { _scLocalMeta = False, _scBlockInData = True, _scDriftOnce = 1
+                       , _scRows = Just (\h -> if h == 500 then [rowB, rowD, rowA] else [rowA]) }
+            testConf { _scLocalMeta = False, _scBlockInData = True
+                     , _scRows = Just (const [rowA, rowB, rowD]) } $ \o t so _ -> do
+            rep <- runCompare quietLogger cov o t [txlogReqAt 500 "7"]
+            reportDiffCount rep @?= 0
+            reportCount rep ClsHistory KindOrderOnly @?= 1
+            reportCount rep ClsHistory KindSame @?= 0
+            reportRetried rep @?= 1
+            reportRetriedSame rep @?= 1
+            reportOrderOnlyTxids rep @?= ["7"]
+            deepLocals <$> seenPaths so >>= (@?= 2)
+    , testCase "stale oracle tip, both answers differ: Differ after one re-read, retried 1" $
+        withStubs 1_000
+            oracleConf { _scLocalMeta = False, _scBlockInData = True, _scDriftOnce = 1 }
+            testConf { _scLocalMeta = False, _scBlockInData = True, _scDataTag = "x" } $ \o t so _ -> do
+            rep <- runCompare quietLogger cov o t [localReqAt 500]
+            reportVerdict rep @?= Fail
+            reportDiffCount rep @?= 1
+            reportRetried rep @?= 1
+            reportRetriedSame rep @?= 0
+            ps <- seenPaths so
+            deepLocals ps @?= 2
+    , testCase "answers with block metadata are not read again: a difference at equal pins stays, a pin mismatch is the pin retry" $ do
+        withStubs 1_000 oracleConf testConf { _scDataTag = "x" } $ \o t so _ -> do
+            rep <- runCompare quietLogger cov o t [localReqAt 500]
+            reportDiffCount rep @?= 1
+            reportRetried rep @?= 0
+            deepLocals <$> seenPaths so >>= (@?= 1)
+        withStubs 1_000 oracleConf { _scDriftOnce = 1 } testConf $ \o t _ _ -> do
+            rep <- runCompare quietLogger cov o t [localReqAt 500]
+            reportCount rep ClsLocal KindSame @?= 1
+            reportRetried rep @?= 0
+    , testCase "an answer with block metadata on one side only is not read again: Differ, retried 0, the oracle sent once" $ do
+        -- the oracle has metadata, the test side has none (m-2 of the review)
+        withStubs 1_000
+            oracleConf
+            testConf { _scLocalMeta = False, _scBlockInData = True } $ \o t so _ -> do
+            rep <- runCompare quietLogger cov o t [localReqAt 500]
+            reportDiffCount rep @?= 1
+            reportRetried rep @?= 0
+            deepLocals <$> seenPaths so >>= (@?= 1)
+        -- and the other way round
+        withStubs 1_000
+            oracleConf { _scLocalMeta = False, _scBlockInData = True }
+            testConf $ \o t so _ -> do
+            rep <- runCompare quietLogger cov o t [localReqAt 500]
+            reportDiffCount rep @?= 1
+            reportRetried rep @?= 0
+            deepLocals <$> seenPaths so >>= (@?= 1)
+    , testCase "a request of a class without a tip is never read again" $
+        withStubs 1_000 oracleConf testConf { _scPayloads = M.insert (toText payloadA) "other" (_scPayloads testConf) } $ \o t so _ -> do
+            rep <- runCompare quietLogger cov o t [payloadReqFor payloadA]
+            reportDiffCount rep @?= 1
+            reportRetried rep @?= 0
+            length . filter (toText payloadA `T.isInfixOf`) <$> seenPaths so >>= (@?= 1)
     , testCase "identical services: Pass; an uncovered request is sent to neither side" $
         withStubs 1_000 oracleConf testConf $ \o t so st -> do
             let reqs =
