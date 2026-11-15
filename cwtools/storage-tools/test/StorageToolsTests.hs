@@ -4,6 +4,7 @@ import Test.Tasty
 
 import qualified Chainweb.StorageTools.Test.Cold as Cold
 import qualified Chainweb.StorageTools.Test.Compare as Compare
+import qualified Chainweb.StorageTools.Test.FileLimit as FileLimit
 import qualified Chainweb.StorageTools.Test.Http as Http
 import qualified Chainweb.StorageTools.Test.InProcess as InProcess
 import qualified Chainweb.StorageTools.Test.RangeDb as RangeDb
@@ -13,6 +14,7 @@ main :: IO ()
 main = defaultMain $ testGroup "storage-tools"
     [ Compare.tests
     , Requests.tests
+    , FileLimit.tests
     , Http.tests
     , RangeDb.tests
     , Cold.tests

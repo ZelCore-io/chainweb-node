@@ -36,7 +36,9 @@
 -- targets, with at most 10 times that many attempts. The skips are recorded
 -- per class in the report; they are not inconclusive, and a class that the
 -- attempts leave short is reported short, not void.
-
+--
+-- The soft limit of open files is raised to the hard limit at start, and both
+-- are logged.
 --
 -- Only a run of all 7 classes can pass: one of fewer classes (@--classes@),
 -- one with a class that never got a same 2xx answer (identical errors only),
@@ -77,6 +79,7 @@ import Chainweb.StorageTools.Compare.Rules (parseRequestFile)
 import Chainweb.StorageTools.Compare.Run
 import Chainweb.StorageTools.Compare.Sample
 import Chainweb.StorageTools.Compare.Types
+import Chainweb.StorageTools.FileLimit
 import Chainweb.Utils (toText)
 import Chainweb.Version
 import Chainweb.Version.Mainnet (mainnet)
@@ -296,6 +299,7 @@ main = do
         settings = case _optTest o of
             TestUrl _ -> []
             TestDb td -> localSettingsText (_tdLocal td)
+    raiseFileLimit >>= logFunctionText logger Info . describeFileLimits
     hl <- newHostLimiters (_optRate o) (_optPauseFile o)
     oracle <- Side "oracle" (_optOracle o) <$> limiterFor hl (_optOracle o)
     (reqs, classes, gen) <- case _optSource o of

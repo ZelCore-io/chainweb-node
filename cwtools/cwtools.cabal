@@ -336,6 +336,7 @@ library storage-tools
         Chainweb.StorageTools.Compare.Run
         Chainweb.StorageTools.Compare.Sample
         Chainweb.StorageTools.Compare.Types
+        Chainweb.StorageTools.FileLimit
         Chainweb.StorageTools.Http
         Chainweb.StorageTools.Measure.Cold
         Chainweb.StorageTools.Measure.Payload
@@ -371,6 +372,7 @@ library storage-tools
         , servant-client
         , streaming
         , text
+        , unix
         , unordered-containers
         , vector
         , warp
@@ -462,6 +464,7 @@ test-suite storage-tools-tests
     other-modules:
         Chainweb.StorageTools.Test.Cold
         Chainweb.StorageTools.Test.Compare
+        Chainweb.StorageTools.Test.FileLimit
         Chainweb.StorageTools.Test.Http
         Chainweb.StorageTools.Test.InProcess
         Chainweb.StorageTools.Test.RangeDb
@@ -498,6 +501,7 @@ test-suite storage-tools-tests
         , tasty-hunit
         , temporary
         , text
+        , unix
         , unordered-containers
         , vector
         , wai
