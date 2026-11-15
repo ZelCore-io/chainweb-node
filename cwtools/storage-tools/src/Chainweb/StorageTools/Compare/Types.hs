@@ -34,6 +34,7 @@ module Chainweb.StorageTools.Compare.Types
 , Answer(..)
 
   -- * Verdicts
+, genSkipNoTx
 , AllowRule(..)
 , allowRuleText
 , SkipReason(..)
@@ -273,6 +274,14 @@ data Answer = Answer
 
 -- -------------------------------------------------------------------------- --
 -- Verdicts
+
+-- | The kind of a target dropped at generation because a poll or SPV target
+-- has no transaction within 1000 blocks of the sampled height. Such a target
+-- is redrawn, and it is never inconclusive: it is a property of the chain, not
+-- of the oracle.
+--
+genSkipNoTx :: T.Text
+genSkipNoTx = "no tx within 1000 blocks"
 
 -- | The allowlist of spec 10.1: the only differences that are allowed, each
 -- with evidence. Tip skew and requests that are not covered are never

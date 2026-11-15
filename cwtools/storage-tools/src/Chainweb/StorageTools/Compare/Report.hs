@@ -54,6 +54,9 @@ module Chainweb.StorageTools.Compare.Report
 , reportEntrySuccess
 , reportHollowEntries
 , reportGeneration
+, reportGenerationDraws
+, reportGenSkippedInconclusive
+, reportGenShort
 , reportGenTargets
 , reportGenSkipped
 , reportGenSkippedKind
@@ -221,6 +224,9 @@ data Report = Report
         -- ^ see 'reportGeneration'
     , _repGenSkipped :: !(M.Map (RequestClass, T.Text) Int)
         -- ^ per class and kind, see 'reportGeneration'
+    , _repGenDraws :: !(M.Map RequestClass (Int, Int, Int))
+        -- ^ per class: the targets it was to have, the attempts and the
+        -- targets it is short, see 'reportGenerationDraws'
     , _repSettings :: ![(T.Text, T.Text)]
         -- ^ see 'reportSettings'
     , _repRealKey :: !(M.Map RequestClass Int)
@@ -242,7 +248,7 @@ maxBodyBytes :: Int
 maxBodyBytes = 4_096
 
 emptyReport :: Report
-emptyReport = Report mempty mempty mempty mempty mempty mempty 0 0 mempty 0 0 0 mempty mempty [] 0 mempty [] mempty mempty []
+emptyReport = Report mempty mempty mempty mempty mempty mempty 0 0 mempty 0 0 0 mempty mempty [] 0 mempty mempty [] mempty mempty []
 
 -- | Adds the outcome of a request. The result does not depend on the order
 -- in which outcomes are added.
@@ -415,7 +421,9 @@ reportNoAnswer rep na = M.findWithDefault 0 na (_repNoAnswer rep)
 -- | The inconclusive outcomes of a run, which share one budget of 1% of the
 -- requests sent (ruling (b) on the Task 5 re-review): 'PinUnstable',
 -- 'Unpinned' after sending, 'NoOracleAnswer', and the targets skipped at
--- generation ('reportGeneration').
+-- generation for a reason other than 'genSkipNoTx' ('reportGeneration'). A
+-- target without a transaction in its window is redrawn and is no part of the
+-- budget (ruling of M0c).
 --
 reportInconclusive :: Report -> Int
 reportInconclusive rep = sum (map snd (inconclusiveKinds rep))
@@ -427,7 +435,7 @@ inconclusiveKinds rep =
     [ ("pin unstable", _repPinUnstable rep)
     , ("unpinned after sending", _repUnpinnedSent rep)
     , ("no oracle answer", reportSkippedFor rep NoOracleAnswer)
-    , ("skipped at generation", reportGenSkippedTotal rep)
+    , ("skipped at generation", reportGenSkippedInconclusive rep)
     ]
 
 -- | The number of requests whose answers were judged: same, order only,
@@ -494,13 +502,38 @@ entryText (c, e) = requestClassText c <> ":" <> e
 -- generated run, the class and kind of those dropped at generation, for
 -- instance because an oracle lookup failed (ruling on Task 6a) or because a
 -- poll or SPV target has no transaction within 1000 blocks (ruling C3 on Task
--- 6). More than 1% of the targets dropped makes the run 'Void'.
+-- 6). A target without a transaction is redrawn ('reportGenerationDraws') and
+-- is no part of the budget; the other kinds are, and make the run 'Void' above
+-- 1% of the requests sent.
 --
 reportGeneration :: Int -> [(RequestClass, T.Text)] -> Report -> Report
 reportGeneration n skipped rep = rep
     { _repGenTargets = n
     , _repGenSkipped = M.fromListWith (+) [ (s, 1) | s <- skipped ]
     }
+
+-- | @reportGenerationDraws [(class, requested, attempts, short)]@: what the
+-- draws of each class came to when targets without a transaction in their
+-- window were redrawn (see "Chainweb.StorageTools.Compare.Requests"): the
+-- targets the class was to have, the targets drawn in all, and the targets it
+-- is short because the attempts ran out. A short count is reported, and it
+-- does not void a run.
+--
+reportGenerationDraws :: [(RequestClass, Int, Int, Int)] -> Report -> Report
+reportGenerationDraws ds rep = rep
+    { _repGenDraws = M.fromList [ (c, (n, a, sh)) | (c, n, a, sh) <- ds ] }
+
+-- | The targets dropped at generation that count toward the budget of
+-- inconclusive outcomes: every kind but 'genSkipNoTx'.
+--
+reportGenSkippedInconclusive :: Report -> Int
+reportGenSkippedInconclusive rep = reportGenSkippedTotal rep - reportGenSkippedKind rep genSkipNoTx
+
+-- | The targets of a class that its draws are short of, see
+-- 'reportGenerationDraws'.
+--
+reportGenShort :: Report -> RequestClass -> Int
+reportGenShort rep c = maybe 0 (\(_, _, sh) -> sh) (M.lookup c (_repGenDraws rep))
 
 -- | The targets sampled for a generated run, see 'reportGeneration'.
 --
@@ -605,7 +638,7 @@ reportMissingClasses rep = filter (not . covers) allRequestClasses
 --   real key was compared ('reportRealKeyCompared', ruling C3 on Task 6);
 -- * the inconclusive outcomes ('reportInconclusive': 'PinUnstable',
 --   'Unpinned' after sending, 'NoOracleAnswer', and the targets dropped at
---   generation) are together more than 1% of the requests sent. One budget
+--   generation, but not those without a transaction in their window) are together more than 1% of the requests sent. One budget
 --   for all of them, as spec 10.1 states the 1% as one fraction (ruling (b)
 --   on the Task 5 re-review); the report keeps the count of each kind.
 --
@@ -650,11 +683,22 @@ inconclusiveText rep = T.intercalate ", " [ k <> " " <> T.pack (show n) | (k, n)
     <> if reportGenSkippedTotal rep > 0 then " (" <> genSkipKinds rep <> ")" else ""
 
 -- | The skips at generation per kind, for example @no tx within 1000 blocks:
--- 3, an oracle lookup failed: 1@.
+-- 3, an oracle lookup failed: 1@. The first is no part of the budget.
 --
 genSkipKinds :: Report -> T.Text
 genSkipKinds rep = T.intercalate ", "
     [ k <> ": " <> T.pack (show n) | (k, n) <- M.toList (M.mapKeysWith (+) snd (_repGenSkipped rep)) ]
+
+-- | The draws of each class that needed redraws or fell short, for the
+-- summary.
+--
+genDrawsText :: Report -> [T.Text]
+genDrawsText rep =
+    [ requestClassText c <> " " <> T.pack (show a) <> " attempts for " <> T.pack (show n) <> " targets"
+        <> (if sh > 0 then ", short by " <> T.pack (show sh) else "")
+    | (c, (n, a, sh)) <- M.toList (_repGenDraws rep)
+    , a > n || sh > 0
+    ]
 
 -- | The exit code of @cw-compare@ for a gate verdict: 0 'Pass', 2 'Fail',
 -- 3 'Void', 4 'PartialPass'. Exit code 1 is left to bad arguments and crashes, so that a
@@ -735,6 +779,9 @@ reportSummary rep = T.unlines $
         <> T.concat [ ", " <> requestClassText c <> " " <> sh n | (c, n) <- M.toList (M.mapKeysWith (+) fst (_repGenSkipped rep)) ]
        | _repGenTargets rep > 0
        ]
+    <> [ "redrawn (targets without a tx in the window; not inconclusive): " <> T.intercalate "; " ds
+       | let ds = genDrawsText rep, not (null ds)
+       ]
     <> [ "settings: " <> T.intercalate ", " [ k <> "=" <> v | (k, v) <- _repSettings rep ]
        | not (null (_repSettings rep))
        ]
@@ -811,6 +858,15 @@ instance ToJSON Report where
             , "skipped" .= reportGenSkippedTotal rep
             , "skippedPerKind" .= object
                 [ K.fromText k .= n | (k, n) <- M.toList (M.mapKeysWith (+) snd (_repGenSkipped rep)) ]
+            , "perClass" .= object
+                [ K.fromText (requestClassText c) .= object
+                    [ "requested" .= n
+                    , "attempts" .= a
+                    , "short" .= sh
+                    , "skipped" .= reportGenSkipped rep c
+                    ]
+                | (c, (n, a, sh)) <- M.toList (_repGenDraws rep)
+                ]
             ]
         , "settings" .= object [ K.fromText k .= v | (k, v) <- _repSettings rep ]
         , "compared" .= reportCompared rep
@@ -826,7 +882,7 @@ instance ToJSON Report where
             , "pinUnstable" .= _repPinUnstable rep
             , "unpinnedSent" .= _repUnpinnedSent rep
             , "noOracleAnswer" .= reportSkippedFor rep NoOracleAnswer
-            , "generationSkipped" .= reportGenSkippedTotal rep
+            , "generationSkipped" .= reportGenSkippedInconclusive rep
             ]
         , "noAnswer" .= object
             [ K.fromText (noAnswerText na) .= reportNoAnswer rep na | na <- [minBound .. maxBound] ]
