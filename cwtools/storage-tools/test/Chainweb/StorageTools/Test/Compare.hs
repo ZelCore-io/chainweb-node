@@ -135,10 +135,13 @@ cmdBody code = BL.toStrict $ encode $ object
 
 -- | Rows of a @txlog@ answer, each as the bytes a node wrote.
 --
-rowA, rowB, rowC :: B.ByteString
+rowA, rowB, rowC, rowD :: B.ByteString
 rowA = "{\"key\":\"KEzk\",\"table\":\"coin_coin-table\",\"txid\":7,\"value\":{\"balance\":1.5,\"guard\":{\"pred\":\"keys-all\"}}}"
 rowB = "{\"key\":\"k:4f95\",\"table\":\"coin_coin-table\",\"txid\":7,\"value\":{\"balance\":2.0}}"
 rowC = "{\"key\":\"k:77aa\",\"table\":\"coin_coin-table\",\"txid\":7,\"value\":{\"balance\":3.25}}"
+-- | A row whose key holds a comma, a closing bracket and an escaped quote, which
+-- a splitter of the rows must not take for the end of a row or of the array.
+rowD = "{\"key\":\"a,]\\\"x\",\"txid\":7}"
 
 -- | A pinned answer at the target of 'txlogReqAt' 100 with these rows.
 --
@@ -232,12 +235,16 @@ rulesTests = testGroup "rules"
         assertBool "body" $ isDiffer (judge cov localReq (Answer 400 "e" Nothing) (Answer 400 "f" Nothing))
         assertBool "status" $ isDiffer (judge cov localReq (Answer 400 "e" Nothing) (Answer 500 "e" Nothing))
     , testCase "txlog rows in another order: OrderOnly, naming the table, the txid and the rows" $ do
-        let j = judge cov (txlogReqAt 100 "7") (txlogAnswer [rowA, rowB, rowC]) (txlogAnswer [rowC, rowA, rowB])
+        let j = judge cov (txlogReqAt 100 "7") (txlogAnswer [rowA, rowB, rowC, rowD]) (txlogAnswer [rowD, rowC, rowA, rowB])
         assertBool ("OrderOnly: " <> show j) (isOrderOnly j)
         case j of
             Final (OrderOnly ev) -> assertBool ("evidence: " <> T.unpack ev) $
-                all (`T.isInfixOf` ev) ["coin.coin-table", "7", "3 rows"]
+                all (`T.isInfixOf` ev) ["coin.coin-table", "7", "4 rows"]
             _ -> return ()
+        -- a row with a comma, a bracket and an escaped quote in a string: one byte of it changed is a Differ
+        let rowD' = B.take 9 rowD <> "y" <> B.drop 10 rowD
+        assertBool "a changed byte in the row with the special characters" $ isDiffer
+            (judge cov (txlogReqAt 100 "7") (txlogAnswer [rowA, rowD, rowB]) (txlogAnswer [rowB, rowD', rowA]))
     , testCase "txlog rows in the same order: Same" $
         judge cov (txlogReqAt 100 "7") (txlogAnswer [rowA, rowB]) (txlogAnswer [rowA, rowB]) @?= Final Same
     , testCase "txlog: one byte of one row changed, in another order or not: Differ" $ do
@@ -651,6 +658,9 @@ data StubConfig = StubConfig
     , _scBlockInData :: !Bool
         -- ^ @/local@ answers (not the tip probes) carry no block metadata and
         -- hold the height of the block they were computed at as their data
+    , _scRows :: !(Maybe (Integer -> [B.ByteString]))
+        -- ^ with '_scBlockInData': the data of a @/local@ answer is these rows,
+        -- as a JSON array, for the height of the block it was computed at
     , _scDriftOnce :: !Integer
         -- ^ the tip of the service moves by this many blocks right after it
         -- answered its first tip probe, as a node's tip does between a probe
@@ -679,6 +689,7 @@ oracleConf = StubConfig
     , _scDropLocal = False
     , _scPayloadStatuses = []
     , _scBlockInData = False
+    , _scRows = Nothing
     , _scDriftOnce = 0
     }
 
@@ -709,7 +720,10 @@ stubApp seen probes payloadHits tipRef sc req respond = do
             | _scBlockInData sc = do
                 tip <- readIORef tipRef
                 let h = B8.pack (show (tip - fromIntegral d))
-                    dd = if B.null (_scDataTag sc) then h else "[" <> h <> ",\"" <> _scDataTag sc <> "\"]"
+                    dd = case _scRows sc of
+                        Just f -> "[" <> B.intercalate "," (f (fromIntegral tip - fromIntegral d)) <> "]"
+                        Nothing | B.null (_scDataTag sc) -> h
+                                | otherwise -> "[" <> h <> ",\"" <> _scDataTag sc <> "\"]"
                 reply 200 ("{\"result\":{\"status\":\"success\",\"data\":" <> dd <> "},\"metaData\":null}")
             | _scLocalMeta sc = withMeta d
             | otherwise = reply 200 "{\"result\":{\"status\":\"success\",\"data\":1},\"metaData\":null}"
@@ -855,6 +869,20 @@ runTests = testGroup "runCompare"
             assertBool "json" $ "\"retried\":1" `B.isInfixOf` BL.toStrict (encode rep)
             assertBool "json, retriedSame" $ "\"retriedSame\":1" `B.isInfixOf` BL.toStrict (encode rep)
             assertBool "summary" $ "oracle re-read after a difference: 1, of which Same or order-only: 1" `T.isInfixOf` reportSummary rep
+    , testCase "stale oracle tip, txlog: the re-read answer holds the rows in another order: OrderOnly, retried 1, retriedSame 1" $
+        withStubs 1_000
+            oracleConf { _scLocalMeta = False, _scBlockInData = True, _scDriftOnce = 1
+                       , _scRows = Just (\h -> if h == 500 then [rowB, rowD, rowA] else [rowA]) }
+            testConf { _scLocalMeta = False, _scBlockInData = True
+                     , _scRows = Just (const [rowA, rowB, rowD]) } $ \o t so _ -> do
+            rep <- runCompare quietLogger cov o t [txlogReqAt 500 "7"]
+            reportDiffCount rep @?= 0
+            reportCount rep ClsHistory KindOrderOnly @?= 1
+            reportCount rep ClsHistory KindSame @?= 0
+            reportRetried rep @?= 1
+            reportRetriedSame rep @?= 1
+            reportOrderOnlyTxids rep @?= ["7"]
+            deepLocals <$> seenPaths so >>= (@?= 2)
     , testCase "stale oracle tip, both answers differ: Differ after one re-read, retried 1" $
         withStubs 1_000
             oracleConf { _scLocalMeta = False, _scBlockInData = True, _scDriftOnce = 1 }
