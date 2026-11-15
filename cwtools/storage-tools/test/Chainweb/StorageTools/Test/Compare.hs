@@ -446,6 +446,15 @@ reportTests = testGroup "report"
         reportVerdict (run 2) @?= PartialPass
         reportVerdict (run 3) @?= Void
         reportPinned (run 3) @?= 200
+    , testCase "retriedSame counts the re-reads that end Same or OrderOnly, not those that stay Differ" $ do
+        let retried v = (out 0 localReq v (Just (ok "p")) (Just (ok "p")) 2) { _outRetried = True }
+            plain v = out 0 localReq v (Just (ok "p")) (Just (ok "p")) 1
+            rep = foldl addOutcome emptyReport
+                [ retried Same, retried (OrderOnly "rows"), retried (Differ "x"), plain Same, plain (OrderOnly "rows") ]
+        reportRetried rep @?= 3
+        reportRetriedSame rep @?= 2
+        assertBool "json" $ "\"retriedSame\":2" `B.isInfixOf` BL.toStrict (encode rep)
+        assertBool "summary" $ "oracle re-read after a difference: 3, of which Same or order-only: 2" `T.isInfixOf` reportSummary rep
     , testCase "OrderOnly passes: its own count per class, its txids in the report, exit 0; any Differ still fails" $ do
         let sameRun = [ out i r Same (Just (ok "p")) (Just (ok "p")) 1
                       | (i, r) <- zip [0 ..] (concat (replicate 3 [payloadReq, headerReq, localReq, historyReqAt 100])) ]
@@ -837,12 +846,15 @@ runTests = testGroup "runCompare"
             reportCount rep ClsLocal KindSame @?= 1
             reportDiffCount rep @?= 0
             reportRetried rep @?= 1
+            reportRetriedSame rep @?= 1
             ps <- seenPaths so
             probeCount ps @?= 2
             deepLocals ps @?= 2
             pt <- seenPaths st
             deepLocals pt @?= 1
             assertBool "json" $ "\"retried\":1" `B.isInfixOf` BL.toStrict (encode rep)
+            assertBool "json, retriedSame" $ "\"retriedSame\":1" `B.isInfixOf` BL.toStrict (encode rep)
+            assertBool "summary" $ "oracle re-read after a difference: 1, of which Same or order-only: 1" `T.isInfixOf` reportSummary rep
     , testCase "stale oracle tip, both answers differ: Differ after one re-read, retried 1" $
         withStubs 1_000
             oracleConf { _scLocalMeta = False, _scBlockInData = True, _scDriftOnce = 1 }
@@ -851,6 +863,7 @@ runTests = testGroup "runCompare"
             reportVerdict rep @?= Fail
             reportDiffCount rep @?= 1
             reportRetried rep @?= 1
+            reportRetriedSame rep @?= 0
             ps <- seenPaths so
             deepLocals ps @?= 2
     , testCase "answers with block metadata are not read again: a difference at equal pins stays, a pin mismatch is the pin retry" $ do

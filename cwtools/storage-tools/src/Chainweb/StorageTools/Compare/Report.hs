@@ -37,6 +37,7 @@ module Chainweb.StorageTools.Compare.Report
 , reportSameNon2xx
 , reportAllowedFor
 , reportRetried
+, reportRetriedSame
 , reportOrderOnlyTxids
 , reportOrderOnlySamples
 , reportDiffCount
@@ -207,6 +208,8 @@ data Report = Report
     , _repDiffCount :: !Int
     , _repRetried :: !Int
         -- ^ see 'reportRetried'
+    , _repRetriedSame :: !Int
+        -- ^ see 'reportRetriedSame'
     , _repDiffs :: !(M.Map Int DiffSample)
         -- ^ the differences with the lowest request indices
     , _repPinned :: !Int
@@ -248,7 +251,7 @@ maxBodyBytes :: Int
 maxBodyBytes = 4_096
 
 emptyReport :: Report
-emptyReport = Report mempty mempty mempty mempty mempty mempty 0 0 mempty 0 0 0 mempty mempty [] 0 mempty mempty [] mempty mempty []
+emptyReport = Report mempty mempty mempty mempty mempty mempty 0 0 0 mempty 0 0 0 mempty mempty [] 0 mempty mempty [] mempty mempty []
 
 -- | Adds the outcome of a request. The result does not depend on the order
 -- in which outcomes are added.
@@ -282,9 +285,14 @@ addOutcome rep0 o = case v of
   where
     rep = rep0
         { _repRetried = _repRetried rep0 + (if _outRetried o then 1 else 0)
+        , _repRetriedSame = _repRetriedSame rep0 + (if _outRetried o && absorbed then 1 else 0)
         , _repNoAnswer = maybe id (\na -> M.insertWith (+) na 1) (_outNoAnswer o) (_repNoAnswer rep0)
         , _repPactFailures = if pactFailure then M.insertWith (+) cls 1 (_repPactFailures rep0) else _repPactFailures rep0
         }
+    absorbed = case v of
+        Same -> True
+        OrderOnly _ -> True
+        _ -> False
     txlog = txlogOfRequest req
     pactFailure = pactStatusIs "failure"
     pactSuccess = pactStatusIs "success"
@@ -390,6 +398,14 @@ reportOrderOnlySamples = M.elems . _repOrderOnly
 --
 reportRetried :: Report -> Int
 reportRetried = _repRetried
+
+-- | The re-reads that ended 'Same' or 'OrderOnly': the second answer of the
+-- oracle agreed with the first answer of the test side, so the difference was
+-- absorbed. A large share of 'reportRetried' is a finding: production's tip
+-- handling or the harness's depth is wrong (review of CWC-FIX, m-1 and m-3).
+--
+reportRetriedSame :: Report -> Int
+reportRetriedSame = _repRetriedSame
 
 reportDiffCount :: Report -> Int
 reportDiffCount = _repDiffCount
@@ -788,6 +804,7 @@ reportSummary rep = T.unlines $
     <> [ "compared: " <> sh (reportCompared rep)
         <> ", differences: " <> sh (_repDiffCount rep)
         <> ", oracle re-read after a difference: " <> sh (_repRetried rep)
+        <> ", of which Same or order-only: " <> sh (_repRetriedSame rep)
         <> ", sent: " <> sh (reportSentTotal rep)
         <> ", pinned requests sent: " <> sh (_repPinned rep)
         <> ", pin unstable: " <> sh (_repPinUnstable rep)
@@ -872,6 +889,7 @@ instance ToJSON Report where
         , "compared" .= reportCompared rep
         , "differences" .= _repDiffCount rep
         , "retried" .= _repRetried rep
+        , "retriedSame" .= _repRetriedSame rep
         , "sent" .= reportSentTotal rep
         , "pinnedSent" .= _repPinned rep
         , "pinUnstable" .= _repPinUnstable rep
