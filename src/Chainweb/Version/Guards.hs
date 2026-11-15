@@ -45,6 +45,7 @@ module Chainweb.Version.Guards
     , chainweb221Pact
     , chainweb222Pact
     , chainweb223Pact
+    , chainweb223PactUpgradeBlock
     , chainweb224Pact
     , chainweb225Pact
     , chainweb228Pact
@@ -293,6 +294,11 @@ chainweb222Pact = checkFork atOrAfter Chainweb222Pact
 -- | Pact 4.11 features, verifier plugins
 chainweb223Pact :: ChainwebVersion -> ChainId -> BlockHeight -> Bool
 chainweb223Pact = checkFork atOrAfter Chainweb223Pact
+
+-- | True only at the block whose coinbase applies the Chainweb223Pact upgrade
+-- (coin v6). See 'Chainweb.Pact.PactService.Pact4.ExecBlock.runCoinbase'.
+chainweb223PactUpgradeBlock :: ChainwebVersion -> ChainId -> BlockHeight -> Bool
+chainweb223PactUpgradeBlock = checkFork (==) Chainweb223Pact
 
 -- | Pact 4.12 features, optimized buy/redeem gas transactions reduce gas cost
 -- for all transactions

@@ -430,7 +430,11 @@ runCoinbase miner enfCBFail usePrecomp mc = do
 
       T2 cr upgradedCacheM <-
           liftIO $ Pact4.applyCoinbase v logger pactDb reward txCtx enfCBFail usePrecomp mc
-      mapM_ upgradeInitCache upgradedCacheM
+      case upgradedCacheM of
+        Nothing -> return ()
+        Just newCache
+          | chainweb223PactUpgradeBlock v (ctxChainId txCtx) bh -> rebuildInitCache
+          | otherwise -> upgradeInitCache newCache
       liftPactServiceM $ debugResult "runPact4Coinbase" (Pact4.crLogs %~ fmap J.Array $ cr)
       return $! cr
 
@@ -438,6 +442,33 @@ runCoinbase miner enfCBFail usePrecomp mc = do
     upgradeInitCache newCache = do
       liftPactServiceM $ logInfoPact "Updating init cache for upgrade"
       updateInitCacheM newCache
+
+    -- At the Chainweb223Pact upgrade (coin v6) the init cache is rebuilt from
+    -- the database, the way a process that starts after the upgrade builds it
+    -- ('initializeCoinContract' calls 'Pact4.readInitModules'), instead of
+    -- merging the upgrade's module cache into the cache in effect.
+    --
+    -- Why: the merge in 'updateInitCache' is a left-biased union, so the
+    -- entries already in the cache (coin from before the upgrade among them)
+    -- win over the upgrade's. Mainnet's recorded history from this upgrade
+    -- (4,577,530) to Chainweb224Pact (4,819,246) was computed with the cache
+    -- a restarted node builds. A process that applies the upgrade block itself
+    -- computes 1 or 2 units less gas than recorded for many module deploys
+    -- after it (for example 69,090 for 69,092, 67,776 for 67,777 and 67,166
+    -- for 67,168), so it rejects those blocks with a payload hash mismatch,
+    -- and a sync from genesis in one process stops on most chains.
+    -- kda-community/chainweb-node PR #33 pinned 14 such transactions in
+    -- '_quirkGasFees' (Chainweb.Version.Mainnet); a one-process replay of each
+    -- chain from 4,577,000 found 64 more on 15 chains, from 4,594,049 to
+    -- 4,652,803, before it was complete. A process started after 4,577,530
+    -- replays all of them with the recorded gas. Rebuilding the cache here
+    -- gives a process that applies the upgrade the same cache.
+    --
+    -- Every other upgrade keeps the merge.
+    rebuildInitCache = do
+      liftPactServiceM $ logInfoPact
+        "Rebuilding init cache from the database for the Chainweb223Pact upgrade"
+      replaceInitCacheM =<< Pact4.readInitModules
 
 
 data CommandInvalidError
