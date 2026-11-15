@@ -490,6 +490,7 @@ outcomeWith i c s b = Outcome
     , _outAttempts = 1
     , _outDepths = Just (700, 690)
     , _outNoAnswer = Nothing
+    , _outRetried = False
     }
 
 pactFailures :: Assertion

@@ -425,7 +425,7 @@ sampleTests = testGroup "sampling"
 -- | An outcome without depths or transport failure.
 --
 out :: Int -> Request -> Verdict -> Maybe Answer -> Maybe Answer -> Int -> Outcome
-out i r v a b n = Outcome i r v a b n Nothing Nothing
+out i r v a b n = Outcome i r v a b n Nothing Nothing False
 
 outcome :: Int -> Request -> Verdict -> Outcome
 outcome i r v = out i r v Nothing Nothing 1
@@ -535,7 +535,7 @@ reportTests = testGroup "report"
     , testCase "no answer from the oracle above 1% of the requests sent voids the run" $ do
         let run k = foldl addOutcome emptyReport
                 [ if i < k
-                    then Outcome i payloadReq (Skipped NoOracleAnswer) Nothing Nothing 1 Nothing (Just NoAnswerOracle)
+                    then Outcome i payloadReq (Skipped NoOracleAnswer) Nothing Nothing 1 Nothing (Just NoAnswerOracle) False
                     else out i payloadReq Same Nothing Nothing 1
                 | i <- [0 .. 199]
                 ]
@@ -543,7 +543,7 @@ reportTests = testGroup "report"
         reportVerdict (run 3) @?= Void
         reportNoAnswer (run 3) NoAnswerOracle @?= 3
     , testCase "one 1% budget for every inconclusive outcome over the requests sent, with counts per kind" $ do
-        let skipped i r na = Outcome i localReq (Skipped r) Nothing Nothing 1 Nothing na
+        let skipped i r na = Outcome i localReq (Skipped r) Nothing Nothing 1 Nothing na False
             rep = reportGeneration 400 [ (ClsLocal, "an oracle lookup failed") | _ <- [1 .. 3 :: Int] ] $
                 foldl addOutcome emptyReport $
                     [ skipped 0 PinUnstable Nothing
@@ -571,10 +571,10 @@ reportTests = testGroup "report"
 
     , testCase "transport failures are counted per side, in the summary and the JSON" $ do
         let rep = foldl addOutcome emptyReport
-                [ Outcome 0 payloadReq (Differ "no answer") (Just (ok "p")) Nothing 1 Nothing (Just NoAnswerTest)
-                , Outcome 1 payloadReq (Skipped NoOracleAnswer) Nothing Nothing 1 Nothing (Just NoAnswerOracle)
-                , Outcome 2 payloadReq (Skipped NoOracleAnswer) Nothing Nothing 1 Nothing (Just NoAnswerBoth)
-                , Outcome 3 payloadReq (Skipped NoOracleAnswer) Nothing Nothing 1 Nothing (Just NoAnswerBoth)
+                [ Outcome 0 payloadReq (Differ "no answer") (Just (ok "p")) Nothing 1 Nothing (Just NoAnswerTest) False
+                , Outcome 1 payloadReq (Skipped NoOracleAnswer) Nothing Nothing 1 Nothing (Just NoAnswerOracle) False
+                , Outcome 2 payloadReq (Skipped NoOracleAnswer) Nothing Nothing 1 Nothing (Just NoAnswerBoth) False
+                , Outcome 3 payloadReq (Skipped NoOracleAnswer) Nothing Nothing 1 Nothing (Just NoAnswerBoth) False
                 ]
         map (reportNoAnswer rep) [NoAnswerTest, NoAnswerOracle, NoAnswerBoth] @?= [1, 1, 2]
         reportVerdict rep @?= Fail
@@ -586,7 +586,7 @@ reportTests = testGroup "report"
                 [ "payload" .= object [ "exec" .= object [ "code" .= code ] ] ]
             req = localReq { _reqBody = Just (BL.toStrict (encode (object [ "cmd" .= cmd, "hash" .= ("h" :: T.Text) ]))) }
             rep = addOutcome emptyReport
-                (Outcome 7 req (Differ "d") (Just (ok "a")) (Just (ok "b")) 1 (Just (900, 890)) Nothing)
+                (Outcome 7 req (Differ "d") (Just (ok "a")) (Just (ok "b")) 1 (Just (900, 890)) Nothing False)
             summary = reportSummary rep
         assertBool "depths" $ "(depth oracle 900, test 890)" `T.isInfixOf` summary
         assertBool "code" $ ("body: " <> T.take 120 code <> "...") `T.isInfixOf` summary
@@ -639,6 +639,13 @@ data StubConfig = StubConfig
     , _scPayloadStatuses :: ![Int]
         -- ^ the statuses of the first payload answers, in order, before the
         -- payloads themselves
+    , _scBlockInData :: !Bool
+        -- ^ @/local@ answers (not the tip probes) carry no block metadata and
+        -- hold the height of the block they were computed at as their data
+    , _scDriftOnce :: !Integer
+        -- ^ the tip of the service moves by this many blocks right after it
+        -- answered its first tip probe, as a node's tip does between a probe
+        -- and the request that follows it
     }
 
 -- | Arrival time and path with query of every request a stub saw.
@@ -662,6 +669,8 @@ oracleConf = StubConfig
     , _scDelay = 0
     , _scDropLocal = False
     , _scPayloadStatuses = []
+    , _scBlockInData = False
+    , _scDriftOnce = 0
     }
 
 -- | The same answers as the oracle at a different tip, without the orphan.
@@ -674,8 +683,8 @@ testConf = oracleConf
 
 -- | A stub service. History code (@txids@) fails at the tip, as on Pact 5.
 --
-stubApp :: Seen -> IORef Int -> IORef Int -> StubConfig -> Application
-stubApp seen probes payloadHits sc req respond = do
+stubApp :: Seen -> IORef Int -> IORef Int -> IORef BlockHeight -> StubConfig -> Application
+stubApp seen probes payloadHits tipRef sc req respond = do
     body <- BL.toStrict <$> strictRequestBody req
     t <- getMonotonicTime
     let full = T.decodeUtf8 (rawPathInfo req <> rawQueryString req)
@@ -684,9 +693,20 @@ stubApp seen probes payloadHits sc req respond = do
             _ -> Nothing
         reply s b = respond $ responseLBS (mkStatus s "") [] (BL.fromStrict b)
         dat = if B.null (_scDataTag sc) then body else "[" <> body <> ",\"" <> _scDataTag sc <> "\"]"
+        withMeta d = do
+            tip <- readIORef tipRef
+            reply 200 (localBody (tip - fromIntegral d) (_scParent sc) dat)
         local d
-            | _scLocalMeta sc = reply 200 (localBody (_scTip sc - fromIntegral d) (_scParent sc) dat)
+            | _scBlockInData sc = do
+                tip <- readIORef tipRef
+                let h = B8.pack (show (tip - fromIntegral d))
+                    dd = if B.null (_scDataTag sc) then h else "[" <> h <> ",\"" <> _scDataTag sc <> "\"]"
+                reply 200 ("{\"result\":{\"status\":\"success\",\"data\":" <> dd <> "},\"metaData\":null}")
+            | _scLocalMeta sc = withMeta d
             | otherwise = reply 200 "{\"result\":{\"status\":\"success\",\"data\":1},\"metaData\":null}"
+        probe d
+            | _scLocalMeta sc || _scBlockInData sc = withMeta d
+            | otherwise = local d
     atomicModifyIORef' seen (\xs -> ((t, full) : xs, ()))
     when (_scDelay sc > 0) $ threadDelay (_scDelay sc)
     case drop 3 (pathInfo req) of
@@ -714,7 +734,12 @@ stubApp seen probes payloadHits sc req respond = do
             Just d
                 | "(+ 1 1)" `B.isInfixOf` body -> do
                     n <- atomicModifyIORef' probes (\k -> (k + 1, k))
-                    if n < _scProbeFailures sc then reply 500 "probe failed" else local d
+                    if n < _scProbeFailures sc
+                        then reply 500 "probe failed"
+                        else do
+                            r <- probe d
+                            when (n == 0) (modifyIORef' tipRef (+ fromInteger (_scDriftOnce sc)))
+                            return r
                 | d == 0, "txids" `B.isInfixOf` body -> reply 500 "history functions are not available at the tip"
                 | _scDropLocal sc -> respond $ responseRaw (\_ _ -> return ()) (responseLBS status500 [] "no raw")
                 | otherwise -> local d
@@ -766,7 +791,8 @@ serve :: Seen -> Maybe StubConfig -> (Int -> IO a) -> IO a
 serve seen (Just sc) k = do
     probes <- newIORef 0
     payloadHits <- newIORef 0
-    testWithApplication (return (stubApp seen probes payloadHits sc)) k
+    tipRef <- newIORef (_scTip sc)
+    testWithApplication (return (stubApp seen probes payloadHits tipRef sc)) k
 serve _ Nothing k = do
     closed <- testWithApplication (return (\_ respond -> respond (responseLBS status200 [] ""))) return
     k closed
@@ -802,6 +828,47 @@ runTests = testGroup "runCompare"
         n2 @?= 1
         n3 @?= 0
 
+    , testCase "stale oracle tip, answers without block metadata: the oracle is read again with a fresh tip, Same, retried 1" $
+        withStubs 1_000
+            oracleConf { _scLocalMeta = False, _scBlockInData = True, _scDriftOnce = 1 }
+            testConf { _scLocalMeta = False, _scBlockInData = True } $ \o t so st -> do
+            rep <- runCompare quietLogger cov o t [localReqAt 500]
+            reportVerdict rep @?= PartialPass
+            reportCount rep ClsLocal KindSame @?= 1
+            reportDiffCount rep @?= 0
+            reportRetried rep @?= 1
+            ps <- seenPaths so
+            probeCount ps @?= 2
+            deepLocals ps @?= 2
+            pt <- seenPaths st
+            deepLocals pt @?= 1
+            assertBool "json" $ "\"retried\":1" `B.isInfixOf` BL.toStrict (encode rep)
+    , testCase "stale oracle tip, both answers differ: Differ after one re-read, retried 1" $
+        withStubs 1_000
+            oracleConf { _scLocalMeta = False, _scBlockInData = True, _scDriftOnce = 1 }
+            testConf { _scLocalMeta = False, _scBlockInData = True, _scDataTag = "x" } $ \o t so _ -> do
+            rep <- runCompare quietLogger cov o t [localReqAt 500]
+            reportVerdict rep @?= Fail
+            reportDiffCount rep @?= 1
+            reportRetried rep @?= 1
+            ps <- seenPaths so
+            deepLocals ps @?= 2
+    , testCase "answers with block metadata are not read again: a difference at equal pins stays, a pin mismatch is the pin retry" $ do
+        withStubs 1_000 oracleConf testConf { _scDataTag = "x" } $ \o t so _ -> do
+            rep <- runCompare quietLogger cov o t [localReqAt 500]
+            reportDiffCount rep @?= 1
+            reportRetried rep @?= 0
+            deepLocals <$> seenPaths so >>= (@?= 1)
+        withStubs 1_000 oracleConf { _scDriftOnce = 1 } testConf $ \o t _ _ -> do
+            rep <- runCompare quietLogger cov o t [localReqAt 500]
+            reportCount rep ClsLocal KindSame @?= 1
+            reportRetried rep @?= 0
+    , testCase "a request of a class without a tip is never read again" $
+        withStubs 1_000 oracleConf testConf { _scPayloads = M.insert (toText payloadA) "other" (_scPayloads testConf) } $ \o t so _ -> do
+            rep <- runCompare quietLogger cov o t [payloadReqFor payloadA]
+            reportDiffCount rep @?= 1
+            reportRetried rep @?= 0
+            length . filter (toText payloadA `T.isInfixOf`) <$> seenPaths so >>= (@?= 1)
     , testCase "identical services: Pass; an uncovered request is sent to neither side" $
         withStubs 1_000 oracleConf testConf $ \o t so st -> do
             let reqs =

@@ -36,6 +36,7 @@ module Chainweb.StorageTools.Compare.Report
 , reportSame2xx
 , reportSameNon2xx
 , reportAllowedFor
+, reportRetried
 , reportOrderOnlyTxids
 , reportOrderOnlySamples
 , reportDiffCount
@@ -113,6 +114,10 @@ data Outcome = Outcome
         -- pinned request that was sent
     , _outNoAnswer :: !(Maybe NoAnswer)
         -- ^ which side gave no HTTP answer, after all attempts
+    , _outRetried :: !Bool
+        -- ^ the oracle was read again after a difference between answers
+        -- without block metadata, and the verdict is that of the second
+        -- answer (ruling of M0c, stale tip); '_outOracle' is that answer
     }
 
 -- | A transport failure: no HTTP answer after all attempts. On the test side
@@ -197,6 +202,8 @@ data Report = Report
     , _repOrderOnly :: !(M.Map Int OrderOnlySample)
         -- ^ every 'OrderOnly' outcome
     , _repDiffCount :: !Int
+    , _repRetried :: !Int
+        -- ^ see 'reportRetried'
     , _repDiffs :: !(M.Map Int DiffSample)
         -- ^ the differences with the lowest request indices
     , _repPinned :: !Int
@@ -235,7 +242,7 @@ maxBodyBytes :: Int
 maxBodyBytes = 4_096
 
 emptyReport :: Report
-emptyReport = Report mempty mempty mempty mempty mempty mempty 0 mempty 0 0 0 mempty mempty [] 0 mempty [] mempty mempty []
+emptyReport = Report mempty mempty mempty mempty mempty mempty 0 0 mempty 0 0 0 mempty mempty [] 0 mempty [] mempty mempty []
 
 -- | Adds the outcome of a request. The result does not depend on the order
 -- in which outcomes are added.
@@ -268,7 +275,8 @@ addOutcome rep0 o = case v of
         }
   where
     rep = rep0
-        { _repNoAnswer = maybe id (\na -> M.insertWith (+) na 1) (_outNoAnswer o) (_repNoAnswer rep0)
+        { _repRetried = _repRetried rep0 + (if _outRetried o then 1 else 0)
+        , _repNoAnswer = maybe id (\na -> M.insertWith (+) na 1) (_outNoAnswer o) (_repNoAnswer rep0)
         , _repPactFailures = if pactFailure then M.insertWith (+) cls 1 (_repPactFailures rep0) else _repPactFailures rep0
         }
     txlog = txlogOfRequest req
@@ -368,6 +376,14 @@ reportOrderOnlyTxids = map snd . M.keys . M.fromList
 --
 reportOrderOnlySamples :: Report -> [OrderOnlySample]
 reportOrderOnlySamples = M.elems . _repOrderOnly
+
+-- | The requests whose oracle answer was read again: a difference between
+-- answers without block metadata may come from an oracle tip that moved since
+-- it was probed, so the oracle is asked once more with a fresh tip and the
+-- request is classified on that answer.
+--
+reportRetried :: Report -> Int
+reportRetried = _repRetried
 
 reportDiffCount :: Report -> Int
 reportDiffCount = _repDiffCount
@@ -724,6 +740,7 @@ reportSummary rep = T.unlines $
        ]
     <> [ "compared: " <> sh (reportCompared rep)
         <> ", differences: " <> sh (_repDiffCount rep)
+        <> ", oracle re-read after a difference: " <> sh (_repRetried rep)
         <> ", sent: " <> sh (reportSentTotal rep)
         <> ", pinned requests sent: " <> sh (_repPinned rep)
         <> ", pin unstable: " <> sh (_repPinUnstable rep)
@@ -798,6 +815,7 @@ instance ToJSON Report where
         , "settings" .= object [ K.fromText k .= v | (k, v) <- _repSettings rep ]
         , "compared" .= reportCompared rep
         , "differences" .= _repDiffCount rep
+        , "retried" .= _repRetried rep
         , "sent" .= reportSentTotal rep
         , "pinnedSent" .= _repPinned rep
         , "pinUnstable" .= _repPinUnstable rep
