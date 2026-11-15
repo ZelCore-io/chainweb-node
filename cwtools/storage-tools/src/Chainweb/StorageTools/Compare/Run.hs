@@ -611,14 +611,16 @@ compareOne env (i, r) = do
                 return $ Outcome i r (Skipped NoOracleAnswer) Nothing (either (const Nothing) Just eb) attempt ds
                     (Just (either (const NoAnswerBoth) (const NoAnswerOracle) eb)) False
 
--- | Whether one of the answers of a pinned request carries no block metadata:
--- the pin check cannot tell whether the oracle's depth, set from a tip that
--- may have moved since, reached the target block.
+-- | Whether both answers of a pinned request carry no block metadata: the pin
+-- check cannot tell whether the oracle's depth, set from a tip that may have
+-- moved since, reached the target block. If only one answer has metadata, the
+-- sides disagree on what they executed, and a second oracle answer cannot
+-- change that.
 --
 lacksMetadata :: Answer -> Answer -> Bool
-lacksMetadata a b = isNothing (_ansPin a) || isNothing (_ansPin b)
+lacksMetadata a b = isNothing (_ansPin a) && isNothing (_ansPin b)
 
--- | A difference between answers that lack block metadata may be a stale
+-- | A difference between answers that both lack block metadata may be a stale
 -- oracle tip: production's tip moves every few seconds, the cached tip is
 -- up to 'tipRefreshInterval' requests old, and at a block where the answer
 -- changes (a fork or an upgrade) the oracle then answers one block later
@@ -670,7 +672,7 @@ rereadOracle env cov i r a b (dO, dT) attempt first = case (_reqTarget r, apiPre
 -- the depth of its target below that side's tip; if the pins of the answers
 -- disagree, the tips are probed again and the request is sent again, at most
 -- 'maxPinRetries' times, after which it is 'Skipped' 'PinUnstable'. A
--- difference between answers without block metadata is not caught by the pins;
+-- difference between answers without block metadata (both) is not caught by the pins;
 -- the oracle is read once more for it ('rereadOracle'). A side's
 -- tip is the metadata height of 'tipProbe', the same for every class.
 --

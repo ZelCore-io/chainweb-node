@@ -863,6 +863,23 @@ runTests = testGroup "runCompare"
             rep <- runCompare quietLogger cov o t [localReqAt 500]
             reportCount rep ClsLocal KindSame @?= 1
             reportRetried rep @?= 0
+    , testCase "an answer with block metadata on one side only is not read again: Differ, retried 0, the oracle sent once" $ do
+        -- the oracle has metadata, the test side has none (m-2 of the review)
+        withStubs 1_000
+            oracleConf
+            testConf { _scLocalMeta = False, _scBlockInData = True } $ \o t so _ -> do
+            rep <- runCompare quietLogger cov o t [localReqAt 500]
+            reportDiffCount rep @?= 1
+            reportRetried rep @?= 0
+            deepLocals <$> seenPaths so >>= (@?= 1)
+        -- and the other way round
+        withStubs 1_000
+            oracleConf { _scLocalMeta = False, _scBlockInData = True }
+            testConf $ \o t so _ -> do
+            rep <- runCompare quietLogger cov o t [localReqAt 500]
+            reportDiffCount rep @?= 1
+            reportRetried rep @?= 0
+            deepLocals <$> seenPaths so >>= (@?= 1)
     , testCase "a request of a class without a tip is never read again" $
         withStubs 1_000 oracleConf testConf { _scPayloads = M.insert (toText payloadA) "other" (_scPayloads testConf) } $ \o t so _ -> do
             rep <- runCompare quietLogger cov o t [payloadReqFor payloadA]
