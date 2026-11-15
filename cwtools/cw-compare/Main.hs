@@ -28,10 +28,17 @@
 -- file exists, no request is made, to either side.
 --
 -- A target whose oracle lookups fail is dropped and counted as skipped at
--- generation; more than 1% of the targets dropped voids the run.
+-- generation; it counts toward the 1% budget of inconclusive outcomes over the
+-- requests sent.
 --
 -- A poll or SPV target without a transaction within 1000 blocks from the
--- sampled height is dropped at generation too, with that reason.
+-- sampled height is redrawn from its class until the class has its number of
+-- targets, with at most 10 times that many attempts. The skips are recorded
+-- per class in the report; they are not inconclusive, and a class that the
+-- attempts leave short is reported short, not void.
+--
+-- The soft limit of open files is raised to the hard limit at start, and both
+-- are logged.
 --
 -- Only a run of all 7 classes can pass: one of fewer classes (@--classes@),
 -- one with a class that never got a same 2xx answer (identical errors only),
@@ -47,6 +54,7 @@ module Main (main) where
 
 import Control.Monad
 import qualified Data.ByteString.Char8 as B8
+import qualified Data.Map.Strict as M
 import qualified Data.Text as T
 import qualified Data.Text.IO as T
 import Data.Word
@@ -71,6 +79,7 @@ import Chainweb.StorageTools.Compare.Rules (parseRequestFile)
 import Chainweb.StorageTools.Compare.Run
 import Chainweb.StorageTools.Compare.Sample
 import Chainweb.StorageTools.Compare.Types
+import Chainweb.StorageTools.FileLimit
 import Chainweb.Utils (toText)
 import Chainweb.Version
 import Chainweb.Version.Mainnet (mainnet)
@@ -290,6 +299,7 @@ main = do
         settings = case _optTest o of
             TestUrl _ -> []
             TestDb td -> localSettingsText (_tdLocal td)
+    raiseFileLimit >>= logFunctionText logger Info . describeFileLimits
     hl <- newHostLimiters (_optRate o) (_optPauseFile o)
     oracle <- Side "oracle" (_optOracle o) <$> limiterFor hl (_optOracle o)
     (reqs, classes, gen) <- case _optSource o of
@@ -310,7 +320,8 @@ main = do
                     }
                 targets = sampleTargets spec
             logFunctionText logger Info $ "generating " <> T.pack (show (length targets)) <> " requests"
-            (rs, skips) <- generateRequestsSkipping (GenOptions (_genSameSnapshot g)) api pset (_genSeed g) targets
+            (rs, skips, draws) <- generateRequestsRedrawing (GenOptions (_genSameSnapshot g)) api pset (_genSeed g)
+                (redrawTargets spec) targets
             forM_ skips $ \(GenSkip (cls, cid, h) k e) -> logFunctionText logger Warn $
                 "target skipped at generation (" <> requestClassText cls <> ", chain " <> toText cid
                 <> ", height " <> T.pack (show h) <> "): " <> k <> ": " <> e
@@ -323,7 +334,9 @@ main = do
             return
                 ( rs
                 , _genClasses g
-                , reportExpectEntries entries . reportGeneration (length targets) [ (c, k) | GenSkip (c, _, _) k _ <- skips ]
+                , reportExpectEntries entries
+                    . reportGenerationDraws [ (c, _drRequested d, _drAttempts d, _drShort d) | (c, d) <- M.toList draws ]
+                    . reportGeneration (length targets) [ (c, k) | GenSkip (c, _, _) k _ <- skips ]
                 )
     let compareWith test = runCompareClasses logger (_optRunOptions o) classCov oracle test reqs
     rep0 <- case _optTest o of

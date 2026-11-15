@@ -23,6 +23,7 @@ module Chainweb.StorageTools.Compare.Report
 , VerdictKind(..)
 , DiffSample(..)
 , AllowedSample(..)
+, OrderOnlySample(..)
 , emptyReport
 , addOutcome
 , reportCount
@@ -35,6 +36,10 @@ module Chainweb.StorageTools.Compare.Report
 , reportSame2xx
 , reportSameNon2xx
 , reportAllowedFor
+, reportRetried
+, reportRetriedSame
+, reportOrderOnlyTxids
+, reportOrderOnlySamples
 , reportDiffCount
 , reportDiffSamples
 , reportAllowedSamples
@@ -50,6 +55,9 @@ module Chainweb.StorageTools.Compare.Report
 , reportEntrySuccess
 , reportHollowEntries
 , reportGeneration
+, reportGenerationDraws
+, reportGenSkippedInconclusive
+, reportGenShort
 , reportGenTargets
 , reportGenSkipped
 , reportGenSkippedKind
@@ -110,6 +118,10 @@ data Outcome = Outcome
         -- pinned request that was sent
     , _outNoAnswer :: !(Maybe NoAnswer)
         -- ^ which side gave no HTTP answer, after all attempts
+    , _outRetried :: !Bool
+        -- ^ the oracle was read again after a difference between answers
+        -- without block metadata, and the verdict is that of the second
+        -- answer (ruling of M0c, stale tip); '_outOracle' is that answer
     }
 
 -- | A transport failure: no HTTP answer after all attempts. On the test side
@@ -137,7 +149,7 @@ effectiveVerdict = \case
 -- -------------------------------------------------------------------------- --
 -- Report
 
-data VerdictKind = KindSame | KindAllowed | KindDiffer | KindSkipped
+data VerdictKind = KindSame | KindAllowed | KindDiffer | KindSkipped | KindOrderOnly
     deriving (Show, Eq, Ord, Enum, Bounded)
 
 verdictKindText :: VerdictKind -> T.Text
@@ -146,6 +158,7 @@ verdictKindText = \case
     KindAllowed -> "allowed"
     KindDiffer -> "differ"
     KindSkipped -> "skipped"
+    KindOrderOnly -> "orderOnly"
 
 data DiffSample = DiffSample
     { _dsIndex :: !Int
@@ -160,6 +173,17 @@ data DiffSample = DiffSample
     , _dsTestBytes :: !Int
     , _dsAttempts :: !Int
     , _dsDepths :: !(Maybe (Word64, Word64))
+    }
+
+-- | An outcome 'OrderOnly': the @txlog@ it was about and its evidence.
+--
+data OrderOnlySample = OrderOnlySample
+    { _osIndex :: !Int
+    , _osRequest :: !Request
+    , _osTable :: !T.Text
+    , _osTxid :: !T.Text
+    , _osEvidence :: !T.Text
+    , _osDepths :: !(Maybe (Word64, Word64))
     }
 
 data AllowedSample = AllowedSample
@@ -179,7 +203,13 @@ data Report = Report
         -- ^ requests sent to the sides at least once
     , _repAllowed :: !(M.Map Int AllowedSample)
         -- ^ every allowed difference
+    , _repOrderOnly :: !(M.Map Int OrderOnlySample)
+        -- ^ every 'OrderOnly' outcome
     , _repDiffCount :: !Int
+    , _repRetried :: !Int
+        -- ^ see 'reportRetried'
+    , _repRetriedSame :: !Int
+        -- ^ see 'reportRetriedSame'
     , _repDiffs :: !(M.Map Int DiffSample)
         -- ^ the differences with the lowest request indices
     , _repPinned :: !Int
@@ -197,6 +227,9 @@ data Report = Report
         -- ^ see 'reportGeneration'
     , _repGenSkipped :: !(M.Map (RequestClass, T.Text) Int)
         -- ^ per class and kind, see 'reportGeneration'
+    , _repGenDraws :: !(M.Map RequestClass (Int, Int, Int))
+        -- ^ per class: the targets it was to have, the attempts and the
+        -- targets it is short, see 'reportGenerationDraws'
     , _repSettings :: ![(T.Text, T.Text)]
         -- ^ see 'reportSettings'
     , _repRealKey :: !(M.Map RequestClass Int)
@@ -218,7 +251,7 @@ maxBodyBytes :: Int
 maxBodyBytes = 4_096
 
 emptyReport :: Report
-emptyReport = Report mempty mempty mempty mempty mempty 0 mempty 0 0 0 mempty mempty [] 0 mempty [] mempty mempty []
+emptyReport = Report mempty mempty mempty mempty mempty mempty 0 0 0 mempty 0 0 0 mempty mempty [] 0 mempty mempty [] mempty mempty []
 
 -- | Adds the outcome of a request. The result does not depend on the order
 -- in which outcomes are added.
@@ -227,6 +260,13 @@ addOutcome :: Report -> Outcome -> Report
 addOutcome rep0 o = case v of
     Same -> (counted KindSame rep)
         { _repSameNon2xx = if is2xx then _repSameNon2xx rep else M.insertWith (+) cls 1 (_repSameNon2xx rep)
+        , _repEntrySuccess = case _reqEntry req of
+            Just e | pactSuccess -> M.insertWith (+) (cls, e) 1 (_repEntrySuccess rep)
+            _ -> _repEntrySuccess rep
+        }
+    OrderOnly ev -> (counted KindOrderOnly rep)
+        { _repOrderOnly = M.insert idx
+            (OrderOnlySample idx req (maybe "" fst txlog) (maybe "" snd txlog) ev (_outDepths o)) (_repOrderOnly rep)
         , _repEntrySuccess = case _reqEntry req of
             Just e | pactSuccess -> M.insertWith (+) (cls, e) 1 (_repEntrySuccess rep)
             _ -> _repEntrySuccess rep
@@ -244,9 +284,16 @@ addOutcome rep0 o = case v of
         }
   where
     rep = rep0
-        { _repNoAnswer = maybe id (\na -> M.insertWith (+) na 1) (_outNoAnswer o) (_repNoAnswer rep0)
+        { _repRetried = _repRetried rep0 + (if _outRetried o then 1 else 0)
+        , _repRetriedSame = _repRetriedSame rep0 + (if _outRetried o && absorbed then 1 else 0)
+        , _repNoAnswer = maybe id (\na -> M.insertWith (+) na 1) (_outNoAnswer o) (_repNoAnswer rep0)
         , _repPactFailures = if pactFailure then M.insertWith (+) cls 1 (_repPactFailures rep0) else _repPactFailures rep0
         }
+    absorbed = case v of
+        Same -> True
+        OrderOnly _ -> True
+        _ -> False
+    txlog = txlogOfRequest req
     pactFailure = pactStatusIs "failure"
     pactSuccess = pactStatusIs "success"
     pactStatusIs st = isPinnedClass cls && case _outOracle o of
@@ -332,6 +379,34 @@ reportSameNon2xx rep c = M.findWithDefault 0 c (_repSameNon2xx rep)
 reportAllowedFor :: Report -> AllowRule -> Int
 reportAllowedFor rep r = length [ () | a <- M.elems (_repAllowed rep), _asRule a == r ]
 
+-- | The txids of the @txlog@ requests with an 'OrderOnly' outcome, each once,
+-- in ascending order.
+--
+reportOrderOnlyTxids :: Report -> [T.Text]
+reportOrderOnlyTxids = map snd . M.keys . M.fromList
+    . map (\a -> ((T.length (_osTxid a), _osTxid a), ())) . M.elems . _repOrderOnly
+
+-- | Every 'OrderOnly' outcome, by request index.
+--
+reportOrderOnlySamples :: Report -> [OrderOnlySample]
+reportOrderOnlySamples = M.elems . _repOrderOnly
+
+-- | The requests whose oracle answer was read again: a difference between
+-- answers without block metadata may come from an oracle tip that moved since
+-- it was probed, so the oracle is asked once more with a fresh tip and the
+-- request is classified on that answer.
+--
+reportRetried :: Report -> Int
+reportRetried = _repRetried
+
+-- | The re-reads that ended 'Same' or 'OrderOnly': the second answer of the
+-- oracle agreed with the first answer of the test side, so the difference was
+-- absorbed. A large share of 'reportRetried' is a finding: production's tip
+-- handling or the harness's depth is wrong (review of CWC-FIX, m-1 and m-3).
+--
+reportRetriedSame :: Report -> Int
+reportRetriedSame = _repRetriedSame
+
 reportDiffCount :: Report -> Int
 reportDiffCount = _repDiffCount
 
@@ -362,7 +437,9 @@ reportNoAnswer rep na = M.findWithDefault 0 na (_repNoAnswer rep)
 -- | The inconclusive outcomes of a run, which share one budget of 1% of the
 -- requests sent (ruling (b) on the Task 5 re-review): 'PinUnstable',
 -- 'Unpinned' after sending, 'NoOracleAnswer', and the targets skipped at
--- generation ('reportGeneration').
+-- generation for a reason other than 'genSkipNoTx' ('reportGeneration'). A
+-- target without a transaction in its window is redrawn and is no part of the
+-- budget (ruling of M0c).
 --
 reportInconclusive :: Report -> Int
 reportInconclusive rep = sum (map snd (inconclusiveKinds rep))
@@ -374,15 +451,16 @@ inconclusiveKinds rep =
     [ ("pin unstable", _repPinUnstable rep)
     , ("unpinned after sending", _repUnpinnedSent rep)
     , ("no oracle answer", reportSkippedFor rep NoOracleAnswer)
-    , ("skipped at generation", reportGenSkippedTotal rep)
+    , ("skipped at generation", reportGenSkippedInconclusive rep)
     ]
 
--- | The number of requests whose answers were judged: same, allowed or
--- different.
+-- | The number of requests whose answers were judged: same, order only,
+-- allowed or different.
 --
 reportCompared :: Report -> Int
 reportCompared rep = sum
     [ reportClassTotal rep KindSame
+    , reportClassTotal rep KindOrderOnly
     , reportClassTotal rep KindAllowed
     , reportClassTotal rep KindDiffer
     ]
@@ -390,7 +468,7 @@ reportCompared rep = sum
 -- | The number of requests of a class whose answers were judged.
 --
 reportComparedIn :: Report -> RequestClass -> Int
-reportComparedIn rep c = sum [ reportCount rep c k | k <- [KindSame, KindAllowed, KindDiffer] ]
+reportComparedIn rep c = sum [ reportCount rep c k | k <- [KindSame, KindOrderOnly, KindAllowed, KindDiffer] ]
 
 -- | Requests of a class within the coverage: all but 'NotCovered'.
 --
@@ -440,13 +518,38 @@ entryText (c, e) = requestClassText c <> ":" <> e
 -- generated run, the class and kind of those dropped at generation, for
 -- instance because an oracle lookup failed (ruling on Task 6a) or because a
 -- poll or SPV target has no transaction within 1000 blocks (ruling C3 on Task
--- 6). More than 1% of the targets dropped makes the run 'Void'.
+-- 6). A target without a transaction is redrawn ('reportGenerationDraws') and
+-- is no part of the budget; the other kinds are, and make the run 'Void' above
+-- 1% of the requests sent.
 --
 reportGeneration :: Int -> [(RequestClass, T.Text)] -> Report -> Report
 reportGeneration n skipped rep = rep
     { _repGenTargets = n
     , _repGenSkipped = M.fromListWith (+) [ (s, 1) | s <- skipped ]
     }
+
+-- | @reportGenerationDraws [(class, requested, attempts, short)]@: what the
+-- draws of each class came to when targets without a transaction in their
+-- window were redrawn (see "Chainweb.StorageTools.Compare.Requests"): the
+-- targets the class was to have, the targets drawn in all, and the targets it
+-- is short because the attempts ran out. A short count is reported, and it
+-- does not void a run.
+--
+reportGenerationDraws :: [(RequestClass, Int, Int, Int)] -> Report -> Report
+reportGenerationDraws ds rep = rep
+    { _repGenDraws = M.fromList [ (c, (n, a, sh)) | (c, n, a, sh) <- ds ] }
+
+-- | The targets dropped at generation that count toward the budget of
+-- inconclusive outcomes: every kind but 'genSkipNoTx'.
+--
+reportGenSkippedInconclusive :: Report -> Int
+reportGenSkippedInconclusive rep = reportGenSkippedTotal rep - reportGenSkippedKind rep genSkipNoTx
+
+-- | The targets of a class that its draws are short of, see
+-- 'reportGenerationDraws'.
+--
+reportGenShort :: Report -> RequestClass -> Int
+reportGenShort rep c = maybe 0 (\(_, _, sh) -> sh) (M.lookup c (_repGenDraws rep))
 
 -- | The targets sampled for a generated run, see 'reportGeneration'.
 --
@@ -551,7 +654,7 @@ reportMissingClasses rep = filter (not . covers) allRequestClasses
 --   real key was compared ('reportRealKeyCompared', ruling C3 on Task 6);
 -- * the inconclusive outcomes ('reportInconclusive': 'PinUnstable',
 --   'Unpinned' after sending, 'NoOracleAnswer', and the targets dropped at
---   generation) are together more than 1% of the requests sent. One budget
+--   generation, but not those without a transaction in their window) are together more than 1% of the requests sent. One budget
 --   for all of them, as spec 10.1 states the 1% as one fraction (ruling (b)
 --   on the Task 5 re-review); the report keeps the count of each kind.
 --
@@ -596,11 +699,22 @@ inconclusiveText rep = T.intercalate ", " [ k <> " " <> T.pack (show n) | (k, n)
     <> if reportGenSkippedTotal rep > 0 then " (" <> genSkipKinds rep <> ")" else ""
 
 -- | The skips at generation per kind, for example @no tx within 1000 blocks:
--- 3, an oracle lookup failed: 1@.
+-- 3, an oracle lookup failed: 1@. The first is no part of the budget.
 --
 genSkipKinds :: Report -> T.Text
 genSkipKinds rep = T.intercalate ", "
     [ k <> ": " <> T.pack (show n) | (k, n) <- M.toList (M.mapKeysWith (+) snd (_repGenSkipped rep)) ]
+
+-- | The draws of each class that needed redraws or fell short, for the
+-- summary.
+--
+genDrawsText :: Report -> [T.Text]
+genDrawsText rep =
+    [ requestClassText c <> " " <> T.pack (show a) <> " attempts for " <> T.pack (show n) <> " targets"
+        <> (if sh > 0 then ", short by " <> T.pack (show sh) else "")
+    | (c, (n, a, sh)) <- M.toList (_repGenDraws rep)
+    , a > n || sh > 0
+    ]
 
 -- | The exit code of @cw-compare@ for a gate verdict: 0 'Pass', 2 'Fail',
 -- 3 'Void', 4 'PartialPass'. Exit code 1 is left to bad arguments and crashes, so that a
@@ -681,11 +795,16 @@ reportSummary rep = T.unlines $
         <> T.concat [ ", " <> requestClassText c <> " " <> sh n | (c, n) <- M.toList (M.mapKeysWith (+) fst (_repGenSkipped rep)) ]
        | _repGenTargets rep > 0
        ]
+    <> [ "redrawn (targets without a tx in the window; not inconclusive): " <> T.intercalate "; " ds
+       | let ds = genDrawsText rep, not (null ds)
+       ]
     <> [ "settings: " <> T.intercalate ", " [ k <> "=" <> v | (k, v) <- _repSettings rep ]
        | not (null (_repSettings rep))
        ]
     <> [ "compared: " <> sh (reportCompared rep)
         <> ", differences: " <> sh (_repDiffCount rep)
+        <> ", oracle re-read after a difference: " <> sh (_repRetried rep)
+        <> ", of which Same or order-only: " <> sh (_repRetriedSame rep)
         <> ", sent: " <> sh (reportSentTotal rep)
         <> ", pinned requests sent: " <> sh (_repPinned rep)
         <> ", pin unstable: " <> sh (_repPinUnstable rep)
@@ -695,7 +814,10 @@ reportSummary rep = T.unlines $
     , "no HTTP answer (" <> T.intercalate ", " (map noAnswerText [minBound .. maxBound]) <> "): "
         <> T.intercalate " / " [ sh (reportNoAnswer rep na) | na <- [minBound .. maxBound] ]
     , ""
-    , "per class: same 2xx / same non-2xx / allowed / differ / skipped (" <> T.intercalate ", " (map skipReasonText [minBound .. maxBound]) <> ") / sent"
+    , "order-only (txlog rows in another order, a pass): " <> sh (reportClassTotal rep KindOrderOnly)
+        <> (if null (reportOrderOnlyTxids rep) then "" else ", txids " <> T.intercalate ", " (reportOrderOnlyTxids rep))
+    , ""
+    , "per class: same 2xx / same non-2xx / allowed / differ / skipped (" <> T.intercalate ", " (map skipReasonText [minBound .. maxBound]) <> ") / sent / order-only"
     ]
     <> [ "  " <> requestClassText c <> ": " <> T.intercalate " / "
             [ sh (reportSame2xx rep c)
@@ -705,6 +827,7 @@ reportSummary rep = T.unlines $
             , sh (reportCount rep c KindSkipped)
                 <> " (" <> T.intercalate ", " [ sh (reportSkippedIn rep c r) | r <- [minBound .. maxBound] ] <> ")"
             , sh (reportSent rep c)
+            , sh (reportCount rep c KindOrderOnly)
             ]
        | c <- allRequestClasses
        , any (\k -> reportCount rep c k > 0) [minBound .. maxBound]
@@ -752,10 +875,21 @@ instance ToJSON Report where
             , "skipped" .= reportGenSkippedTotal rep
             , "skippedPerKind" .= object
                 [ K.fromText k .= n | (k, n) <- M.toList (M.mapKeysWith (+) snd (_repGenSkipped rep)) ]
+            , "perClass" .= object
+                [ K.fromText (requestClassText c) .= object
+                    [ "requested" .= n
+                    , "attempts" .= a
+                    , "short" .= sh
+                    , "skipped" .= reportGenSkipped rep c
+                    ]
+                | (c, (n, a, sh)) <- M.toList (_repGenDraws rep)
+                ]
             ]
         , "settings" .= object [ K.fromText k .= v | (k, v) <- _repSettings rep ]
         , "compared" .= reportCompared rep
         , "differences" .= _repDiffCount rep
+        , "retried" .= _repRetried rep
+        , "retriedSame" .= _repRetriedSame rep
         , "sent" .= reportSentTotal rep
         , "pinnedSent" .= _repPinned rep
         , "pinUnstable" .= _repPinUnstable rep
@@ -766,7 +900,7 @@ instance ToJSON Report where
             , "pinUnstable" .= _repPinUnstable rep
             , "unpinnedSent" .= _repUnpinnedSent rep
             , "noOracleAnswer" .= reportSkippedFor rep NoOracleAnswer
-            , "generationSkipped" .= reportGenSkippedTotal rep
+            , "generationSkipped" .= reportGenSkippedInconclusive rep
             ]
         , "noAnswer" .= object
             [ K.fromText (noAnswerText na) .= reportNoAnswer rep na | na <- [minBound .. maxBound] ]
@@ -784,6 +918,21 @@ instance ToJSON Report where
                    ]
                 )
             | c <- allRequestClasses
+            ]
+        , "orderOnly" .= object
+            [ "total" .= reportClassTotal rep KindOrderOnly
+            , "txids" .= reportOrderOnlyTxids rep
+            , "samples" .=
+                [ object
+                    [ "index" .= _osIndex a
+                    , "request" .= _osRequest a
+                    , "table" .= _osTable a
+                    , "txid" .= _osTxid a
+                    , "evidence" .= _osEvidence a
+                    , "depths" .= depthsJson (_osDepths a)
+                    ]
+                | a <- reportOrderOnlySamples rep
+                ]
             ]
         , "allowedPerRule" .= object
             [ K.fromText (allowRuleText r) .= reportAllowedFor rep r | r <- [minBound .. maxBound] ]

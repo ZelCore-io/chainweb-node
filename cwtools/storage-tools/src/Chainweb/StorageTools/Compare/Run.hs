@@ -54,7 +54,7 @@ import qualified Data.ByteString as B
 import qualified Data.ByteString.Lazy as BL
 import Data.IORef
 import qualified Data.Map.Strict as M
-import Data.Maybe (isJust)
+import Data.Maybe (isJust, isNothing)
 import qualified Data.Text as T
 import Data.Int (Int64)
 import qualified Data.Text.Encoding as T
@@ -583,7 +583,7 @@ compareOne :: Env -> (Int, Request) -> IO Outcome
 compareOne env (i, r) = do
     atomicModifyIORef' (_envStarted env) (\n -> (n + 1, ()))
     case preJudge (_envCoverage env (_reqClass r)) r of
-        Just v -> return (Outcome i r v Nothing Nothing 0 Nothing Nothing)
+        Just v -> return (Outcome i r v Nothing Nothing 0 Nothing Nothing False)
         Nothing -> go 1
   where
     go :: Int -> IO Outcome
@@ -592,10 +592,12 @@ compareOne env (i, r) = do
             then sendPinned env r (attempt > 1)
             else sendPlain env r
         case sent of
-            Decided v na -> return (Outcome i r v Nothing Nothing attempt Nothing na)
+            Decided v na -> return (Outcome i r v Nothing Nothing attempt Nothing na False)
             Answers ds (Right a) (Right b) ->
-                let done v = return (Outcome i r v (Just a) (Just b) attempt ds Nothing)
-                in case judge (_envCoverage env (_reqClass r)) r a b of
+                let done v = return (Outcome i r v (Just a) (Just b) attempt ds Nothing False)
+                    cov = _envCoverage env (_reqClass r)
+                in case judge cov r a b of
+                    Final v@(Differ _) | Just depths <- ds, lacksMetadata a b -> rereadOracle env cov i r a b depths attempt v
                     Final v -> done v
                     RetryPinMismatch
                         | attempt <= maxPinRetries -> go (attempt + 1)
@@ -603,11 +605,64 @@ compareOne env (i, r) = do
                     CheckOrphan ph -> checkOrphan env r ph >>= done
                     CompareSpvSubjects -> done (compareSpvProofs a b)
             Answers ds (Right a) (Left e) ->
-                return (Outcome i r (Differ e) (Just a) Nothing attempt ds (Just NoAnswerTest))
+                return (Outcome i r (Differ e) (Just a) Nothing attempt ds (Just NoAnswerTest) False)
             Answers ds (Left e) eb -> do
                 _envLog env Warn $ "request #" <> sshow i <> ": " <> e
                 return $ Outcome i r (Skipped NoOracleAnswer) Nothing (either (const Nothing) Just eb) attempt ds
-                    (Just (either (const NoAnswerBoth) (const NoAnswerOracle) eb))
+                    (Just (either (const NoAnswerBoth) (const NoAnswerOracle) eb)) False
+
+-- | Whether both answers of a pinned request carry no block metadata: the pin
+-- check cannot tell whether the oracle's depth, set from a tip that may have
+-- moved since, reached the target block. If only one answer has metadata, the
+-- sides disagree on what they executed, and a second oracle answer cannot
+-- change that.
+--
+lacksMetadata :: Answer -> Answer -> Bool
+lacksMetadata a b = isNothing (_ansPin a) && isNothing (_ansPin b)
+
+-- | A difference between answers that both lack block metadata may be a stale
+-- oracle tip: production's tip moves every few seconds, the cached tip is
+-- up to 'tipRefreshInterval' requests old, and at a block where the answer
+-- changes (a fork or an upgrade) the oracle then answers one block later
+-- without any sign of it (ruling of M0c, from #8690 and #7599 of the W3 run).
+--
+-- The oracle is asked once more, at the depth of the target below a tip
+-- probed again, with the cached tip dropped first, and the request is
+-- classified on that answer and the first answer of the test side. Only the
+-- oracle is read again; the test side is not. If the tip cannot be probed
+-- again or the second answer does not come, the first difference stands.
+--
+rereadOracle
+    :: Env
+    -> Coverage
+    -> Int
+    -> Request
+    -> Answer
+    -> Answer
+    -> (Word64, Word64)
+    -> Int
+    -> Verdict
+    -> IO Outcome
+rereadOracle env cov i r a b (dO, dT) attempt first = case (_reqTarget r, apiPrefixOfPath (_reqPath r)) of
+    (Just target, Just prefix) -> do
+        atomicModifyIORef' (_envTips env) (\m -> (M.delete (OracleRole, cid) m, ()))
+        tipOf env OracleRole prefix cid True >>= \case
+            Right tip | Just dO' <- depthFor tip target ->
+                sendTo env OracleRole r (fillDepth dO' r) >>= \case
+                    Right a' -> do
+                        let v = case judge cov r a' b of
+                                Final v' -> v'
+                                _ -> Differ "after the oracle was read again, its answer and the answer of the test side are not at the same block"
+                        return (Outcome i r v (Just a') (Just b) (attempt + 1) (Just (dO', dT)) Nothing True)
+                    Left e -> keep ("the oracle did not answer when it was read again: " <> e)
+            Right _ -> keep "the target is above the oracle's tip, probed again"
+            Left f -> keep ("the oracle's tip could not be probed again: " <> probeText f)
+    _ -> keep "no target height or API prefix"
+  where
+    cid = _reqChain r
+    keep why = do
+        _envLog env Warn $ "request #" <> sshow i <> ": " <> why
+        return (Outcome i r first (Just a) (Just b) attempt (Just (dO, dT)) Nothing False)
 
 -- | Compares the answers of the oracle and the test side to the requests, with
 -- 'compareWorkers' requests in flight.
@@ -616,7 +671,9 @@ compareOne env (i, r) = do
 -- sent to either side (ruling 1.14). A pinned request is sent to each side at
 -- the depth of its target below that side's tip; if the pins of the answers
 -- disagree, the tips are probed again and the request is sent again, at most
--- 'maxPinRetries' times, after which it is 'Skipped' 'PinUnstable'. A side's
+-- 'maxPinRetries' times, after which it is 'Skipped' 'PinUnstable'. A
+-- difference between answers without block metadata (both) is not caught by the pins;
+-- the oracle is read once more for it ('rereadOracle'). A side's
 -- tip is the metadata height of 'tipProbe', the same for every class.
 --
 -- A request the test side alone gives no HTTP answer to is a difference that

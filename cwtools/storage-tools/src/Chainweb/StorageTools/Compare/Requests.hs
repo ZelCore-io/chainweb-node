@@ -43,6 +43,11 @@ module Chainweb.StorageTools.Compare.Requests
 , skipNoTx
 , skipLookupFailed
 , generateRequestsSkipping
+, Target
+, DrawStats(..)
+, maxDrawFactor
+, generateRedrawing
+, generateRequestsRedrawing
 , generateWorkers
 , RequestGenError(..)
 , oracleServiceApi
@@ -642,7 +647,7 @@ data GenSkip = GenSkip
 -- within 'txScanMax' blocks.
 --
 skipNoTx :: T.Text
-skipNoTx = "no tx within 1000 blocks"
+skipNoTx = genSkipNoTx
 
 -- | The kind of a 'GenSkip' whose oracle lookups failed.
 --
@@ -674,6 +679,79 @@ generateRequestsSkipping opts api pset seed targets = do
         Left (e :: HTTP.HttpException) -> return (Left (GenSkip target skipLookupFailed (tshow e)))
     chunks [] = []
     chunks xs = let (a, b) = splitAt generateWorkers xs in a : chunks b
+
+-- | A target of a generated run.
+type Target = (RequestClass, ChainId, BlockHeight)
+
+-- | The attempts of a class are at most this many times its number of targets,
+-- the first draws included (ruling of M0c).
+--
+maxDrawFactor :: Int
+maxDrawFactor = 10
+
+-- | What the draws of a class came to: the targets it was to have, the
+-- targets drawn in all (the first draws and the redraws) and the targets it is
+-- short, that is, those that no redraw replaced because the attempts or the
+-- draws ran out.
+--
+data DrawStats = DrawStats
+    { _drRequested :: !Int
+    , _drAttempts :: !Int
+    , _drShort :: !Int
+    }
+    deriving (Show, Eq)
+
+-- | Generates the requests of the targets and redraws every target without a
+-- transaction in its window ('skipNoTx'), from the class's own draws, until
+-- the class has the number of targets it was to have, or it has used
+-- 'maxDrawFactor' times that many attempts. A skip of any other kind (an
+-- oracle lookup failed) is not redrawn: it stays in the skips, and counts
+-- against the budget of the run.
+--
+-- Returns the requests, every skip of every attempt, and the stats per class.
+--
+generateRedrawing
+    :: ([Target] -> IO ([Request], [GenSkip]))
+    -> (RequestClass -> [Target])
+    -> [Target]
+    -> IO ([Request], [GenSkip], M.Map RequestClass DrawStats)
+generateRedrawing gen redraws targets = do
+    (rs0, sk0) <- gen targets
+    let requested = M.fromListWith (+) [ (c, 1 :: Int) | (c, _, _) <- targets ]
+        need0 = M.fromListWith (+) [ (c, 1 :: Int) | GenSkip (c, _, _) k _ <- sk0, k == skipNoTx ]
+        attempts0 = requested
+        pools0 = M.mapWithKey (\c _ -> redraws c) requested
+    (rs, sk, need, attempts) <- loop rs0 sk0 need0 attempts0 pools0 requested
+    return (rs, sk, M.mapWithKey (\c n -> DrawStats n (M.findWithDefault n c attempts) (M.findWithDefault 0 c need)) requested)
+  where
+    loop rs sk need attempts pools requested = do
+        let room c = maxDrawFactor * M.findWithDefault 0 c requested - M.findWithDefault 0 c attempts
+            batches = M.mapMaybeWithKey (\c n ->
+                let k = min n (room c)
+                    (b, _) = splitAt k (M.findWithDefault [] c pools)
+                in if k > 0 && not (null b) then Just b else Nothing) need
+        if M.null batches
+            then return (rs, sk, need, attempts)
+            else do
+                (rs', sk') <- gen (concat (M.elems batches))
+                let used = M.map length batches
+                    again = M.fromListWith (+) [ (c, 1 :: Int) | GenSkip (c, _, _) k _ <- sk', k == skipNoTx ]
+                    need' = M.mapWithKey (\c n -> if M.member c batches then M.findWithDefault 0 c again + (n - M.findWithDefault 0 c used) else n) need
+                    pools' = M.mapWithKey (\c p -> drop (M.findWithDefault 0 c used) p) pools
+                    attempts' = M.unionWith (+) attempts used
+                loop (rs <> rs') (sk <> sk') (M.filter (> 0) need') attempts' pools' requested
+
+-- | 'generateRedrawing' over 'generateRequestsSkipping'.
+--
+generateRequestsRedrawing
+    :: GenOptions
+    -> ServiceApi
+    -> PactSet
+    -> Word64
+    -> (RequestClass -> [Target])
+    -> [Target]
+    -> IO ([Request], [GenSkip], M.Map RequestClass DrawStats)
+generateRequestsRedrawing opts api pset seed = generateRedrawing (generateRequestsSkipping opts api pset seed)
 
 -- | 'requestsForWith' for every target, in the order of the targets. The
 -- first 'RequestGenError' (or HTTP failure after all attempts) is rethrown.

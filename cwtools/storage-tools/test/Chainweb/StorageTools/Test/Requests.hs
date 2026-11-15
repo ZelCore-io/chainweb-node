@@ -94,6 +94,11 @@ tests = testGroup "Requests"
     , testCase "report: poll and spv count compared requests with a real key; a run of them with none is Void" realKeys
     , testCase "a run whose classes are not all 7 is at best PartialPass (exit 4)" partialPass
     , testCase "generation skips are reported per kind" skipKinds
+    , testCase "a target without a tx in its window is redrawn until the class count is met" redrawReachesCount
+    , testCase "redrawing stops at 10 times the class count in attempts, a short count is reported" redrawCapped
+    , testCase "an oracle lookup that failed is not redrawn" redrawLeavesLookupFailures
+    , testCase "redrawTargets: the class's own draws, deterministic in the seed" redrawTargetsOfSpec
+    , testCase "no-tx skips are recorded per class and never inconclusive; a short count does not void the run" genSkipsAreNotInconclusive
     , testCase "spv: a target chain outside the coverage at the target height + 3 is NotCovered" spvTargetCoverage
     , testCase "--allow-reads-in-local takes a required true|false" allowReadsOption
     , testCase "--oracle-local-timeout takes 1 to 3600 seconds and reaches the run options" oracleLocalTimeoutOption
@@ -490,6 +495,7 @@ outcomeWith i c s b = Outcome
     , _outAttempts = 1
     , _outDepths = Just (700, 690)
     , _outNoAnswer = Nothing
+    , _outRetried = False
     }
 
 pactFailures :: Assertion
@@ -653,7 +659,101 @@ skipKinds = do
     reportGenSkipped rep ClsPoll @?= 3
     assertBool ("summary per kind: " <> T.unpack summary) $
         "no tx within 1000 blocks: 3" `T.isInfixOf` summary && "an oracle lookup failed: 1" `T.isInfixOf` summary
-    assertBool "void reason per kind" (any ("no tx within 1000 blocks: 3" `T.isInfixOf`) (reportVoidReasons rep))
+    -- a target without a tx is redrawn and never inconclusive (ruling of M0c):
+    -- only the failed lookup is over the budget, and the reason names the kinds
+    assertBool "void reason per kind" (any ("an oracle lookup failed: 1" `T.isInfixOf`) (reportVoidReasons rep))
+    reportInconclusive rep @?= 1
+
+-- -------------------------------------------------------------------------- --
+-- Redrawing skipped targets
+
+fakeReq :: BlockHeight -> Request
+fakeReq h = Request ClsPoll cid0 (Just h) methodGet "/x" Nothing Nothing
+
+-- | A generator that skips every target whose height is a multiple of 5 (20%
+-- of the heights it is given), and one that skips by class.
+--
+skipEvery5 :: [Target] -> IO ([Request], [GenSkip])
+skipEvery5 ts = return
+    ( [ fakeReq h | (_, _, h) <- ts, h `mod` 5 /= 0 ]
+    , [ GenSkip t skipNoTx "no tx" | t@(_, _, h) <- ts, h `mod` 5 == 0 ]
+    )
+
+redrawReachesCount :: Assertion
+redrawReachesCount = do
+    let initial = [ (ClsPoll, cid0, h) | h <- [0 .. 99] ]
+        redraws c = [ (c, cid0, h) | h <- [1_000 ..] ]
+    (rs, skips, stats) <- generateRedrawing skipEvery5 redraws initial
+    -- 20 of the first 100 skip; the 20 redraws (1000 to 1019) skip 4, those 4
+    -- (1020 to 1023) skip 1, and that one (1024) does not
+    length rs @?= 100
+    M.toList stats @?= [(ClsPoll, DrawStats 100 125 0)]
+    length skips @?= 25
+    assertBool "every skip is of the no-tx kind" $ all ((== skipNoTx) . _gsKind) skips
+
+redrawCapped :: Assertion
+redrawCapped = do
+    let initial = [ (ClsSpv, cid0, h) | h <- [1 .. 10] ] <> [ (ClsHeader, cid0, h) | h <- [1 .. 5] ]
+        redraws c = [ (c, cid0, h) | h <- [1_000 ..] ]
+        gen' ts = return
+            ( [ fakeReq h | (c, _, h) <- ts, c /= ClsSpv ]
+            , [ GenSkip t skipNoTx "no tx" | t@(c, _, _) <- ts, c == ClsSpv ]
+            )
+    (rs, skips, stats) <- generateRedrawing gen' redraws initial
+    -- 10 targets at most 10 times: 100 attempts, the first 10 included
+    M.lookup ClsSpv stats @?= Just (DrawStats 10 100 10)
+    M.lookup ClsHeader stats @?= Just (DrawStats 5 5 0)
+    length rs @?= 5
+    length skips @?= 100
+    -- the redraws of a class that has none leave it short too
+    (_, _, none) <- generateRedrawing gen' (const []) initial
+    M.lookup ClsSpv none @?= Just (DrawStats 10 10 10)
+
+redrawLeavesLookupFailures :: Assertion
+redrawLeavesLookupFailures = do
+    let initial = [ (ClsLocal, cid0, h) | h <- [1 .. 4] ]
+        gen' ts = return ([], [ GenSkip t skipLookupFailed "down" | t <- ts ])
+    (rs, skips, stats) <- generateRedrawing gen' (\c -> [ (c, cid0, h) | h <- [1_000 ..] ]) initial
+    rs @?= []
+    length skips @?= 4
+    M.toList stats @?= [(ClsLocal, DrawStats 4 4 0)]
+
+redrawTargetsOfSpec :: Assertion
+redrawTargetsOfSpec = do
+    let spec = SampleSpec
+            { _ssSeed = 1, _ssCount = 50, _ssClasses = [ClsPoll, ClsSpv]
+            , _ssCoverage = Coverage (M.fromList [(cid0, [(0, 100_000)])])
+            , _ssBoundaries = [], _ssBoundaryShare = 0.2, _ssHistoryMax = Nothing, _ssPactChains = Nothing }
+        poll = take 200 (redrawTargets spec ClsPoll)
+    length poll @?= 200
+    assertBool "of the class, inside the coverage" $ all (\(c, ch, h) -> c == ClsPoll && ch == cid0 && h <= 100_000) poll
+    poll @?= take 200 (redrawTargets spec ClsPoll)
+    assertBool "another seed" $ poll /= take 200 (redrawTargets spec { _ssSeed = 2 } ClsPoll)
+    assertBool "another class" $ map (\(_, ch, h) -> (ch, h)) poll /= map (\(_, ch, h) -> (ch, h)) (take 200 (redrawTargets spec ClsSpv))
+    assertBool "not the first draws" $ poll /= take 200 (sampleTargets spec { _ssClasses = [ClsPoll], _ssCount = 200 })
+    redrawTargets spec ClsHeader @?= []
+
+genSkipsAreNotInconclusive :: Assertion
+genSkipsAreNotInconclusive = do
+    let base = foldl addOutcome emptyReport [ outcomeWith i ClsLocal 200 "{}" | i <- [0 .. 99] ]
+        noTx = replicate 180 (ClsPoll, skipNoTx)
+        rep = reportGenerationDraws [(ClsPoll, 20, 200, 4)] (reportGeneration 120 noTx base)
+        json = toJSON rep
+    reportInconclusive rep @?= 0
+    reportVoidReasons rep @?= []
+    reportVerdict rep @?= PartialPass
+    reportGenSkipped rep ClsPoll @?= 180
+    field ["generation", "perClass", "poll", "requested"] json @?= Just (Number 20)
+    field ["generation", "perClass", "poll", "attempts"] json @?= Just (Number 200)
+    field ["generation", "perClass", "poll", "short"] json @?= Just (Number 4)
+    field ["generation", "perClass", "poll", "skipped"] json @?= Just (Number 180)
+    field ["inconclusive", "total"] json @?= Just (Number 0)
+    field ["inconclusive", "generationSkipped"] json @?= Just (Number 0)
+    assertBool "summary" $ "short" `T.isInfixOf` reportSummary rep
+    -- a lookup that failed is still inconclusive: 3 of 100 sent is above 1%
+    let failed = reportGeneration 120 (replicate 3 (ClsLocal, skipLookupFailed)) base
+    reportInconclusive failed @?= 3
+    reportVerdict failed @?= Void
 
 spvTargetCoverage :: Assertion
 spvTargetCoverage = do

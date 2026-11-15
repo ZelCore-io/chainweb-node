@@ -22,6 +22,7 @@ module Chainweb.StorageTools.Compare.Sample
 , boundaryDistance
 , historyMaxHeight
 , sampleTargets
+, redrawTargets
 , genesisCoverage
 ) where
 
@@ -149,19 +150,25 @@ drawFrom ws g =
     let (i, g') = uniformR (0, sum (map windowSize ws) - 1) g
     in (pick i ws, g')
 
+-- | The windows to draw from per class: the regular ones and those near a
+-- boundary. Classes without covered heights are left out.
+--
+classPools :: SampleSpec -> [(RequestClass, [Window], [Window])]
+classPools spec =
+    [ (cls, regular, nearBoundaries (_ssBoundaries spec) regular)
+    | cls <- _ssClasses spec
+    , let covered = windows (classCoverage (_ssPactChains spec) (_ssCoverage spec) cls)
+    , let regular = classWindows spec cls covered
+    , not (null regular)
+    ]
+
 -- | '_ssCount' targets, the same for the same spec. Classes without covered
 -- heights are left out; without any class the result is empty.
 --
 sampleTargets :: SampleSpec -> [(RequestClass, ChainId, BlockHeight)]
 sampleTargets spec = go (mkStdGen (fromIntegral (_ssSeed spec))) (_ssCount spec)
   where
-    pools =
-        [ (cls, regular, nearBoundaries (_ssBoundaries spec) regular)
-        | cls <- _ssClasses spec
-        , let covered = windows (classCoverage (_ssPactChains spec) (_ssCoverage spec) cls)
-        , let regular = classWindows spec cls covered
-        , not (null regular)
-        ]
+    pools = classPools spec
     nPools = length pools
 
     go g k
@@ -173,6 +180,25 @@ sampleTargets spec = go (mkStdGen (fromIntegral (_ssSeed spec))) (_ssCount spec)
                 ws = if u < _ssBoundaryShare spec && not (null near) then near else regular
                 ((c, h), g3) = drawFrom ws g2
             in (cls, c, h) : go g3 (k - 1)
+
+-- | The redraws of a class, for a target that its generation had to drop (a
+-- poll or SPV target without a transaction in its window): an infinite list
+-- of targets of that class, drawn like those of 'sampleTargets' (the same
+-- windows and boundary share) but from a generator of their own, so that they
+-- are the same for the same spec and do not repeat the first draws. Empty if
+-- the class has no covered heights.
+--
+redrawTargets :: SampleSpec -> RequestClass -> [(RequestClass, ChainId, BlockHeight)]
+redrawTargets spec cls = case [ (regular, near) | (c, regular, near) <- classPools spec, c == cls ] of
+    [] -> []
+    (regular, near) : _ ->
+        go regular near (mkStdGen (fromIntegral (_ssSeed spec) * 7_919 + 104_729 + fromEnum cls))
+  where
+    go regular near g =
+        let (u, g1) = uniformR (0, 1 :: Double) g
+            ws = if u < _ssBoundaryShare spec && not (null near) then near else regular
+            ((c, h), g2) = drawFrom ws g1
+        in (cls, c, h) : go regular near g2
 
 -- | The coverage of the given chains over an inclusive height range, each
 -- chain from the greater of the range's low end and its genesis height (on
