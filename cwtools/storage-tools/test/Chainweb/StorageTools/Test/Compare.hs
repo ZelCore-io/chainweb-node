@@ -117,6 +117,44 @@ historyReqAt h = (localReqAt h)
     , _reqBody = Just "{\"code\":\"(txids coin.coin-table 0)\"}"
     }
 
+-- | A History request for @(txlog coin.coin-table TXID)@ in the shape the
+-- generator builds: a command whose @cmd@ is a JSON string with the Pact code.
+--
+txlogReqAt :: BlockHeight -> T.Text -> Request
+txlogReqAt h txid = (localReqAt h)
+    { _reqClass = ClsHistory
+    , _reqBody = Just (cmdBody ("(txlog coin.coin-table " <> txid <> ")"))
+    }
+
+cmdBody :: T.Text -> B.ByteString
+cmdBody code = BL.toStrict $ encode $ object
+    [ "cmd" .= T.decodeUtf8 (BL.toStrict (encode (object
+        [ "payload" .= object [ "exec" .= object [ "code" .= code, "data" .= object [] ] ] ])))
+    , "hash" .= ("h" :: T.Text)
+    ]
+
+-- | Rows of a @txlog@ answer, each as the bytes a node wrote.
+--
+rowA, rowB, rowC :: B.ByteString
+rowA = "{\"key\":\"KEzk\",\"table\":\"coin_coin-table\",\"txid\":7,\"value\":{\"balance\":1.5,\"guard\":{\"pred\":\"keys-all\"}}}"
+rowB = "{\"key\":\"k:4f95\",\"table\":\"coin_coin-table\",\"txid\":7,\"value\":{\"balance\":2.0}}"
+rowC = "{\"key\":\"k:77aa\",\"table\":\"coin_coin-table\",\"txid\":7,\"value\":{\"balance\":3.25}}"
+
+-- | A pinned answer at the target of 'txlogReqAt' 100 with these rows.
+--
+txlogAnswer :: [B.ByteString] -> Answer
+txlogAnswer rows = found (localBody 100 'A' ("[" <> B.intercalate "," rows <> "]"))
+
+isOrderOnly :: Judgement -> Bool
+isOrderOnly = \case
+    Final (OrderOnly _) -> True
+    _ -> False
+
+preflightReq, pollReq, spvReqAt :: Request
+preflightReq = (localReqAt 100) { _reqClass = ClsPreflight }
+pollReq = (payloadReqFor payloadA) { _reqClass = ClsPoll }
+spvReqAt = (payloadReqFor payloadA) { _reqClass = ClsSpv }
+
 localReq, keysReq :: Request
 localReq = localReqAt 100
 keysReq = keysReqAt 100
@@ -193,6 +231,57 @@ rulesTests = testGroup "rules"
         judge cov localReq (Answer 400 "e" Nothing) (Answer 400 "e" Nothing) @?= Final Same
         assertBool "body" $ isDiffer (judge cov localReq (Answer 400 "e" Nothing) (Answer 400 "f" Nothing))
         assertBool "status" $ isDiffer (judge cov localReq (Answer 400 "e" Nothing) (Answer 500 "e" Nothing))
+    , testCase "txlog rows in another order: OrderOnly, naming the table, the txid and the rows" $ do
+        let j = judge cov (txlogReqAt 100 "7") (txlogAnswer [rowA, rowB, rowC]) (txlogAnswer [rowC, rowA, rowB])
+        assertBool ("OrderOnly: " <> show j) (isOrderOnly j)
+        case j of
+            Final (OrderOnly ev) -> assertBool ("evidence: " <> T.unpack ev) $
+                all (`T.isInfixOf` ev) ["coin.coin-table", "7", "3 rows"]
+            _ -> return ()
+    , testCase "txlog rows in the same order: Same" $
+        judge cov (txlogReqAt 100 "7") (txlogAnswer [rowA, rowB]) (txlogAnswer [rowA, rowB]) @?= Final Same
+    , testCase "txlog: one byte of one row changed, in another order or not: Differ" $ do
+        let changed = B.take 20 rowB <> "X" <> B.drop 21 rowB
+        assertBool "same order" $ isDiffer
+            (judge cov (txlogReqAt 100 "7") (txlogAnswer [rowA, rowB]) (txlogAnswer [rowA, changed]))
+        assertBool "other order" $ isDiffer
+            (judge cov (txlogReqAt 100 "7") (txlogAnswer [rowA, rowB]) (txlogAnswer [changed, rowA]))
+    , testCase "txlog: an extra row or a missing row: Differ" $ do
+        assertBool "extra row" $ isDiffer
+            (judge cov (txlogReqAt 100 "7") (txlogAnswer [rowA, rowB]) (txlogAnswer [rowB, rowC, rowA]))
+        assertBool "missing row" $ isDiffer
+            (judge cov (txlogReqAt 100 "7") (txlogAnswer [rowA, rowB, rowC]) (txlogAnswer [rowB, rowA]))
+        assertBool "a duplicate in place of another row" $ isDiffer
+            (judge cov (txlogReqAt 100 "7") (txlogAnswer [rowA, rowA, rowB]) (txlogAnswer [rowA, rowB, rowB]))
+    , testCase "txlog: only rows in a row differ by bytes (key order inside a row): Differ" $ do
+        let reordered = "{\"table\":\"coin_coin-table\",\"key\":\"k:4f95\",\"txid\":7,\"value\":{\"balance\":2.0}}"
+        assertBool "key order inside a row" $ isDiffer
+            (judge cov (txlogReqAt 100 "7") (txlogAnswer [rowA, rowB]) (txlogAnswer [reordered, rowA]))
+    , testCase "txlog: the rest of the answer must be byte-equal" $ do
+        let other = found (localBody 100 'A' ("[" <> B.intercalate "," [rowB, rowA] <> "]") <> " ")
+        assertBool "trailing byte" $ isDiffer
+            (judge cov (txlogReqAt 100 "7") (txlogAnswer [rowA, rowB]) other)
+        let st = Answer 500 (_ansBody (txlogAnswer [rowB, rowA])) (_ansPin (txlogAnswer [rowB, rowA]))
+        assertBool "status" $ isDiffer
+            (judge cov (txlogReqAt 100 "7") (txlogAnswer [rowA, rowB]) st)
+    , testCase "txlog: a failure answer or no rows array is compared as bytes" $ do
+        let failure b = found (localBody 100 'A' "null" <> b)
+        assertBool "equal failures stay Same" $ judge cov (txlogReqAt 100 "7") (failure "") (failure "") == Final Same
+        assertBool "different failures" $ isDiffer
+            (judge cov (txlogReqAt 100 "7") (failure "") (failure "x"))
+    , testCase "order is not forgiven for other history functions, keys or plain local" $ do
+        let dat xs = found (localBody 100 'A' ("[" <> B.intercalate "," xs <> "]"))
+        assertBool "txids" $ isDiffer
+            (judge cov (historyReqAt 100) (dat ["1", "2"]) (dat ["2", "1"]))
+        assertBool "keys" $ isDiffer
+            (judge cov keysReq (dat ["\"a\"", "\"b\""]) (dat ["\"b\"", "\"a\""]))
+        assertBool "local" $ isDiffer
+            (judge cov localReq (dat [rowA, rowB]) (dat [rowB, rowA]))
+    , testCase "txlogOfRequest reads the table and the txid from the Pact code" $ do
+        txlogOfRequest (txlogReqAt 100 "2610493") @?= Just ("coin.coin-table", "2610493")
+        txlogOfRequest (historyReqAt 100) @?= Nothing
+        txlogOfRequest (txlogReqAt 100 "7") { _reqClass = ClsLocal } @?= Nothing
+        txlogOfRequest (txlogReqAt 100 "7") { _reqBody = Just (cmdBody "(txlog coin.coin-table x)") } @?= Nothing
     , testCase "orphanVerdict: failed lookups and references on one side are differences" $ do
         let o = HeaderRef (hashText 'U') (toText payloadC)
             t = HeaderRef (hashText 'W') (toText payloadC)
@@ -357,6 +446,35 @@ reportTests = testGroup "report"
         reportVerdict (run 2) @?= PartialPass
         reportVerdict (run 3) @?= Void
         reportPinned (run 3) @?= 200
+    , testCase "OrderOnly passes: its own count per class, its txids in the report, exit 0; any Differ still fails" $ do
+        let sameRun = [ out i r Same (Just (ok "p")) (Just (ok "p")) 1
+                      | (i, r) <- zip [0 ..] (concat (replicate 3 [payloadReq, headerReq, localReq, historyReqAt 100])) ]
+            orderOnly i txid = out i (txlogReqAt 100 txid) (OrderOnly ("txlog coin.coin-table " <> txid <> ": 2 rows in another order"))
+                (Just (txlogAnswer [rowA, rowB])) (Just (txlogAnswer [rowB, rowA])) 1
+            ooRep = foldl addOutcome emptyReport (sameRun <> [ orderOnly 100 "7", orderOnly 101 "7", orderOnly 102 "9" ])
+            json = BL.toStrict (encode ooRep)
+        reportCount ooRep ClsHistory KindOrderOnly @?= 3
+        reportCount ooRep ClsHistory KindDiffer @?= 0
+        reportCount ooRep ClsHistory KindSame @?= 3
+        reportDiffCount ooRep @?= 0
+        reportCompared ooRep @?= length sameRun + 3
+        reportOrderOnlyTxids ooRep @?= ["7", "9"]
+        reportVerdict ooRep @?= PartialPass  -- poll, spv and preflight are not in this run
+        gateExitCode (reportVerdict ooRep) @?= ExitFailure 4
+        assertBool "json per class" $ "\"orderOnly\":3" `B.isInfixOf` json
+        assertBool "json txids" $ "\"txids\":[\"7\",\"9\"]" `B.isInfixOf` json
+        assertBool "summary" $ "order-only (txlog rows in another order, a pass): 3, txids 7, 9" `T.isInfixOf` reportSummary ooRep
+        -- the verdict of a run with every class is Pass with OrderOnly outcomes, Fail with a Differ
+        let allClasses = [ out i r Same (Just (ok "p")) (Just (ok "p")) 1
+                         | (i, r) <- zip [0 ..] [payloadReq, headerReq, localReq, historyReqAt 100, preflightReq] ]
+                         <> [ out 10 pollReq Same (Just (ok "{\"k\":{}}")) (Just (ok "{\"k\":{}}")) 1
+                            , out 11 spvReqAt Same (Just (ok "p")) (Just (ok "p")) 1 ]
+            passRep = foldl addOutcome emptyReport (allClasses <> [ orderOnly 100 "7", orderOnly 101 "9" ])
+        reportVerdict passRep @?= Pass
+        gateExitCode (reportVerdict passRep) @?= ExitSuccess
+        let failRep = addOutcome passRep (out 102 (txlogReqAt 100 "7") (Differ "d") Nothing Nothing 1)
+        reportVerdict failRep @?= Fail
+        gateExitCode (reportVerdict failRep) @?= ExitFailure 2
     , testCase "a run that compared nothing is void" $
         reportVerdict (addOutcome emptyReport (out 0 uncoveredReq (Skipped NotCovered) Nothing Nothing 0)) @?= Void
     , testCase "every History request ends Unpinned and every payload request is Same: Void, not Pass" $ do

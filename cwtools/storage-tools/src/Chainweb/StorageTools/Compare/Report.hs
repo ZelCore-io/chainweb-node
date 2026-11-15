@@ -23,6 +23,7 @@ module Chainweb.StorageTools.Compare.Report
 , VerdictKind(..)
 , DiffSample(..)
 , AllowedSample(..)
+, OrderOnlySample(..)
 , emptyReport
 , addOutcome
 , reportCount
@@ -35,6 +36,8 @@ module Chainweb.StorageTools.Compare.Report
 , reportSame2xx
 , reportSameNon2xx
 , reportAllowedFor
+, reportOrderOnlyTxids
+, reportOrderOnlySamples
 , reportDiffCount
 , reportDiffSamples
 , reportAllowedSamples
@@ -137,7 +140,7 @@ effectiveVerdict = \case
 -- -------------------------------------------------------------------------- --
 -- Report
 
-data VerdictKind = KindSame | KindAllowed | KindDiffer | KindSkipped
+data VerdictKind = KindSame | KindAllowed | KindDiffer | KindSkipped | KindOrderOnly
     deriving (Show, Eq, Ord, Enum, Bounded)
 
 verdictKindText :: VerdictKind -> T.Text
@@ -146,6 +149,7 @@ verdictKindText = \case
     KindAllowed -> "allowed"
     KindDiffer -> "differ"
     KindSkipped -> "skipped"
+    KindOrderOnly -> "orderOnly"
 
 data DiffSample = DiffSample
     { _dsIndex :: !Int
@@ -160,6 +164,17 @@ data DiffSample = DiffSample
     , _dsTestBytes :: !Int
     , _dsAttempts :: !Int
     , _dsDepths :: !(Maybe (Word64, Word64))
+    }
+
+-- | An outcome 'OrderOnly': the @txlog@ it was about and its evidence.
+--
+data OrderOnlySample = OrderOnlySample
+    { _osIndex :: !Int
+    , _osRequest :: !Request
+    , _osTable :: !T.Text
+    , _osTxid :: !T.Text
+    , _osEvidence :: !T.Text
+    , _osDepths :: !(Maybe (Word64, Word64))
     }
 
 data AllowedSample = AllowedSample
@@ -179,6 +194,8 @@ data Report = Report
         -- ^ requests sent to the sides at least once
     , _repAllowed :: !(M.Map Int AllowedSample)
         -- ^ every allowed difference
+    , _repOrderOnly :: !(M.Map Int OrderOnlySample)
+        -- ^ every 'OrderOnly' outcome
     , _repDiffCount :: !Int
     , _repDiffs :: !(M.Map Int DiffSample)
         -- ^ the differences with the lowest request indices
@@ -218,7 +235,7 @@ maxBodyBytes :: Int
 maxBodyBytes = 4_096
 
 emptyReport :: Report
-emptyReport = Report mempty mempty mempty mempty mempty 0 mempty 0 0 0 mempty mempty [] 0 mempty [] mempty mempty []
+emptyReport = Report mempty mempty mempty mempty mempty mempty 0 mempty 0 0 0 mempty mempty [] 0 mempty [] mempty mempty []
 
 -- | Adds the outcome of a request. The result does not depend on the order
 -- in which outcomes are added.
@@ -227,6 +244,13 @@ addOutcome :: Report -> Outcome -> Report
 addOutcome rep0 o = case v of
     Same -> (counted KindSame rep)
         { _repSameNon2xx = if is2xx then _repSameNon2xx rep else M.insertWith (+) cls 1 (_repSameNon2xx rep)
+        , _repEntrySuccess = case _reqEntry req of
+            Just e | pactSuccess -> M.insertWith (+) (cls, e) 1 (_repEntrySuccess rep)
+            _ -> _repEntrySuccess rep
+        }
+    OrderOnly ev -> (counted KindOrderOnly rep)
+        { _repOrderOnly = M.insert idx
+            (OrderOnlySample idx req (maybe "" fst txlog) (maybe "" snd txlog) ev (_outDepths o)) (_repOrderOnly rep)
         , _repEntrySuccess = case _reqEntry req of
             Just e | pactSuccess -> M.insertWith (+) (cls, e) 1 (_repEntrySuccess rep)
             _ -> _repEntrySuccess rep
@@ -247,6 +271,7 @@ addOutcome rep0 o = case v of
         { _repNoAnswer = maybe id (\na -> M.insertWith (+) na 1) (_outNoAnswer o) (_repNoAnswer rep0)
         , _repPactFailures = if pactFailure then M.insertWith (+) cls 1 (_repPactFailures rep0) else _repPactFailures rep0
         }
+    txlog = txlogOfRequest req
     pactFailure = pactStatusIs "failure"
     pactSuccess = pactStatusIs "success"
     pactStatusIs st = isPinnedClass cls && case _outOracle o of
@@ -332,6 +357,18 @@ reportSameNon2xx rep c = M.findWithDefault 0 c (_repSameNon2xx rep)
 reportAllowedFor :: Report -> AllowRule -> Int
 reportAllowedFor rep r = length [ () | a <- M.elems (_repAllowed rep), _asRule a == r ]
 
+-- | The txids of the @txlog@ requests with an 'OrderOnly' outcome, each once,
+-- in ascending order.
+--
+reportOrderOnlyTxids :: Report -> [T.Text]
+reportOrderOnlyTxids = map snd . M.keys . M.fromList
+    . map (\a -> ((T.length (_osTxid a), _osTxid a), ())) . M.elems . _repOrderOnly
+
+-- | Every 'OrderOnly' outcome, by request index.
+--
+reportOrderOnlySamples :: Report -> [OrderOnlySample]
+reportOrderOnlySamples = M.elems . _repOrderOnly
+
 reportDiffCount :: Report -> Int
 reportDiffCount = _repDiffCount
 
@@ -377,12 +414,13 @@ inconclusiveKinds rep =
     , ("skipped at generation", reportGenSkippedTotal rep)
     ]
 
--- | The number of requests whose answers were judged: same, allowed or
--- different.
+-- | The number of requests whose answers were judged: same, order only,
+-- allowed or different.
 --
 reportCompared :: Report -> Int
 reportCompared rep = sum
     [ reportClassTotal rep KindSame
+    , reportClassTotal rep KindOrderOnly
     , reportClassTotal rep KindAllowed
     , reportClassTotal rep KindDiffer
     ]
@@ -390,7 +428,7 @@ reportCompared rep = sum
 -- | The number of requests of a class whose answers were judged.
 --
 reportComparedIn :: Report -> RequestClass -> Int
-reportComparedIn rep c = sum [ reportCount rep c k | k <- [KindSame, KindAllowed, KindDiffer] ]
+reportComparedIn rep c = sum [ reportCount rep c k | k <- [KindSame, KindOrderOnly, KindAllowed, KindDiffer] ]
 
 -- | Requests of a class within the coverage: all but 'NotCovered'.
 --
@@ -695,7 +733,10 @@ reportSummary rep = T.unlines $
     , "no HTTP answer (" <> T.intercalate ", " (map noAnswerText [minBound .. maxBound]) <> "): "
         <> T.intercalate " / " [ sh (reportNoAnswer rep na) | na <- [minBound .. maxBound] ]
     , ""
-    , "per class: same 2xx / same non-2xx / allowed / differ / skipped (" <> T.intercalate ", " (map skipReasonText [minBound .. maxBound]) <> ") / sent"
+    , "order-only (txlog rows in another order, a pass): " <> sh (reportClassTotal rep KindOrderOnly)
+        <> (if null (reportOrderOnlyTxids rep) then "" else ", txids " <> T.intercalate ", " (reportOrderOnlyTxids rep))
+    , ""
+    , "per class: same 2xx / same non-2xx / allowed / differ / skipped (" <> T.intercalate ", " (map skipReasonText [minBound .. maxBound]) <> ") / sent / order-only"
     ]
     <> [ "  " <> requestClassText c <> ": " <> T.intercalate " / "
             [ sh (reportSame2xx rep c)
@@ -705,6 +746,7 @@ reportSummary rep = T.unlines $
             , sh (reportCount rep c KindSkipped)
                 <> " (" <> T.intercalate ", " [ sh (reportSkippedIn rep c r) | r <- [minBound .. maxBound] ] <> ")"
             , sh (reportSent rep c)
+            , sh (reportCount rep c KindOrderOnly)
             ]
        | c <- allRequestClasses
        , any (\k -> reportCount rep c k > 0) [minBound .. maxBound]
@@ -784,6 +826,21 @@ instance ToJSON Report where
                    ]
                 )
             | c <- allRequestClasses
+            ]
+        , "orderOnly" .= object
+            [ "total" .= reportClassTotal rep KindOrderOnly
+            , "txids" .= reportOrderOnlyTxids rep
+            , "samples" .=
+                [ object
+                    [ "index" .= _osIndex a
+                    , "request" .= _osRequest a
+                    , "table" .= _osTable a
+                    , "txid" .= _osTxid a
+                    , "evidence" .= _osEvidence a
+                    , "depths" .= depthsJson (_osDepths a)
+                    ]
+                | a <- reportOrderOnlySamples rep
+                ]
             ]
         , "allowedPerRule" .= object
             [ K.fromText (allowRuleText r) .= reportAllowedFor rep r | r <- [minBound .. maxBound] ]
