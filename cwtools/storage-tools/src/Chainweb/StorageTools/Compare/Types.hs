@@ -27,12 +27,14 @@ module Chainweb.StorageTools.Compare.Types
 , historyGasLimit
 , hasDepthPlaceholder
 , fillDepth
+, txlogOfRequest
 
   -- * Answers
 , Pin(..)
 , Answer(..)
 
   -- * Verdicts
+, genSkipNoTx
 , AllowRule(..)
 , allowRuleText
 , SkipReason(..)
@@ -51,6 +53,7 @@ module Chainweb.StorageTools.Compare.Types
 
 
 import Data.Aeson
+import qualified Data.Aeson.KeyMap as KM
 import qualified Data.ByteString as B
 import qualified Data.Map.Strict as M
 import qualified Data.Text as T
@@ -221,6 +224,31 @@ instance FromJSON Request where
                 Nothing -> return Nothing
                 Just t -> either (fail . show) (return . Just) (decodeB64UrlNoPaddingText t)
 
+-- | The table and the txid of a History request for @(txlog TABLE TXID)@, from
+-- the Pact code of its command (@cmd@, then @payload.exec.code@); 'Nothing'
+-- for any other request.
+--
+txlogOfRequest :: Request -> Maybe (T.Text, T.Text)
+txlogOfRequest r = do
+    guardM (_reqClass r == ClsHistory)
+    body <- _reqBody r
+    Object o <- decodeStrict' body
+    String cmd <- KM.lookup "cmd" o
+    Object c <- decodeStrict' (T.encodeUtf8 cmd)
+    Object pl <- KM.lookup "payload" c
+    Object ex <- KM.lookup "exec" pl
+    String code <- KM.lookup "code" ex
+    case T.words code of
+        [open, table, txid]
+            | open == "(txlog"
+            , Just txid' <- T.stripSuffix ")" txid
+            , not (T.null txid')
+            , T.all (\ch -> ch >= '0' && ch <= '9') txid'
+            , not (T.null table) -> Just (table, txid')
+        _ -> Nothing
+  where
+    guardM b = if b then Just () else Nothing
+
 -- -------------------------------------------------------------------------- --
 -- Answers
 
@@ -246,6 +274,14 @@ data Answer = Answer
 
 -- -------------------------------------------------------------------------- --
 -- Verdicts
+
+-- | The kind of a target dropped at generation because a poll or SPV target
+-- has no transaction within 1000 blocks of the sampled height. Such a target
+-- is redrawn, and it is never inconclusive: it is a property of the chain, not
+-- of the oracle.
+--
+genSkipNoTx :: T.Text
+genSkipNoTx = "no tx within 1000 blocks"
 
 -- | The allowlist of spec 10.1: the only differences that are allowed, each
 -- with evidence. Tip skew and requests that are not covered are never
@@ -292,6 +328,12 @@ skipReasonText = \case
 
 data Verdict
     = Same
+    | OrderOnly !T.Text
+        -- ^ the answers of a @txlog@ hold the same rows, byte for byte, as a
+        -- multiset, in another order (ruling of M0c: @txlog@ has no ORDER BY,
+        -- and two stock nodes return a block's rows in different orders). Its
+        -- own class of outcome, never 'Same' and never 'Differ'; a run with
+        -- only such outcomes passes. The text says which rows.
     | Allowed !AllowRule !T.Text
         -- ^ a difference the allowlist allows, with evidence. An 'Allowed'
         -- verdict without evidence counts as 'Differ'.
