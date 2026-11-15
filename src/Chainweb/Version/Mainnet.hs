@@ -233,11 +233,21 @@ mainnet = ChainwebVersion
         (ForkAtBlockHeight $ BlockHeight 4_577_530, Set.fromList [VerifierName "hyperlane_v3_message"]) `Above`
         Bottom (minBound, mempty)
     , _versionQuirks = VersionQuirks
+        -- Gas of these transactions as recorded on chain. They follow the coin v6
+        -- upgrade at Chainweb223Pact (4,577,530). Up to Chainweb224Pact
+        -- (4,819,246) the Pact 4 init module cache depends on whether the process
+        -- applied the upgrade block itself or loaded the cache from the database
+        -- after it, so a node that replays across the upgrade in one process
+        -- computes a different gas for some module deploys (for example 67,776
+        -- instead of 67,777) and rejects the block. The first 14 entries came
+        -- from kda-community/chainweb-node PR #33; (3, 4594061) and
+        -- (19, 4594065) were found by replaying every chain across the upgrade.
         { _quirkGasFees = onChains
             [ (unsafeChainId 0, HM.fromList [((BlockHeight 4585419, TxBlockIdx 0), Gas 67_618)
                                             ,((BlockHeight 4585422, TxBlockIdx 0), Gas 67_754)])
             , (unsafeChainId 2, HM.fromList [((BlockHeight 4594041, TxBlockIdx 0), Gas 69_092)])
-            , (unsafeChainId 3, HM.fromList [((BlockHeight 4594046, TxBlockIdx 0), Gas 69_092)])
+            , (unsafeChainId 3, HM.fromList [((BlockHeight 4594046, TxBlockIdx 0), Gas 69_092)
+                                            ,((BlockHeight 4594061, TxBlockIdx 0), Gas 67_777)])
             , (unsafeChainId 4, HM.fromList [((BlockHeight 4594048, TxBlockIdx 0), Gas 69_092)])
             , (unsafeChainId 5, HM.fromList [((BlockHeight 4594048, TxBlockIdx 0), Gas 69_092)])
             , (unsafeChainId 6, HM.fromList [((BlockHeight 4594048, TxBlockIdx 0), Gas 69_092)])
@@ -247,7 +257,8 @@ mainnet = ChainwebVersion
                                             ,((BlockHeight 4594066, TxBlockIdx 0), Gas 67_777)])
             , (unsafeChainId 10,HM.fromList [((BlockHeight 4594048, TxBlockIdx 0), Gas 69_092)])
             , (unsafeChainId 15,HM.fromList [((BlockHeight 4594049, TxBlockIdx 0), Gas 69_092)])
-            , (unsafeChainId 19,HM.fromList [((BlockHeight 4594050, TxBlockIdx 0), Gas 69_092)])
+            , (unsafeChainId 19,HM.fromList [((BlockHeight 4594050, TxBlockIdx 0), Gas 69_092)
+                                            ,((BlockHeight 4594065, TxBlockIdx 0), Gas 67_777)])
             ]
         }
     , _versionForkNumber = 1
