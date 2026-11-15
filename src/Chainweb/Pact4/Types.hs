@@ -12,6 +12,7 @@ module Chainweb.Pact4.Types
   ( getInitCache
   , updateInitCache
   , updateInitCacheM
+  , replaceInitCacheM
 
   , GasSupply(..)
 
@@ -216,6 +217,15 @@ updateInitCacheM mc = do
   pc <- view psParentHeader
   liftPactServiceM $
     updateInitCache mc pc
+
+-- | Like 'updateInitCacheM', but the given cache replaces the one in effect
+-- instead of being merged with it. The key is the same adjusted parent block
+-- height that 'updateInitCache' uses.
+replaceInitCacheM :: ModuleCache -> PactBlockM logger tbl ()
+replaceInitCacheM mc = do
+  ph <- views psParentHeader (view blockHeight . _parentHeader)
+  let pbh = if ph == 0 then 0 else succ ph
+  liftPactServiceM $ psInitCache %= M.insert pbh mc
 
 -- | Run 'PactBlockM' by providing the block context, in the form of
 -- a database snapshot at that block and information about the parent header.
