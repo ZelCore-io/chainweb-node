@@ -28,6 +28,7 @@ module Chainweb.Storage.Table.RocksDB.Tuning
   , RocksDbTuning(..)
   , defaultTuning
   , payloadZstdTuning
+  , payloadBlockCacheBytes
   , coldStoreTuning
   , applyTuning
 
@@ -165,7 +166,8 @@ defaultTuning = RocksDbTuning
     }
 
 -- | zstd level 3 with a 64 KB dictionary trained on 6.4 MB of samples (100x
--- the dictionary), 32 KB blocks (spec 4.2).
+-- the dictionary), 32 KB blocks (spec 4.2), and a block cache of
+-- 'payloadBlockCacheBytes'.
 --
 payloadZstdTuning :: RocksDbTuning
 payloadZstdTuning = defaultTuning
@@ -175,7 +177,20 @@ payloadZstdTuning = defaultTuning
         , _zstdMaxTrainBytes = 6553600
         }
     , _tuningBlockSize = Just 32768
+    , _tuningBlockCacheBytes = Just payloadBlockCacheBytes
     }
+
+-- | The block cache of 'payloadZstdTuning': 256 MiB.
+--
+-- The cache holds uncompressed blocks, so a warm read of a cached block skips
+-- the zstd decompression that otherwise makes zstd reads slower than Snappy
+-- reads. Without it the database uses RocksDB's default cache (32 MB in 8.x),
+-- which 32 KB zstd blocks fill after about a thousand blocks. 256 MiB is a
+-- quarter of the cold store's 1 GB ('coldStoreTuning'): the node opens one
+-- database for all chains, and its other memory use stays the same.
+--
+payloadBlockCacheBytes :: Int
+payloadBlockCacheBytes = 268435456
 
 -- | 'payloadZstdTuning' plus a bloom filter with 10 bits per key and a 1 GB
 -- block cache (spec 4.3, 8.2).
