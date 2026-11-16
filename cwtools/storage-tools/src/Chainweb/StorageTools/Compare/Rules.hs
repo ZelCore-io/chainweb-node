@@ -302,6 +302,12 @@ judge cov r a b = case preJudge cov r of
 -- If only one answer has block metadata, the answers differ: one side
 -- executed the code and the other did not.
 --
+-- An oracle answer whose block metadata is off the target height while the
+-- test side has none is not judged: the oracle's tip moved between its probe
+-- and the request, and it answered at another block (concern 1 of GA-FAST-1).
+-- It is the pin retry: the tips are probed again and the request is sent
+-- again, at most @maxPinRetries@ times, then 'Skipped' 'PinUnstable'.
+--
 judgePinned :: Request -> Answer -> Answer -> Judgement
 judgePinned r a b = case (_ansPin a, _ansPin b) of
     (Just pa, Just pb)
@@ -309,6 +315,8 @@ judgePinned r a b = case (_ansPin a, _ansPin b) of
         | Just (_pinHeight pa) /= _reqTarget r -> RetryPinMismatch
         | otherwise -> Final (compareFor r a b)
     (Nothing, Nothing) -> Final (compareFor r a b)
+    (Just pa, Nothing)
+        | Just (_pinHeight pa) /= _reqTarget r -> RetryPinMismatch
     (Just pa, Nothing) -> Final $ Differ $
         "only the oracle answered with block metadata (height " <> sshow (_pinHeight pa) <> "); " <> bytesDetail a b
     (Nothing, Just pb) -> Final $ Differ $
