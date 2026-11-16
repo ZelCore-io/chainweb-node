@@ -276,7 +276,9 @@ tuningValuesTest = do
             , _zstdMaxTrainBytes = 6553600
             }
         , _tuningBlockSize = Just 32768
+        , _tuningBlockCacheBytes = Just 268435456
         }
+    assertBool "payloadBlockCacheBytes is 256 MiB" $ payloadBlockCacheBytes == 256 * 1024 * 1024
     assertBool "coldStoreTuning" $ coldStoreTuning == payloadZstdTuning
         { _tuningBloomBitsPerKey = Just 10
         , _tuningBlockCacheBytes = Just 1073741824
@@ -471,7 +473,7 @@ blockSizeReachesSstTest = withTestDir "tuning-blocksize" $ \dir -> do
 --
 blockCacheReachesDbTest :: IO ()
 blockCacheReachesDbTest =
-    forM_ [coldStoreTuning, defaultTuning { _tuningBlockCacheBytes = Just 8388608 }] $ \tuning ->
+    forM_ [payloadZstdTuning, coldStoreTuning, defaultTuning { _tuningBlockCacheBytes = Just 8388608 }] $ \tuning ->
     withTempRocksDbTuned "tuning-cache" tuning $ \db -> do
         capacity <- rocksDbProperty db "rocksdb.block-cache-capacity"
         assertBool ("block cache capacity " <> show capacity <> " for " <> show tuning) $
