@@ -540,10 +540,11 @@ reportGenerationDraws ds rep = rep
     { _repGenDraws = M.fromList [ (c, (n, a, sh)) | (c, n, a, sh) <- ds ] }
 
 -- | The targets dropped at generation that count toward the budget of
--- inconclusive outcomes: every kind but 'genSkipNoTx'.
+-- inconclusive outcomes: every kind but those redrawn ('genSkipRedrawn':
+-- 'genSkipNoTx' and 'genSkipGenesisPreflight').
 --
 reportGenSkippedInconclusive :: Report -> Int
-reportGenSkippedInconclusive rep = reportGenSkippedTotal rep - reportGenSkippedKind rep genSkipNoTx
+reportGenSkippedInconclusive rep = reportGenSkippedTotal rep - sum (map (reportGenSkippedKind rep) genSkipRedrawn)
 
 -- | The targets of a class that its draws are short of, see
 -- 'reportGenerationDraws'.

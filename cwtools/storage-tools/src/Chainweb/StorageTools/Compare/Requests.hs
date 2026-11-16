@@ -41,7 +41,10 @@ module Chainweb.StorageTools.Compare.Requests
 , generateRequests
 , GenSkip(..)
 , skipNoTx
+, skipGenesisPreflight
 , skipLookupFailed
+, isGenesisPreflight
+, skipGenesisPreflights
 , generateRequestsSkipping
 , generateRequestsSkippingP
 , GenProgress
@@ -87,6 +90,7 @@ import Data.Either (isLeft)
 import Data.Int (Int64)
 import Data.IORef
 import Data.List (nubBy, sort, sortOn)
+import qualified Data.List as L
 import qualified Data.Map.Strict as M
 import Data.Maybe (fromMaybe, mapMaybe, maybeToList)
 import qualified Data.Text as T
@@ -652,7 +656,7 @@ generateWorkers = 8
 data GenSkip = GenSkip
     { _gsTarget :: !(RequestClass, ChainId, BlockHeight)
     , _gsKind :: !T.Text
-        -- ^ 'skipNoTx' or 'skipLookupFailed'; the report counts skips per
+        -- ^ 'skipNoTx', 'skipGenesisPreflight' or 'skipLookupFailed'; the report counts skips per
         -- class and kind
     , _gsReason :: !T.Text
         -- ^ the details
@@ -664,6 +668,12 @@ data GenSkip = GenSkip
 --
 skipNoTx :: T.Text
 skipNoTx = genSkipNoTx
+
+-- | The kind of a 'GenSkip' of a preflight target at its chain's genesis
+-- height ('isGenesisPreflight').
+--
+skipGenesisPreflight :: T.Text
+skipGenesisPreflight = genSkipGenesisPreflight
 
 -- | The kind of a 'GenSkip' whose oracle lookups failed.
 --
@@ -736,7 +746,9 @@ data DrawStats = DrawStats
     deriving (Show, Eq)
 
 -- | Generates the requests of the targets and redraws every target without a
--- transaction in its window ('skipNoTx'), from the class's own draws, until
+-- transaction in its window ('skipNoTx') or that is a preflight at its
+-- chain's genesis height ('skipGenesisPreflight'), from the class's own
+-- draws, until
 -- the class has the number of targets it was to have, or it has used
 -- 'maxDrawFactor' times that many attempts. A skip of any other kind (an
 -- oracle lookup failed) is not redrawn: it stays in the skips, and counts
@@ -752,7 +764,7 @@ generateRedrawing
 generateRedrawing gen redraws targets = do
     (rs0, sk0) <- gen targets
     let requested = M.fromListWith (+) [ (c, 1 :: Int) | (c, _, _) <- targets ]
-        need0 = M.fromListWith (+) [ (c, 1 :: Int) | GenSkip (c, _, _) k _ <- sk0, k == skipNoTx ]
+        need0 = M.fromListWith (+) [ (c, 1 :: Int) | GenSkip (c, _, _) k _ <- sk0, k `elem` genSkipRedrawn ]
         attempts0 = requested
         pools0 = M.mapWithKey (\c _ -> redraws c) requested
     (rs, sk, need, attempts) <- loop rs0 sk0 need0 attempts0 pools0 requested
@@ -769,7 +781,7 @@ generateRedrawing gen redraws targets = do
             else do
                 (rs', sk') <- gen (concat (M.elems batches))
                 let used = M.map length batches
-                    again = M.fromListWith (+) [ (c, 1 :: Int) | GenSkip (c, _, _) k _ <- sk', k == skipNoTx ]
+                    again = M.fromListWith (+) [ (c, 1 :: Int) | GenSkip (c, _, _) k _ <- sk', k `elem` genSkipRedrawn ]
                     need' = M.mapWithKey (\c n -> if M.member c batches then M.findWithDefault 0 c again + (n - M.findWithDefault 0 c used) else n) need
                     pools' = M.mapWithKey (\c p -> drop (M.findWithDefault 0 c used) p) pools
                     attempts' = M.unionWith (+) attempts used
@@ -801,7 +813,40 @@ generateRequestsRedrawingP
     -> IO ([Request], [GenSkip], M.Map RequestClass DrawStats)
 generateRequestsRedrawingP progress opts api pset seed redraws targets =
     maybe id withGenProgress progress $
-        generateRedrawing (generateRequestsSkippingP progress opts api pset seed) redraws targets
+        generateRedrawing
+            (skipGenesisPreflights progress (_saVersion api) (generateRequestsSkippingP progress opts api pset seed))
+            redraws targets
+
+-- | Whether a target is a preflight at its chain's genesis height. A pinned
+-- request is sent at the depth of its parent block, and the genesis block
+-- has none: each side clamps to genesis in its own way, and the answers
+-- differ in the time check, not in stored data (group E of G-A1c, chains
+-- 10 to 19 at 852,054).
+--
+isGenesisPreflight :: ChainwebVersion -> Target -> Bool
+isGenesisPreflight v (cls, cid, h) = cls == ClsPreflight && h == genesisBlockHeight v cid
+
+-- | A generator that drops every preflight target at its chain's genesis
+-- height ('isGenesisPreflight') as a 'skipGenesisPreflight' skip, before
+-- any lookup, so that 'generateRedrawing' redraws it, and passes the other
+-- targets, in their order, to the generator it wraps. Each dropped target is
+-- counted as a skip in the progress.
+--
+skipGenesisPreflights
+    :: Maybe GenProgress
+    -> ChainwebVersion
+    -> ([Target] -> IO ([Request], [GenSkip]))
+    -> [Target]
+    -> IO ([Request], [GenSkip])
+skipGenesisPreflights progress v gen targets = do
+    let (atGenesis, rest) = L.partition (isGenesisPreflight v) targets
+        dropped = [ GenSkip t skipGenesisPreflight
+                      ("a preflight at the genesis height of chain " <> toText cid <> ": " <> tshow (getBlockHeight h)
+                       <> "; its pinned parent block does not exist")
+                  | t@(_, cid, h) <- atGenesis ]
+    forM_ progress $ \p -> forM_ dropped $ \_ -> progressDone p True
+    (rs, sk) <- if null rest then return ([], []) else gen rest
+    return (rs, dropped <> sk)
 
 -- -------------------------------------------------------------------------- --
 -- Progress of generation

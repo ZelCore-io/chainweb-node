@@ -99,6 +99,8 @@ tests = testGroup "Requests"
     , testCase "an oracle lookup that failed is not redrawn" redrawLeavesLookupFailures
     , testCase "redrawTargets: the class's own draws, deterministic in the seed" redrawTargetsOfSpec
     , testCase "no-tx skips are recorded per class and never inconclusive; a short count does not void the run" genSkipsAreNotInconclusive
+    , testCase "a preflight at chain 10's genesis height (852,054) is redrawn, never generated; other classes and draws unchanged" genesisPreflightsRedrawn
+    , testCase "a preflight at chain 0's genesis height is redrawn before any lookup; the other requests are those of the same seed" genesisPreflightsGenerated
     , testCase "spv: a target chain outside the coverage at the target height + 3 is NotCovered" spvTargetCoverage
     , testCase "--allow-reads-in-local takes a required true|false" allowReadsOption
     , testCase "--oracle-local-timeout takes 1 to 3600 seconds and reaches the run options" oracleLocalTimeoutOption
@@ -737,6 +739,62 @@ redrawTargetsOfSpec = do
     assertBool "another class" $ map (\(_, ch, h) -> (ch, h)) poll /= map (\(_, ch, h) -> (ch, h)) (take 200 (redrawTargets spec ClsSpv))
     assertBool "not the first draws" $ poll /= take 200 (sampleTargets spec { _ssClasses = [ClsPoll], _ssCount = 200 })
     redrawTargets spec ClsHeader @?= []
+
+-- | A generator that turns every target into a request, without lookups.
+--
+fakeGen :: [Target] -> IO ([Request], [GenSkip])
+fakeGen ts = return (fakeRequests ts, [])
+
+fakeRequests :: [Target] -> [Request]
+fakeRequests ts = [ Request c ch (Just h) methodGet "/x" Nothing Nothing | (c, ch, h) <- ts ]
+
+genesisPreflightsRedrawn :: Assertion
+genesisPreflightsRedrawn = do
+    let spec cov = SampleSpec
+            { _ssSeed = 7, _ssCount = 200, _ssClasses = allRequestClasses, _ssCoverage = cov
+            , _ssBoundaries = [], _ssBoundaryShare = 0, _ssHistoryMax = historyMaxHeight mainnet, _ssPactChains = Nothing }
+        s10 = spec (genesisCoverage mainnet [cid10] (852_000, 852_056))
+        ts = sampleTargets s10
+        atGenesis (c, ch, h) = c == ClsPreflight && ch == cid10 && h == 852_054
+        isPre (c, _, _) = c == ClsPreflight
+        target r = (_reqClass r, _reqChain r, fromMaybe 0 (_reqTarget r))
+        nPre = length (filter isPre ts)
+        nGen = length (filter atGenesis ts)
+    assertBool ("the draws hold preflights at 852,054: " <> show nGen) (nGen > 0)
+    (rs, skips, stats) <- generateRedrawing (skipGenesisPreflights Nothing mainnet fakeGen) (redrawTargets s10) ts
+    assertBool "no preflight at the genesis height" $ not (any (atGenesis . target) rs)
+    -- other classes: the same requests, in the same order
+    filter (not . isPre . target) rs @?= filter (not . isPre . target) (fakeRequests ts)
+    -- the preflights of the first draws off the genesis height stay, in order;
+    -- the class still has its count
+    map target (take (nPre - nGen) (filter (isPre . target) rs)) @?= [ x | x <- ts, isPre x, not (atGenesis x) ]
+    length (filter (isPre . target) rs) @?= nPre
+    assertBool "every skip is a genesis preflight" $ all ((== skipGenesisPreflight) . _gsKind) skips
+    case M.lookup ClsPreflight stats of
+        Just (DrawStats n a sh) -> do
+            (n, sh) @?= (nPre, 0)
+            a - n @?= length skips
+        Nothing -> assertFailure "no stats for preflight"
+    -- the redrawn kind is no part of the inconclusive budget
+    reportInconclusive (reportGeneration 200 [ (c, _gsKind g) | g@(GenSkip (c, _, _) _ _) <- skips ] emptyReport) @?= 0
+    -- a coverage without a genesis height: the wrapper changes nothing
+    let s0 = spec (genesisCoverage mainnet [cid0] (100, 200))
+        ts0 = sampleTargets s0
+    (rs0, sk0, _) <- generateRedrawing (skipGenesisPreflights Nothing mainnet fakeGen) (redrawTargets s0) ts0
+    (rs0, sk0) @?= (fakeRequests ts0, [])
+
+genesisPreflightsGenerated :: Assertion
+genesisPreflightsGenerated = withOracle $ \_ _ api _ -> do
+    let targets = [(ClsPreflight, cid0, 0), (ClsHeader, cid0, 10), (ClsPreflight, cid0, 300), (ClsLocal, cid0, 300)]
+        redraws c = (c, cid0, 0) : [ (c, cid0, h) | h <- [301 ..] ]
+    (rs, skips, stats) <- generateRequestsRedrawing defaultGenOptions api defaultPactSet 1 redraws targets
+    [ (_reqClass r, _reqTarget r) | r <- rs, _reqClass r == ClsPreflight ] @?= [(ClsPreflight, Just 300), (ClsPreflight, Just 301)]
+    map (\g -> (_gsKind g, _gsTarget g)) skips @?= [(skipGenesisPreflight, (ClsPreflight, cid0, 0)), (skipGenesisPreflight, (ClsPreflight, cid0, 0))]
+    M.lookup ClsPreflight stats @?= Just (DrawStats 2 4 0)
+    others <- mapM (requestsFor api defaultPactSet 1) [(ClsHeader, cid0, 10), (ClsLocal, cid0, 300)]
+    filter ((/= ClsPreflight) . _reqClass) rs @?= others
+    pre <- requestsFor api defaultPactSet 1 (ClsPreflight, cid0, 300)
+    take 1 (filter ((== ClsPreflight) . _reqClass) rs) @?= [pre]
 
 genSkipsAreNotInconclusive :: Assertion
 genSkipsAreNotInconclusive = do
