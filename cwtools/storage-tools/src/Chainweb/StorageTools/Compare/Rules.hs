@@ -42,6 +42,7 @@ module Chainweb.StorageTools.Compare.Rules
   -- * Request files
 , allowedRequest
 , parseRequestFile
+, renderRequestFile
 
   -- * Pins
 , answerPin
@@ -63,6 +64,7 @@ import Data.Aeson
 import Data.Aeson.Types (Parser, parseEither, parseMaybe)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as B8
+import qualified Data.ByteString.Lazy as BL
 import Data.Char (isAsciiLower, isAsciiUpper, isDigit)
 import qualified Data.List as L
 import Data.Maybe (isJust, isNothing)
@@ -261,6 +263,12 @@ parseRequestFile prefix bs = fmap concat $ mapM line $ zip [1 :: Int ..] (B8.lin
             Right r -> case allowedRequest prefix r of
                 Left e -> Left (show i <> ": not allowed: " <> T.unpack e <> ": " <> B8.unpack (_reqMethod r) <> " " <> T.unpack (_reqPath r))
                 Right () -> Right [r]
+
+-- | The text of a request file: one JSON request per line, in the order of
+-- the list. 'parseRequestFile' reads it back.
+--
+renderRequestFile :: [Request] -> B.ByteString
+renderRequestFile = B8.unlines . map (BL.toStrict . encode)
 
 -- | An SPV proof to another chain ends in a header of the target chain at most
 -- this many blocks above the source block: the diameter of the chain graphs of
