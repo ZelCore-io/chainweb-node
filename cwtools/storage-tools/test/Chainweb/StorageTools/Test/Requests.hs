@@ -110,6 +110,11 @@ tests = testGroup "Requests"
     , testCase "a Pact set entry that expects success needs a Same success in each class, or the run is at best PartialPass" hollowEntries
     , testCase "lookups whose window crosses the oracle's tip stop at the height of its cut" nearTip
     , testCase "a preflight sender is a k: account of the block; plain /local takes any account" preflightSenders
+    , testCase "the progress line of generation: counts, redraws, rate and eta" progressLineText
+    , testCase "progress is logged every N targets done, after the quiet limit, and at the end, once" progressLogging
+    , testCase "a quiet generation logs a line at the quiet limit from the ticker thread, and one at the end" progressTicker
+    , testCase "generating with progress logging gives the same requests, skips and stats as without" progressSameOutput
+    , testCase "saved requests are read back by the request file reader as an equal list" saveRoundTrip
     ]
 
 cid0, cid3, cid10 :: ChainId
@@ -1107,3 +1112,111 @@ preflightSenders = do
         -- plain /local fills {account} from any account, the miner included
         codes <- forM [1 .. 40] $ \s -> execCode <$> gen api s ClsLocal 301
         assertBool "a plain /local reads the miner NoMiner" (any (maybe False ("NoMiner" `T.isInfixOf`)) codes)
+
+-- -------------------------------------------------------------------------- --
+-- Progress and saved requests
+
+progressLineText :: Assertion
+progressLineText = do
+    progressLine 100_000 1_000 3 100 @?=
+        "generated 1000 of 100000 requests (3 skipped, 0 redraws), 1m40s elapsed, rate 10.00/s, eta 2h45m00s"
+    progressLine 100_000 0 0 0 @?=
+        "generated 0 of 100000 requests (0 skipped, 0 redraws), 0s elapsed, rate 0.00/s, eta unknown"
+    -- past the total, the targets are redraws and nothing is left but them
+    progressLine 10 14 6 7 @?=
+        "generated 10 of 10 requests (6 skipped, 4 redraws), 7s elapsed, rate 2.00/s, eta 0s"
+
+-- | A manual clock and a log, to drive a 'GenProgress' without waiting.
+--
+progressLogging :: Assertion
+progressLogging = do
+    clock <- newIORef (0 :: Double)
+    logged <- newIORef []
+    p <- newGenProgressWith 3 300 1_000 (readIORef clock) (\l -> modifyIORef logged (l :)) 7
+    let lines' = reverse <$> readIORef logged
+        at t = writeIORef clock t
+    -- every third target done
+    at 1 >> mapM_ (progressDone p) [False, True]
+    lines' >>= (@?= [])
+    at 3 >> progressDone p False
+    lines' >>= (@?= ["generated 3 of 7 requests (1 skipped, 0 redraws), 3s elapsed, rate 1.00/s, eta 4s"])
+    -- not before the quiet limit, then once, then not again at once
+    at 302 >> progressTick p
+    lines' >>= (@?= ["generated 3 of 7 requests (1 skipped, 0 redraws), 3s elapsed, rate 1.00/s, eta 4s"])
+    at 303 >> progressTick p
+    lines' >>= \ls -> length ls @?= 2
+    at 304 >> progressTick p
+    lines' >>= \ls -> length ls @?= 2
+    -- the end: a line unless the last one already says the same
+    progressFinish p
+    lines' >>= \ls -> length ls @?= 2
+    mapM_ (progressDone p) [False, False, False, False]
+    lines' >>= \ls -> length ls @?= 3
+    at 400 >> progressFinish p
+    progressFinish p
+    ls <- lines'
+    length ls @?= 4
+    last ls @?= "generated 7 of 7 requests (1 skipped, 0 redraws), 6m40s elapsed, rate 0.02/s, eta 0s"
+
+progressTicker :: Assertion
+progressTicker = do
+    logged <- newIORef []
+    now <- newIORef (0 :: Double)
+    p <- newGenProgressWith 1_000 5 1_000 (readIORef now) (\l -> modifyIORef logged (l :)) 10
+    r <- withGenProgress p $ do
+        writeIORef now 6
+        threadDelay 200_000
+        return (42 :: Int)
+    r @?= 42
+    ls <- readIORef logged
+    -- one from the ticker (the clock stood at 6, then 5 seconds not yet passed)
+    -- and one at the end, which counts nothing done
+    assertBool ("a line from the ticker and one at the end: " <> show ls) (length ls == 1 || length ls == 2)
+    assertBool ("the ticker line: " <> show ls) $
+        any ("generated 0 of 10 requests (0 skipped, 0 redraws), 6s elapsed" `T.isPrefixOf`) ls
+
+-- | Targets of several classes, one that is skipped at generation (a poll
+-- without a transaction in reach), for the tests of generation.
+--
+progressTargets :: [Target]
+progressTargets =
+    [ (ClsHeader, cid0, h) | h <- [10, 20, 30] ]
+    <> [ (ClsPayload, cid0, h) | h <- [40, 50] ]
+    <> [ (ClsLocal, cid0, 60), (ClsPoll, cid0, 100), (ClsSpv, cid0, 500), (ClsPoll, cid0, 900) ]
+
+progressSameOutput :: Assertion
+progressSameOutput = withOracleTxs (== 700) $ \_ _ api _ -> do
+    let redraws c = [ (c, cid0, h) | h <- [200, 210 ..] ]
+        run mp = generateRequestsRedrawingP mp defaultGenOptions api defaultPactSet 7 redraws progressTargets
+    plain <- run Nothing
+    logged <- newIORef []
+    p <- newGenProgress (\l -> modifyIORef logged (l :)) (length progressTargets)
+    withProgress <- run (Just p)
+    withProgress @?= plain
+    -- the logging happened: the end line at least, with the redraws counted
+    ls <- readIORef logged
+    assertBool ("a line at the end: " <> show ls) $ case ls of
+        l : _ -> "generated " `T.isPrefixOf` l && " of 9 requests (" `T.isInfixOf` l
+        [] -> False
+    -- and one run twice with logging is the same again
+    again <- newGenProgressWith 2 300 1_000 (return 0) (const (return ())) (length progressTargets) >>= run . Just
+    again @?= plain
+    let (rs, _, _) = plain
+    assertBool "some requests" (length rs >= 5)
+
+saveRoundTrip :: Assertion
+saveRoundTrip = withOracleTxs (== 700) $ \_ _ api _ -> do
+    (rs, _, _) <- generateRequestsRedrawing defaultGenOptions api defaultPactSet 3 (const []) progressTargets
+    assertBool "some requests" (length rs >= 5)
+    let bytes = renderRequestFile rs
+    -- one line per request
+    length (B8.lines bytes) @?= length rs
+    parseRequestFile (apiPrefix mainnet) bytes @?= Right rs
+    -- through a file, as --save-requests writes it
+    tmp <- getTemporaryDirectory
+    (f, h) <- openTempFile tmp "cwc-save-requests"
+    hClose h
+    B8.writeFile f bytes
+    back <- B8.readFile f
+    removeFile f
+    parseRequestFile (apiPrefix mainnet) back @?= Right rs
