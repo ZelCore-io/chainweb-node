@@ -613,16 +613,19 @@ compareOne env (i, r) = do
                 return $ Outcome i r (Skipped NoOracleAnswer) Nothing (either (const Nothing) Just eb) attempt ds
                     (Just (either (const NoAnswerBoth) (const NoAnswerOracle) eb)) False
 
--- | Whether both answers of a pinned request carry no block metadata: the pin
--- check cannot tell whether the oracle's depth, set from a tip that may have
--- moved since, reached the target block. If only one answer has metadata, the
--- sides disagree on what they executed, and a second oracle answer cannot
--- change that.
+-- | Whether the oracle's answer of a pinned request carries no block
+-- metadata: the pin check cannot tell whether the oracle's depth, set from a
+-- tip that may have moved since, reached the target block, so the oracle is
+-- read again. This holds whatever the test side has: a Pact 5 failure, for
+-- one, never has metadata, and an oracle one block late past the Pact 5 fork
+-- answers such a failure where the test side answers with metadata at the
+-- target (M0e, #10969 of m0-w3h3). If only the test side lacks metadata, a
+-- second oracle answer cannot change that, and the oracle is not read again.
 --
 lacksMetadata :: Answer -> Answer -> Bool
-lacksMetadata a b = isNothing (_ansPin a) && isNothing (_ansPin b)
+lacksMetadata oracle _test = isNothing (_ansPin oracle)
 
--- | A difference between answers that both lack block metadata may be a stale
+-- | A difference where the oracle's answer lacks block metadata may be a stale
 -- oracle tip: production's tip moves every few seconds, the cached tip is
 -- up to 'tipRefreshInterval' requests old, and at a block where the answer
 -- changes (a fork or an upgrade) the oracle then answers one block later

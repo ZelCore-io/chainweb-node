@@ -661,6 +661,10 @@ data StubConfig = StubConfig
     , _scRows :: !(Maybe (Integer -> [B.ByteString]))
         -- ^ with '_scBlockInData': the data of a @/local@ answer is these rows,
         -- as a JSON array, for the height of the block it was computed at
+    , _scFailFrom :: !(Maybe Integer)
+        -- ^ a @/local@ answer (not a tip probe) computed at this height or
+        -- above is a failure without block metadata, as a Pact 5 error past
+        -- the Pact 5 fork
     , _scDriftOnce :: !Integer
         -- ^ the tip of the service moves by this many blocks right after it
         -- answered its first tip probe, as a node's tip does between a probe
@@ -690,6 +694,7 @@ oracleConf = StubConfig
     , _scPayloadStatuses = []
     , _scBlockInData = False
     , _scRows = Nothing
+    , _scFailFrom = Nothing
     , _scDriftOnce = 0
     }
 
@@ -717,6 +722,13 @@ stubApp seen probes payloadHits tipRef sc req respond = do
             tip <- readIORef tipRef
             reply 200 (localBody (tip - fromIntegral d) (_scParent sc) dat)
         local d
+            | Just f <- _scFailFrom sc = do
+                tip <- readIORef tipRef
+                if fromIntegral tip - fromIntegral d >= f
+                    then reply 200 "{\"result\":{\"status\":\"failure\",\"error\":\"Cannot find module: txlog\"},\"metaData\":null}"
+                    else local' d
+            | otherwise = local' d
+        local' d
             | _scBlockInData sc = do
                 tip <- readIORef tipRef
                 let h = B8.pack (show (tip - fromIntegral d))
@@ -904,8 +916,7 @@ runTests = testGroup "runCompare"
             rep <- runCompare quietLogger cov o t [localReqAt 500]
             reportCount rep ClsLocal KindSame @?= 1
             reportRetried rep @?= 0
-    , testCase "an answer with block metadata on one side only is not read again: Differ, retried 0, the oracle sent once" $ do
-        -- the oracle has metadata, the test side has none (m-2 of the review)
+    , testCase "only the test side lacks block metadata: not read again, Differ, retried 0, the oracle sent once" $
         withStubs 1_000
             oracleConf
             testConf { _scLocalMeta = False, _scBlockInData = True } $ \o t so _ -> do
@@ -913,14 +924,39 @@ runTests = testGroup "runCompare"
             reportDiffCount rep @?= 1
             reportRetried rep @?= 0
             deepLocals <$> seenPaths so >>= (@?= 1)
-        -- and the other way round
+    , testCase "only the oracle lacks block metadata, also on the re-read: read again once, Differ, retried 1" $
         withStubs 1_000
             oracleConf { _scLocalMeta = False, _scBlockInData = True }
-            testConf $ \o t so _ -> do
+            testConf $ \o t so st -> do
             rep <- runCompare quietLogger cov o t [localReqAt 500]
             reportDiffCount rep @?= 1
-            reportRetried rep @?= 0
-            deepLocals <$> seenPaths so >>= (@?= 1)
+            reportRetried rep @?= 1
+            reportRetriedSame rep @?= 0
+            deepLocals <$> seenPaths so >>= (@?= 2)
+            deepLocals <$> seenPaths st >>= (@?= 1)
+    , testCase "stale oracle tip, a failure without metadata one block late (M0e): read again, Same with the test side's answer with metadata, retried 1" $
+        withStubs 1_000
+            oracleConf { _scDriftOnce = 1, _scFailFrom = Just 501 }
+            testConf $ \o t so st -> do
+            rep <- runCompare quietLogger cov o t [localReqAt 500]
+            reportDiffCount rep @?= 0
+            reportCount rep ClsLocal KindSame @?= 1
+            reportRetried rep @?= 1
+            reportRetriedSame rep @?= 1
+            ps <- seenPaths so
+            probeCount ps @?= 2
+            deepLocals ps @?= 2
+            deepLocals <$> seenPaths st >>= (@?= 1)
+    , testCase "stale oracle tip, a failure without metadata one block late; the re-read answer at the target still differs: Differ, retried 1" $
+        withStubs 1_000
+            oracleConf { _scDriftOnce = 1, _scFailFrom = Just 501, _scDataTag = "x" }
+            testConf $ \o t so _ -> do
+            rep <- runCompare quietLogger cov o t [localReqAt 500]
+            reportVerdict rep @?= Fail
+            reportDiffCount rep @?= 1
+            reportRetried rep @?= 1
+            reportRetriedSame rep @?= 0
+            deepLocals <$> seenPaths so >>= (@?= 2)
     , testCase "a request of a class without a tip is never read again" $
         withStubs 1_000 oracleConf testConf { _scPayloads = M.insert (toText payloadA) "other" (_scPayloads testConf) } $ \o t so _ -> do
             rep <- runCompare quietLogger cov o t [payloadReqFor payloadA]
