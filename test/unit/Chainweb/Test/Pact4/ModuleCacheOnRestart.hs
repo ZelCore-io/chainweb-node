@@ -36,6 +36,7 @@ import qualified Pact.Utils.StableHashMap as SHM
 -- chainweb imports
 
 import Chainweb.BlockHeader
+import Chainweb.BlockHeight
 import Chainweb.ChainId
 import Chainweb.Graph
 import Chainweb.Logger
@@ -95,6 +96,10 @@ tests rdb =
     , testCaseSteps "testCw217CoinOnly" $ withPact' bdbio ioSqlEnv iom $
         testCw217CoinOnly bdbio rewindDataM
     , testCaseSteps "testRestartCw217" $
+      withPact' bdbio ioSqlEnv iom testRestart
+    , testCaseSteps "testCw223Upgrade" $ withPact' bdbio ioSqlEnv iom $
+        testCw223Upgrade bdbio
+    , testCaseSteps "testRestartCw223" $
       withPact' bdbio ioSqlEnv iom testRestart
     ]
 
@@ -225,6 +230,48 @@ testCw217CoinOnly iobdb _rewindM = (go, go')
       case M.lookup 20 initCache of
         Just a -> assertEqual "module init cache contains only coin" ["coin"] (Pact4.moduleCacheKeys a)
         Nothing -> assertFailure "failed to lookup block at 20"
+
+-- | Run blocks up to and including the Chainweb223Pact upgrade block (the
+-- coin v6 upgrade) in one process, and snapshot the init cache. The next test,
+-- 'testRestart' as "testRestartCw223", starts a fresh process, which builds
+-- its init cache from the database at the next block, and checks that it gets
+-- the same modules and module hashes as the process that applied the upgrade.
+--
+-- If the upgrade's module cache is merged into the cache in effect, the two
+-- differ: in this test version the merged cache also holds the fungible-v2 and
+-- fungible-xchain-v1 interfaces, which the restarted process doesn't load. The
+-- cache is used until Chainweb224Pact, and a different cache can change the
+-- gas of later transactions.
+testCw223Upgrade
+    :: (Logger logger, CanReadablePayloadCas cas, logger ~ GenericLogger)
+    => IO TestBlockDb
+    -> CacheTest logger cas
+testCw223Upgrade iobdb = (go, go')
+  where
+    go = do
+      initPayloadState
+      bdb <- liftIO iobdb
+      let loop = do
+            h <- view blockHeight <$> liftIO (getParentTestBlockDb bdb testChainId)
+            when (h < cw223Height) $ doNextCoinbase iobdb >> loop
+      loop
+
+    go' ioa initCache = do
+      snapshotCache ioa initCache
+      -- the upgrade block's entry is the latest one, so it is the one that
+      -- "testRestartCw223" compares
+      case M.lookupMax initCache of
+        Just (k, _) -> assertEqual
+          "latest init cache entry is the Chainweb223Pact upgrade block's" cw223Height k
+        Nothing -> assertFailure "init cache is empty"
+
+-- | The height of the Chainweb223Pact upgrade block in the test version. It
+-- must be below Chainweb224Pact, after which the init cache is no longer used.
+cw223Height :: BlockHeight
+cw223Height =
+    case testVer ^?! versionForks . at Chainweb223Pact . _Just . atChain testChainId of
+        ForkAtBlockHeight h -> h
+        _ -> error "the test version must fork Chainweb223Pact at a block height"
 
 assertNoCacheMismatch
     :: SHM.StableHashMap ModuleName (Maybe ModuleHash)
