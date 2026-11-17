@@ -433,7 +433,7 @@ runCoinbase miner enfCBFail usePrecomp mc = do
       case upgradedCacheM of
         Nothing -> return ()
         Just newCache
-          | chainweb223PactUpgradeBlock v (ctxChainId txCtx) bh -> rebuildInitCache
+          | chainweb223PactInitCacheRebuild v (ctxChainId txCtx) bh -> rebuildInitCache
           | otherwise -> upgradeInitCache newCache
       liftPactServiceM $ debugResult "runPact4Coinbase" (Pact4.crLogs %~ fmap J.Array $ cr)
       return $! cr
@@ -464,7 +464,9 @@ runCoinbase miner enfCBFail usePrecomp mc = do
     -- replays all of them with the recorded gas. Rebuilding the cache here
     -- gives a process that applies the upgrade the same cache.
     --
-    -- Every other upgrade keeps the merge.
+    -- Only mainnet01 (and the unit-test versions) rebuild; see
+    -- 'chainweb223PactInitCacheRebuild'. Every other version, and every other
+    -- upgrade, keeps the merge, as in Chainweb 3.2.1.
     rebuildInitCache = do
       liftPactServiceM $ logInfoPact
         "Rebuilding init cache from the database for the Chainweb223Pact upgrade"

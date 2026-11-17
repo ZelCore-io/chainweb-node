@@ -46,6 +46,7 @@ module Chainweb.Version.Guards
     , chainweb222Pact
     , chainweb223Pact
     , chainweb223PactUpgradeBlock
+    , chainweb223PactInitCacheRebuild
     , chainweb224Pact
     , chainweb225Pact
     , chainweb228Pact
@@ -78,6 +79,7 @@ import Chainweb.Pact4.Transaction qualified as Pact4
 import Chainweb.Utils.Rule
 import Chainweb.ForkState
 import Chainweb.Version
+import Chainweb.Version.Mainnet (mainnet)
 import Chainweb.Pact5.InitialGasModel
 import Control.Lens
 import Data.Word (Word64)
@@ -299,6 +301,28 @@ chainweb223Pact = checkFork atOrAfter Chainweb223Pact
 -- (coin v6). See 'Chainweb.Pact.PactService.Pact4.ExecBlock.runCoinbase'.
 chainweb223PactUpgradeBlock :: ChainwebVersion -> ChainId -> BlockHeight -> Bool
 chainweb223PactUpgradeBlock = checkFork (==) Chainweb223Pact
+
+-- | True only at the Chainweb223Pact upgrade block, and only on the versions
+-- where Pact 4 rebuilds the init module cache from the database at that block
+-- instead of merging the upgrade's cache into it. See
+-- 'Chainweb.Pact.PactService.Pact4.ExecBlock.runCoinbase'.
+--
+-- The rebuild is validated against mainnet01's recorded history only, so it
+-- applies to mainnet01. Every other public version (testnet04, testnet06,
+-- recap-development, devnets) keeps the merge, as in Chainweb 3.2.1: whether
+-- their recorded history was written with the merged cache is unknown.
+--
+-- Test versions (version codes from 0x80000000, see
+-- @Chainweb.Test.TestVersions.testVersionTemplate@) also rebuild, so the
+-- unit tests can exercise the rebuild path. They have no recorded history.
+chainweb223PactInitCacheRebuild :: ChainwebVersion -> ChainId -> BlockHeight -> Bool
+chainweb223PactInitCacheRebuild v cid bh =
+    rebuildsAtUpgrade && chainweb223PactUpgradeBlock v cid bh
+  where
+    code = _versionCode v
+    rebuildsAtUpgrade =
+        code == _versionCode mainnet
+        || code >= ChainwebVersionCode 0x80000000
 
 -- | Pact 4.12 features, optimized buy/redeem gas transactions reduce gas cost
 -- for all transactions
