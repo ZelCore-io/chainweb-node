@@ -42,6 +42,7 @@ module Chainweb.StorageTools.Compare.Rules
   -- * Request files
 , allowedRequest
 , parseRequestFile
+, renderRequestFile
 
   -- * Pins
 , answerPin
@@ -63,6 +64,7 @@ import Data.Aeson
 import Data.Aeson.Types (Parser, parseEither, parseMaybe)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as B8
+import qualified Data.ByteString.Lazy as BL
 import Data.Char (isAsciiLower, isAsciiUpper, isDigit)
 import qualified Data.List as L
 import Data.Maybe (isJust, isNothing)
@@ -259,6 +261,12 @@ parseRequestFile prefix bs = fmap concat $ mapM line $ zip [1 :: Int ..] (B8.lin
                 Left e -> Left (show i <> ": not allowed: " <> T.unpack e <> ": " <> B8.unpack (_reqMethod r) <> " " <> T.unpack (_reqPath r))
                 Right () -> Right [r]
 
+-- | The text of a request file: one JSON request per line, in the order of
+-- the list. 'parseRequestFile' reads it back.
+--
+renderRequestFile :: [Request] -> B.ByteString
+renderRequestFile = B8.unlines . map (BL.toStrict . encode)
+
 -- | An SPV proof to another chain ends in a header of the target chain at most
 -- this many blocks above the source block: the diameter of the chain graphs of
 -- mainnet and testnet (3). The test side must hold the target chain up to
@@ -294,6 +302,12 @@ judge cov r a b = case preJudge cov r of
 -- If only one answer has block metadata, the answers differ: one side
 -- executed the code and the other did not.
 --
+-- An oracle answer whose block metadata is off the target height while the
+-- test side has none is not judged: the oracle's tip moved between its probe
+-- and the request, and it answered at another block (concern 1 of GA-FAST-1).
+-- It is the pin retry: the tips are probed again and the request is sent
+-- again, at most @maxPinRetries@ times, then 'Skipped' 'PinUnstable'.
+--
 judgePinned :: Request -> Answer -> Answer -> Judgement
 judgePinned r a b = case (_ansPin a, _ansPin b) of
     (Just pa, Just pb)
@@ -301,6 +315,8 @@ judgePinned r a b = case (_ansPin a, _ansPin b) of
         | Just (_pinHeight pa) /= _reqTarget r -> RetryPinMismatch
         | otherwise -> Final (compareFor r a b)
     (Nothing, Nothing) -> Final (compareFor r a b)
+    (Just pa, Nothing)
+        | Just (_pinHeight pa) /= _reqTarget r -> RetryPinMismatch
     (Just pa, Nothing) -> Final $ Differ $
         "only the oracle answered with block metadata (height " <> sshow (_pinHeight pa) <> "); " <> bytesDetail a b
     (Nothing, Just pb) -> Final $ Differ $

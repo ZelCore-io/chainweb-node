@@ -41,13 +41,28 @@ module Chainweb.StorageTools.Compare.Requests
 , generateRequests
 , GenSkip(..)
 , skipNoTx
+, skipGenesisPreflight
 , skipLookupFailed
+, isGenesisPreflight
+, skipGenesisPreflights
 , generateRequestsSkipping
+, generateRequestsSkippingP
+, GenProgress
+, newGenProgress
+, newGenProgressWith
+, withGenProgress
+, progressDone
+, progressTick
+, progressFinish
+, progressLine
+, progressEvery
+, progressQuietSeconds
 , Target
 , DrawStats(..)
 , maxDrawFactor
 , generateRedrawing
 , generateRequestsRedrawing
+, generateRequestsRedrawingP
 , generateWorkers
 , RequestGenError(..)
 , oracleServiceApi
@@ -60,7 +75,7 @@ module Chainweb.StorageTools.Compare.Requests
 ) where
 
 import Control.Concurrent (threadDelay)
-import Control.Concurrent.Async (mapConcurrently)
+import Control.Concurrent.Async (mapConcurrently, withAsync)
 import Control.Exception (Exception, throwIO, try)
 import Control.Monad
 import Data.Aeson
@@ -71,17 +86,22 @@ import qualified Data.ByteString as B
 import qualified Data.ByteString.Lazy as BL
 import Data.Char (isAscii, isAlphaNum)
 import qualified Data.HashSet as HS
+import Data.Either (isLeft)
 import Data.Int (Int64)
+import Data.IORef
 import Data.List (nubBy, sort, sortOn)
+import qualified Data.List as L
 import qualified Data.Map.Strict as M
 import Data.Maybe (fromMaybe, mapMaybe, maybeToList)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
 import Data.Word
+import GHC.Clock (getMonotonicTime)
 import qualified Network.HTTP.Client as HTTP
 import Network.HTTP.Types (Header, Method, hAccept, hContentType, methodGet, methodPost, statusCode)
 import Pact.Core.Hash (hash, hashToText)
 import System.Random (StdGen, mkStdGen, uniformR)
+import Text.Printf (printf)
 
 -- internal modules
 
@@ -636,7 +656,7 @@ generateWorkers = 8
 data GenSkip = GenSkip
     { _gsTarget :: !(RequestClass, ChainId, BlockHeight)
     , _gsKind :: !T.Text
-        -- ^ 'skipNoTx' or 'skipLookupFailed'; the report counts skips per
+        -- ^ 'skipNoTx', 'skipGenesisPreflight' or 'skipLookupFailed'; the report counts skips per
         -- class and kind
     , _gsReason :: !T.Text
         -- ^ the details
@@ -648,6 +668,12 @@ data GenSkip = GenSkip
 --
 skipNoTx :: T.Text
 skipNoTx = genSkipNoTx
+
+-- | The kind of a 'GenSkip' of a preflight target at its chain's genesis
+-- height ('isGenesisPreflight').
+--
+skipGenesisPreflight :: T.Text
+skipGenesisPreflight = genSkipGenesisPreflight
 
 -- | The kind of a 'GenSkip' whose oracle lookups failed.
 --
@@ -667,11 +693,29 @@ generateRequestsSkipping
     -> Word64
     -> [(RequestClass, ChainId, BlockHeight)]
     -> IO ([Request], [GenSkip])
-generateRequestsSkipping opts api pset seed targets = do
+generateRequestsSkipping = generateRequestsSkippingP Nothing
+
+-- | 'generateRequestsSkipping' that reports each target it finishes to a
+-- 'GenProgress'. The progress only observes: the requests, the skips and
+-- their order are those of 'generateRequestsSkipping'.
+--
+generateRequestsSkippingP
+    :: Maybe GenProgress
+    -> GenOptions
+    -> ServiceApi
+    -> PactSet
+    -> Word64
+    -> [(RequestClass, ChainId, BlockHeight)]
+    -> IO ([Request], [GenSkip])
+generateRequestsSkippingP progress opts api pset seed targets = do
     rs <- fmap concat $ mapM (mapConcurrently one) $ chunks targets
     return ([ r | Right r <- rs ], [ s | Left s <- rs ])
   where
-    one target = try (try (requestsForWith opts api pset seed target)) >>= \case
+    one target = do
+        r <- attempt target
+        forM_ progress $ \p -> progressDone p (isLeft r)
+        return r
+    attempt target = try (try (requestsForWith opts api pset seed target)) >>= \case
         Right (Right r) -> return (Right r)
         Right (Left (RequestGenError e)) -> return (Left (GenSkip target skipLookupFailed e))
         Right (Left (NoTxWithin lo hi)) -> return (Left (GenSkip target skipNoTx
@@ -702,7 +746,9 @@ data DrawStats = DrawStats
     deriving (Show, Eq)
 
 -- | Generates the requests of the targets and redraws every target without a
--- transaction in its window ('skipNoTx'), from the class's own draws, until
+-- transaction in its window ('skipNoTx') or that is a preflight at its
+-- chain's genesis height ('skipGenesisPreflight'), from the class's own
+-- draws, until
 -- the class has the number of targets it was to have, or it has used
 -- 'maxDrawFactor' times that many attempts. A skip of any other kind (an
 -- oracle lookup failed) is not redrawn: it stays in the skips, and counts
@@ -718,7 +764,7 @@ generateRedrawing
 generateRedrawing gen redraws targets = do
     (rs0, sk0) <- gen targets
     let requested = M.fromListWith (+) [ (c, 1 :: Int) | (c, _, _) <- targets ]
-        need0 = M.fromListWith (+) [ (c, 1 :: Int) | GenSkip (c, _, _) k _ <- sk0, k == skipNoTx ]
+        need0 = M.fromListWith (+) [ (c, 1 :: Int) | GenSkip (c, _, _) k _ <- sk0, k `elem` genSkipRedrawn ]
         attempts0 = requested
         pools0 = M.mapWithKey (\c _ -> redraws c) requested
     (rs, sk, need, attempts) <- loop rs0 sk0 need0 attempts0 pools0 requested
@@ -735,7 +781,7 @@ generateRedrawing gen redraws targets = do
             else do
                 (rs', sk') <- gen (concat (M.elems batches))
                 let used = M.map length batches
-                    again = M.fromListWith (+) [ (c, 1 :: Int) | GenSkip (c, _, _) k _ <- sk', k == skipNoTx ]
+                    again = M.fromListWith (+) [ (c, 1 :: Int) | GenSkip (c, _, _) k _ <- sk', k `elem` genSkipRedrawn ]
                     need' = M.mapWithKey (\c n -> if M.member c batches then M.findWithDefault 0 c again + (n - M.findWithDefault 0 c used) else n) need
                     pools' = M.mapWithKey (\c p -> drop (M.findWithDefault 0 c used) p) pools
                     attempts' = M.unionWith (+) attempts used
@@ -751,7 +797,189 @@ generateRequestsRedrawing
     -> (RequestClass -> [Target])
     -> [Target]
     -> IO ([Request], [GenSkip], M.Map RequestClass DrawStats)
-generateRequestsRedrawing opts api pset seed = generateRedrawing (generateRequestsSkipping opts api pset seed)
+generateRequestsRedrawing = generateRequestsRedrawingP Nothing
+
+-- | 'generateRequestsRedrawing' that logs its progress ('GenProgress'). The
+-- requests, the skips and the stats are those of 'generateRequestsRedrawing'.
+--
+generateRequestsRedrawingP
+    :: Maybe GenProgress
+    -> GenOptions
+    -> ServiceApi
+    -> PactSet
+    -> Word64
+    -> (RequestClass -> [Target])
+    -> [Target]
+    -> IO ([Request], [GenSkip], M.Map RequestClass DrawStats)
+generateRequestsRedrawingP progress opts api pset seed redraws targets =
+    maybe id withGenProgress progress $
+        generateRedrawing
+            (skipGenesisPreflights progress (_saVersion api) (generateRequestsSkippingP progress opts api pset seed))
+            redraws targets
+
+-- | Whether a target is a preflight at its chain's genesis height. A pinned
+-- request is sent at the depth of its parent block, and the genesis block
+-- has none: each side clamps to genesis in its own way, and the answers
+-- differ in the time check, not in stored data (group E of G-A1c, chains
+-- 10 to 19 at 852,054).
+--
+isGenesisPreflight :: ChainwebVersion -> Target -> Bool
+isGenesisPreflight v (cls, cid, h) = cls == ClsPreflight && h == genesisBlockHeight v cid
+
+-- | A generator that drops every preflight target at its chain's genesis
+-- height ('isGenesisPreflight') as a 'skipGenesisPreflight' skip, before
+-- any lookup, so that 'generateRedrawing' redraws it, and passes the other
+-- targets, in their order, to the generator it wraps. Each dropped target is
+-- counted as a skip in the progress.
+--
+skipGenesisPreflights
+    :: Maybe GenProgress
+    -> ChainwebVersion
+    -> ([Target] -> IO ([Request], [GenSkip]))
+    -> [Target]
+    -> IO ([Request], [GenSkip])
+skipGenesisPreflights progress v gen targets = do
+    let (atGenesis, rest) = L.partition (isGenesisPreflight v) targets
+        dropped = [ GenSkip t skipGenesisPreflight
+                      ("a preflight at the genesis height of chain " <> toText cid <> ": " <> tshow (getBlockHeight h)
+                       <> "; its pinned parent block does not exist")
+                  | t@(_, cid, h) <- atGenesis ]
+    forM_ progress $ \p -> forM_ dropped $ \_ -> progressDone p True
+    (rs, sk) <- if null rest then return ([], []) else gen rest
+    return (rs, dropped <> sk)
+
+-- -------------------------------------------------------------------------- --
+-- Progress of generation
+
+-- | A line of progress is logged every this many targets done.
+--
+progressEvery :: Int
+progressEvery = 1_000
+
+-- | A line of progress is logged at the latest this many seconds after the
+-- previous one, even if fewer than 'progressEvery' targets finished.
+--
+progressQuietSeconds :: Double
+progressQuietSeconds = 300
+
+data ProgressState = ProgressState
+    { _psDone :: !Int
+        -- ^ targets finished, redraws included
+    , _psSkipped :: !Int
+    , _psLoggedDone :: !Int
+        -- ^ the count of the last line logged, -1 before the first
+    , _psLoggedAt :: !Double
+        -- ^ the clock at the last line logged
+    }
+
+-- | The progress of a generation: counts the targets finished, redraws
+-- included, and logs a line every 'progressEvery' of them, at the latest
+-- every 'progressQuietSeconds' ('withGenProgress'), and at the end. It only
+-- observes the generation.
+--
+data GenProgress = GenProgress
+    { _gpTotal :: !Int
+    , _gpLog :: T.Text -> IO ()
+    , _gpClock :: IO Double
+        -- ^ seconds, monotonic
+    , _gpStart :: !Double
+    , _gpEvery :: !Int
+    , _gpQuiet :: !Double
+    , _gpTickMicros :: !Int
+    , _gpState :: !(IORef ProgressState)
+    }
+
+-- | The progress of a generation of this many targets (before redraws), that
+-- logs through the function, with the defaults of 'progressEvery' and
+-- 'progressQuietSeconds'. Elapsed time counts from now.
+--
+newGenProgress :: (T.Text -> IO ()) -> Int -> IO GenProgress
+newGenProgress = newGenProgressWith progressEvery progressQuietSeconds 30_000_000 getMonotonicTime
+
+-- | 'newGenProgress' with the count between lines, the quiet seconds, the
+-- microseconds between the checks of the quiet limit and the clock given.
+--
+newGenProgressWith :: Int -> Double -> Int -> IO Double -> (T.Text -> IO ()) -> Int -> IO GenProgress
+newGenProgressWith every quiet tick clock logg total = do
+    t0 <- clock
+    ref <- newIORef (ProgressState 0 0 (-1) t0)
+    return (GenProgress total logg clock t0 every quiet tick ref)
+
+-- | One target finished, skipped or not. Logs the line at every
+-- 'progressEvery'th.
+--
+progressDone :: GenProgress -> Bool -> IO ()
+progressDone p skipped = do
+    now <- _gpClock p
+    line <- atomicModifyIORef' (_gpState p) $ \s ->
+        let done = _psDone s + 1
+            s' = s { _psDone = done, _psSkipped = _psSkipped s + (if skipped then 1 else 0) }
+        in if done `mod` _gpEvery p == 0
+            then (s' { _psLoggedDone = done, _psLoggedAt = now }, Just (lineOf p now s'))
+            else (s', Nothing)
+    forM_ line (_gpLog p)
+
+-- | Logs the line if the quiet limit passed since the last one.
+--
+progressTick :: GenProgress -> IO ()
+progressTick p = do
+    now <- _gpClock p
+    line <- atomicModifyIORef' (_gpState p) $ \s ->
+        if now - _psLoggedAt s >= _gpQuiet p
+            then (s { _psLoggedDone = _psDone s, _psLoggedAt = now }, Just (lineOf p now s))
+            else (s, Nothing)
+    forM_ line (_gpLog p)
+
+-- | Logs the last line, unless the last one logged says the same.
+--
+progressFinish :: GenProgress -> IO ()
+progressFinish p = do
+    now <- _gpClock p
+    line <- atomicModifyIORef' (_gpState p) $ \s ->
+        if _psLoggedDone s == _psDone s
+            then (s, Nothing)
+            else (s { _psLoggedDone = _psDone s, _psLoggedAt = now }, Just (lineOf p now s))
+    forM_ line (_gpLog p)
+
+-- | Runs the action with a thread that logs the line whenever the quiet limit
+-- passes, and logs the last line after it.
+--
+withGenProgress :: GenProgress -> IO a -> IO a
+withGenProgress p act = do
+    r <- withAsync (forever (threadDelay (_gpTickMicros p) >> progressTick p)) (const act)
+    progressFinish p
+    return r
+
+lineOf :: GenProgress -> Double -> ProgressState -> T.Text
+lineOf p now s = progressLine (_gpTotal p) (_psDone s) (_psSkipped s) (now - _gpStart p)
+
+-- | @generated N of TOTAL requests (S skipped, R redraws), E elapsed, rate
+-- X/s, eta T@. The arguments are the number of targets before redraws, the
+-- targets finished (redraws included), those skipped (of all attempts) and
+-- the seconds elapsed. N is the finished targets up to TOTAL and R those
+-- beyond it; the rate counts both, per second; the eta is for the targets not
+-- yet finished, and 0s once all are (redraws are not predicted).
+--
+progressLine :: Int -> Int -> Int -> Double -> T.Text
+progressLine total done skipped elapsed = T.pack $
+    "generated " <> show n <> " of " <> show total <> " requests ("
+    <> show skipped <> " skipped, " <> show redraws <> " redraws), "
+    <> duration elapsed <> " elapsed, rate " <> printf "%.2f" rate <> "/s, eta " <> eta
+  where
+    n = min done total
+    redraws = max 0 (done - total)
+    rate = if elapsed > 0 then fromIntegral done / elapsed else 0 :: Double
+    eta | n >= total = "0s"
+        | rate <= 0 = "unknown"
+        | otherwise = duration (fromIntegral (total - n) / rate)
+    duration :: Double -> String
+    duration x =
+        let t = round x :: Int
+            (h, r) = t `divMod` 3600
+            (m, sec) = r `divMod` 60
+        in if h > 0 then printf "%dh%02dm%02ds" h m sec
+           else if m > 0 then printf "%dm%02ds" m sec
+           else printf "%ds" sec
 
 -- | 'requestsForWith' for every target, in the order of the targets. The
 -- first 'RequestGenError' (or HTTP failure after all attempts) is rethrown.
