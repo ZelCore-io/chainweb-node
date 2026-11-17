@@ -1,6 +1,7 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE NumericUnderscores #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 -- |
 -- Module: Main
@@ -14,7 +15,10 @@
 -- genesis height at the earliest), and each target becomes a request built
 -- from the oracle's canonical block there. The same seed, ranges and oracle
 -- give the same requests. With @--requests FILE@, the requests are read from
--- a file with one JSON request per line instead.
+-- a file with one JSON request per line instead. With @--save-requests FILE@,
+-- the generated requests are written to such a file before the comparison
+-- starts. Generation logs its progress (a line every 1000 targets, at the
+-- latest every 5 minutes, and at the end), and so does the comparison.
 --
 -- The test side is a node's service API (@--test URL@), or the service API
 -- served in process from a node's database directory (@--test-db DIR@, see
@@ -52,6 +56,7 @@
 --
 module Main (main) where
 
+import Control.Exception (IOException, catch)
 import Control.Monad
 import qualified Data.ByteString.Char8 as B8
 import qualified Data.Map.Strict as M
@@ -75,7 +80,7 @@ import Chainweb.StorageTools.Compare.InProcess
 import Chainweb.StorageTools.Compare.PactSet
 import Chainweb.StorageTools.Compare.Report
 import Chainweb.StorageTools.Compare.Requests
-import Chainweb.StorageTools.Compare.Rules (parseRequestFile)
+import Chainweb.StorageTools.Compare.Rules (parseRequestFile, renderRequestFile)
 import Chainweb.StorageTools.Compare.Run
 import Chainweb.StorageTools.Compare.Sample
 import Chainweb.StorageTools.Compare.Types
@@ -123,6 +128,7 @@ data Generate = Generate
     , _genSeed :: !Word64
     , _genPactSet :: !(Maybe FilePath)
     , _genSameSnapshot :: !Bool
+    , _genSave :: !(Maybe FilePath)
     }
 
 chainsReader :: ReadM [ChainId]
@@ -220,6 +226,11 @@ generateOptions = Generate
         ( long "same-snapshot"
         <> help "both nodes were copied from one RocksDB snapshot: also compare plain header ranges (orphans included) and send the Pact set entries marked sameSnapshotOnly (History txids and keylog, keys on a large table), whose cost has no bound on a live node. Never against a production node"
         )
+    <*> optional (strOption
+        ( long "save-requests"
+        <> metavar "FILE"
+        <> help "write the generated requests to this file, one JSON object per line, in the format of --requests, before the comparison starts; a later run can compare them with --requests FILE, without generating them again (only the requests, not the skips and redraws of the generation, which a run from the file does not report)"
+        ))
 
 sourceOptions :: Parser Source
 sourceOptions = RequestFile <$> strOption
@@ -320,11 +331,13 @@ main = do
                     }
                 targets = sampleTargets spec
             logFunctionText logger Info $ "generating " <> T.pack (show (length targets)) <> " requests"
-            (rs, skips, draws) <- generateRequestsRedrawing (GenOptions (_genSameSnapshot g)) api pset (_genSeed g)
+            progress <- newGenProgress (logFunctionText logger Info) (length targets)
+            (rs, skips, draws) <- generateRequestsRedrawingP (Just progress) (GenOptions (_genSameSnapshot g)) api pset (_genSeed g)
                 (redrawTargets spec) targets
             forM_ skips $ \(GenSkip (cls, cid, h) k e) -> logFunctionText logger Warn $
                 "target skipped at generation (" <> requestClassText cls <> ", chain " <> toText cid
                 <> ", height " <> T.pack (show h) <> "): " <> k <> ": " <> e
+            forM_ (_genSave g) $ saveRequests logger v rs
             let entries =
                     [ (c, _peName e)
                     | c <- _genClasses g
@@ -347,6 +360,26 @@ main = do
     writeReport (_optReport o) rep
     T.putStr (reportSummary rep)
     exitWith (gateExitCode (reportVerdict rep))
+
+-- | Writes the requests to the file (@--save-requests@) before the comparison
+-- starts, and checks that @--requests@ would read them back: if it would not,
+-- the file is still written and a warning logged, since the generation is
+-- not to be lost over it. A file that cannot be written stops the run.
+--
+saveRequests :: GenericLogger -> ChainwebVersion -> [Request] -> FilePath -> IO ()
+saveRequests logger v rs f = do
+    let bytes = renderRequestFile rs
+    B8.writeFile f bytes `catch` \(e :: IOException) ->
+        die ("--save-requests " <> f <> ": " <> show e)
+    case parseRequestFile (apiPrefix v) bytes of
+        Right back | back == rs ->
+            logFunctionText logger Info $ "saved " <> T.pack (show (length rs)) <> " requests to " <> T.pack f
+        Right _ -> logFunctionText logger Warn $
+            "saved " <> T.pack (show (length rs)) <> " requests to " <> T.pack f
+            <> ", but --requests reads back a different list"
+        Left e -> logFunctionText logger Warn $
+            "saved " <> T.pack (show (length rs)) <> " requests to " <> T.pack f
+            <> ", but --requests would refuse the file: " <> T.pack e
 
 -- | Logs the entries of a custom Pact set (@--pact-set@) that may go to a
 -- production oracle: those not marked sameSnapshotOnly, sent without

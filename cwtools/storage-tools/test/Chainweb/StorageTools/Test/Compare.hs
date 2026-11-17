@@ -216,6 +216,11 @@ rulesTests = testGroup "rules"
         judge cov localReq (pinned p1 "x") (pinned p2 "x") @?= RetryPinMismatch
     , testCase "pins that agree off the target height: retry" $
         judge cov localReq (pinned p101 "x") (pinned p101 "x") @?= RetryPinMismatch
+    , testCase "an oracle pin off the target height and no test-side metadata: retry" $ do
+        judge cov localReq (pinned p101 "x") (Answer 400 "e" Nothing) @?= RetryPinMismatch
+        judge cov localReq (pinned (Pin 99 (mkHash 'A')) "x") (Answer 400 "e" Nothing) @?= RetryPinMismatch
+    , testCase "an oracle pin at the target height and no test-side metadata: Differ, as before" $
+        assertBool "differ" $ isDiffer (judge cov localReq (pinned p1 "x") (Answer 400 "e" Nothing))
     , testCase "pins that agree at the target height: bytes compared" $ do
         judge cov localReq (pinned p1 "x") (pinned p1 "x") @?= Final Same
         assertBool "pinned bytes" $ isDiffer (judge cov localReq (pinned p1 "x") (pinned p1 "y"))
@@ -669,6 +674,13 @@ data StubConfig = StubConfig
         -- ^ the tip of the service moves by this many blocks right after it
         -- answered its first tip probe, as a node's tip does between a probe
         -- and the request that follows it
+    , _scLateBy :: !Integer
+        -- ^ every @/local@ answer (not a tip probe) is computed this many
+        -- blocks above the height of its depth, as if the tip moved between
+        -- every probe and the request that follows it
+    , _scFailUpTo :: !(Maybe Integer)
+        -- ^ a @/local@ answer (not a tip probe) computed at this height or
+        -- below is a failure without block metadata
     }
 
 -- | Arrival time and path with query of every request a stub saw.
@@ -696,6 +708,8 @@ oracleConf = StubConfig
     , _scRows = Nothing
     , _scFailFrom = Nothing
     , _scDriftOnce = 0
+    , _scLateBy = 0
+    , _scFailUpTo = Nothing
     }
 
 -- | The same answers as the oracle at a different tip, without the orphan.
@@ -721,7 +735,12 @@ stubApp seen probes payloadHits tipRef sc req respond = do
         withMeta d = do
             tip <- readIORef tipRef
             reply 200 (localBody (tip - fromIntegral d) (_scParent sc) dat)
-        local d
+        local d = do
+            tip <- readIORef tipRef
+            if maybe False (fromIntegral tip - fromIntegral d <=) (_scFailUpTo sc)
+                then reply 200 "{\"result\":{\"status\":\"failure\",\"error\":\"Tx time outside of valid range\"},\"metaData\":null}"
+                else local0 d
+        local0 d
             | Just f <- _scFailFrom sc = do
                 tip <- readIORef tipRef
                 if fromIntegral tip - fromIntegral d >= f
@@ -777,7 +796,7 @@ stubApp seen probes payloadHits tipRef sc req respond = do
                             return r
                 | d == 0, "txids" `B.isInfixOf` body -> reply 500 "history functions are not available at the tip"
                 | _scDropLocal sc -> respond $ responseRaw (\_ _ -> return ()) (responseLBS status500 [] "no raw")
-                | otherwise -> local d
+                | otherwise -> local (d - _scLateBy sc)
             Nothing -> reply 400 "no rewindDepth"
         _ -> reply 404 "no route"
 
@@ -957,6 +976,37 @@ runTests = testGroup "runCompare"
             reportRetried rep @?= 1
             reportRetriedSame rep @?= 0
             deepLocals <$> seenPaths so >>= (@?= 2)
+    , testCase "a late oracle answers with metadata one block above the target, the test side without: the pin retry, then Same at the target" $
+        withStubs 1_000
+            oracleConf { _scDriftOnce = 1, _scFailUpTo = Just 500 }
+            testConf { _scFailUpTo = Just 500 } $ \o t so st -> do
+            rep <- runCompare quietLogger cov o t [localReqAt 500]
+            reportDiffCount rep @?= 0
+            reportCount rep ClsLocal KindSame @?= 1
+            reportSkippedFor rep PinUnstable @?= 0
+            reportRetried rep @?= 0
+            deepLocals <$> seenPaths so >>= (@?= 2)
+            deepLocals <$> seenPaths st >>= (@?= 2)
+    , testCase "an oracle always one block late with metadata, the test side without: 5 retries, then Skipped PinUnstable, never Same or Differ" $
+        withStubs 1_000
+            oracleConf { _scLateBy = 1, _scFailUpTo = Just 500 }
+            testConf { _scFailUpTo = Just 500 } $ \o t so st -> do
+            rep <- runCompare quietLogger cov o t [localReqAt 500]
+            reportSkippedFor rep PinUnstable @?= 1
+            reportDiffCount rep @?= 0
+            reportCount rep ClsLocal KindSame @?= 0
+            reportVerdict rep @?= Void
+            no <- deepLocals <$> seenPaths so
+            nt <- deepLocals <$> seenPaths st
+            (no, nt) @?= (6, 6)
+    , testCase "an oracle at the target height with metadata, the test side without: Differ, not retried" $
+        withStubs 1_000
+            oracleConf
+            testConf { _scFailUpTo = Just 500 } $ \o t so _ -> do
+            rep <- runCompare quietLogger cov o t [localReqAt 500]
+            reportDiffCount rep @?= 1
+            reportSkippedFor rep PinUnstable @?= 0
+            deepLocals <$> seenPaths so >>= (@?= 1)
     , testCase "a request of a class without a tip is never read again" $
         withStubs 1_000 oracleConf testConf { _scPayloads = M.insert (toText payloadA) "other" (_scPayloads testConf) } $ \o t so _ -> do
             rep <- runCompare quietLogger cov o t [payloadReqFor payloadA]

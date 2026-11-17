@@ -15,34 +15,41 @@ module Chainweb.Test.Version
 ( tests
 ) where
 
-import Control.Lens (view)
+import Control.Lens ((^?), _Just, at, view)
 import qualified Data.ByteString as B
 import Data.Foldable
 import qualified Data.List.NonEmpty as NE
 
 import Test.QuickCheck
 import Test.Tasty (testGroup, TestTree)
+import Test.Tasty.HUnit (assertBool, assertFailure, testCase)
 import Test.Tasty.QuickCheck (testProperty)
 
 -- internal modules
 
 import Chainweb.BlockHash
 import Chainweb.BlockHeader
+import Chainweb.ChainId
 import Chainweb.Graph
 import Chainweb.Test.Orphans.Internal
 import Chainweb.Test.Orphans.Internal ()
+import Chainweb.Test.TestVersions (fastForkingCpmTestVersion)
 import Chainweb.Utils
 import Chainweb.Utils.Rule
 import Chainweb.Utils.Serialization
 import Chainweb.Version
+import Chainweb.Version.Guards
+    (chainweb223PactInitCacheRebuild, chainweb223PactUpgradeBlock)
 import Chainweb.Version.RecapDevelopment
 import Chainweb.Version.Mainnet
 import Chainweb.Version.Testnet04
+import Chainweb.Version.Testnet06
 
 tests :: TestTree
 tests = testGroup "ChainwebVersion properties"
     [ graphTests
     , headerSizeTests
+    , initCacheRebuildTests
     ]
 
 -- -------------------------------------------------------------------------- --
@@ -146,3 +153,36 @@ prop_workSizeBytes v = property $ do
         return
             $ counterexample ("header: " <> sshow h)
             $ workSizeBytes (_chainwebVersion h) (view blockHeight h) === l
+
+-- -------------------------------------------------------------------------- --
+-- Pact 4 init cache rebuild at the Chainweb223Pact upgrade
+
+-- | The init module cache is rebuilt from the database at the Chainweb223Pact
+-- upgrade block on mainnet01 only (and on the unit-test versions, which have no
+-- recorded history). testnet04, testnet06 and recap-development keep the merge
+-- of Chainweb 3.2.1, even though they have a Chainweb223Pact upgrade block.
+initCacheRebuildTests :: TestTree
+initCacheRebuildTests = testGroup "Pact 4 init cache rebuild at Chainweb223Pact"
+    [ rebuilds "mainnet01" mainnet True
+    , rebuilds "test version (fastForkingCpmTestVersion)"
+        (fastForkingCpmTestVersion singletonChainGraph) True
+    , rebuilds "testnet04" testnet04 False
+    , rebuilds "testnet06" testnet06 False
+    , rebuilds "recap-development" recapDevnet False
+    ]
+  where
+    rebuilds name v expected = testCase name $ do
+        let cid = unsafeChainId 0
+        h <- case v ^? versionForks . at Chainweb223Pact . _Just . atChain cid of
+            Just (ForkAtBlockHeight h) -> return h
+            other -> assertFailure
+                ("Chainweb223Pact is not at a block height on chain 0: " <> show other)
+        assertBool "the version has a Chainweb223Pact upgrade block on chain 0"
+            (chainweb223PactUpgradeBlock v cid h)
+        assertBool
+            ("rebuild at the upgrade block is " <> show expected)
+            (chainweb223PactInitCacheRebuild v cid h == expected)
+        assertBool "no rebuild one block before the upgrade"
+            (not (chainweb223PactInitCacheRebuild v cid (h - 1)))
+        assertBool "no rebuild one block after the upgrade"
+            (not (chainweb223PactInitCacheRebuild v cid (h + 1)))
