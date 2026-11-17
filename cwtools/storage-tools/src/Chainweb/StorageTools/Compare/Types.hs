@@ -35,6 +35,8 @@ module Chainweb.StorageTools.Compare.Types
 
   -- * Verdicts
 , genSkipNoTx
+, genSkipGenesisPreflight
+, genSkipRedrawn
 , AllowRule(..)
 , allowRuleText
 , SkipReason(..)
@@ -282,6 +284,21 @@ data Answer = Answer
 --
 genSkipNoTx :: T.Text
 genSkipNoTx = "no tx within 1000 blocks"
+
+-- | The kind of a target dropped at generation because it is a preflight at
+-- its chain's genesis height (0 on chains 0 to 9 of mainnet, 852,054 on
+-- chains 10 to 19). The pinned parent of the genesis block does not exist,
+-- so the two sides do not run the command at one block (group E of G-A1c).
+-- Such a target is redrawn, and it is never inconclusive, as 'genSkipNoTx'.
+--
+genSkipGenesisPreflight :: T.Text
+genSkipGenesisPreflight = "preflight at the genesis height"
+
+-- | The kinds of targets dropped at generation that are redrawn and are no
+-- part of the budget of inconclusive outcomes.
+--
+genSkipRedrawn :: [T.Text]
+genSkipRedrawn = [genSkipNoTx, genSkipGenesisPreflight]
 
 -- | The allowlist of spec 10.1: the only differences that are allowed, each
 -- with evidence. Tip skew and requests that are not covered are never
