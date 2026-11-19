@@ -13,6 +13,15 @@
 --
 module Chainweb.StorageTools.Test.RangeDb
 ( tests
+
+  -- * Fixtures, for the other test modules
+, Source(..)
+, withSource
+, srcCut
+, silent
+, testVer
+, maxH
+, assertNoDiff
 ) where
 
 import Control.Exception (IOException, try)
@@ -275,7 +284,7 @@ tests = testGroup "Range DB"
         withForkedSource $ \src brA brB -> forM_ [("A", brA), ("B", brB)] $ \(name, br) ->
             withTempRocksDb "storage-tools-range" $ \dst -> do
                 writeIORef (_srcCutOverride src) (Just $ _brCut br)
-                s <- buildRangeDbWith silent (_srcApi src) (srcCut src) (RangeSpec maxH) dst
+                s <- buildRangeDbWith silent defaultPayloadDbConfig (_srcApi src) (srcCut src) (RangeSpec maxH) dst
                 -- everything up to the height, orphans included: 2 chains, maxH + 2 headers
                 assertEqual "headers" (2 * (int maxH + 2)) (_rsHeaders s)
                 assertSubset src dst
@@ -323,7 +332,7 @@ tests = testGroup "Range DB"
             let h = lateStart - 1
                 lateApi = (_srcApi src) { _saVersion = lateVer }
             -- the source cut has both chains, as a source that is above the start of chain 1 does
-            s <- buildRangeDbWith silent lateApi (srcCut src) (RangeSpec h) dst
+            s <- buildRangeDbWith silent defaultPayloadDbConfig lateApi (srcCut src) (RangeSpec h) dst
             -- chain 0 only, heights 0 .. h
             assertEqual "headers" (int h + 1) (_rsHeaders s)
             assertEqual "payloads" (int h + 1) (_rsPayloads s)
@@ -336,7 +345,7 @@ tests = testGroup "Range DB"
 
     , testCase "range DB equals the source on header and payload namespaces" $
         withSource $ \src -> withTempRocksDb "storage-tools-range" $ \dst -> do
-            s <- buildRangeDbWith silent (_srcApi src) (srcCut src) (RangeSpec maxH) dst
+            s <- buildRangeDbWith silent defaultPayloadDbConfig (_srcApi src) (srcCut src) (RangeSpec maxH) dst
             d <- diffRangeDbs (_srcRocks src) dst (allNamespaces testVer)
             assertNoDiff "range DB differs from the source" d
             -- the comparison is not vacuous
@@ -349,7 +358,7 @@ tests = testGroup "Range DB"
 
     , testCase "range DB has one cut with every chain at the max height" $
         withSource $ \src -> withTempRocksDb "storage-tools-range" $ \dst -> do
-            _ <- buildRangeDbWith silent (_srcApi src) (srcCut src) (RangeSpec maxH) dst
+            _ <- buildRangeDbWith silent defaultPayloadDbConfig (_srcApi src) (srcCut src) (RangeSpec maxH) dst
             n <- namespaceSize dst "CutHashes"
             assertEqual "number of cuts" 1 n
             ch <- withTableIterator (unCasify $ cutHashesTable dst) $ \it -> do
@@ -369,7 +378,7 @@ tests = testGroup "Range DB"
         withSourceTo 1_100 $ \src -> withTempRocksDb "storage-tools-range" $ \dst -> do
             top <- probeMaxHeight (_srcApi src) (unsafeChainId 1)
             assertEqual "probeMaxHeight" 1_100 top
-            s <- buildRangeDbWith silent (_srcApi src) (srcCut src) (RangeSpec 1_100) dst
+            s <- buildRangeDbWith silent defaultPayloadDbConfig (_srcApi src) (srcCut src) (RangeSpec 1_100) dst
             assertEqual "headers" (2 * 1_101) (_rsHeaders s)
             assertEqual "payloads" (2 * 1_101) (_rsPayloads s)
             d <- diffRangeDbs (_srcRocks src) dst (allNamespaces testVer)
@@ -380,7 +389,7 @@ tests = testGroup "Range DB"
             let dbPath = dir </> "range-db"
             -- no flush: rangeDbInfo replays the write ahead log
             withRocksDb dbPath modernDefaultOptions $ \dst ->
-                void $ buildRangeDbWith silent (_srcApi src) (srcCut src) (RangeSpec maxH) dst
+                void $ buildRangeDbWith silent defaultPayloadDbConfig (_srcApi src) (srcCut src) (RangeSpec maxH) dst
             -- RocksDB's own info logs aside, the files and their sizes
             let snapshot = do
                     names <- filter (not . isPrefixOf "LOG") <$> listDirectory dbPath
@@ -401,7 +410,7 @@ tests = testGroup "Range DB"
 
     , testCase "corruptEntry makes diffRangeDbs report exactly that key" $
         withSource $ \src -> withTempRocksDb "storage-tools-range" $ \dst -> do
-            _ <- buildRangeDbWith silent (_srcApi src) (srcCut src) (RangeSpec maxH) dst
+            _ <- buildRangeDbWith silent defaultPayloadDbConfig (_srcApi src) (srcCut src) (RangeSpec maxH) dst
             let ns = "BlockPayload2"
             entriesBefore <- readNamespace dst ns
             let n = 3
@@ -430,7 +439,7 @@ tests = testGroup "Range DB"
             assertEqual "targets are distinct" count (S.size $ S.fromList targets)
             assertBool "targets are within the history"
                 (all (\(c, h) -> c `elem` cids && h <= maxH) targets)
-            s <- sampleRangeDb silent (_srcApi src) 1 count dst
+            s <- sampleRangeDb silent defaultPayloadDbConfig (_srcApi src) 1 count dst
             assertEqual "no skipped targets" 0 (_rsSkipped s)
             expected <- payloadKeysOf src targets
             assertEqual "number of payloads in the summary" count (_rsPayloads s)
@@ -459,7 +468,7 @@ tests = testGroup "Range DB"
     , testCase "contiguousRangeDb c a b: payloads of chain c at heights a..b only, equal to the source" $
         withSource $ \src -> withTempRocksDb "storage-tools-contiguous" $ \dst -> do
             let cid = unsafeChainId 1
-            s <- contiguousRangeDb silent (_srcApi src) cid 2 4 dst
+            s <- contiguousRangeDb silent defaultPayloadDbConfig (_srcApi src) cid 2 4 dst
             expected <- payloadKeysOf src [(cid, h) | h <- [2 .. 4]]
             assertEqual "three payloads" 3 (S.size expected)
             assertEqual "payloads in the summary" 3 (_rsPayloads s)
@@ -488,7 +497,7 @@ tests = testGroup "Range DB"
             let dbPath = dir </> "range-db"
                 workPath = dir </> "work"
             withRocksDb dbPath modernDefaultOptions $ \dst -> do
-                _ <- buildRangeDbWith silent (_srcApi src) (srcCut src) (RangeSpec maxH) dst
+                _ <- buildRangeDbWith silent defaultPayloadDbConfig (_srcApi src) (srcCut src) (RangeSpec maxH) dst
                 flushRocksDb dst
             sizes <- measurePayloadSizes testVer dbPath workPath
             let reported = _psNamespaces sizes

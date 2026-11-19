@@ -131,7 +131,7 @@ type TestClientEnv_ = TestClientEnv MockTx RocksDbTable
 
 mkEnv :: RocksDb -> Bool -> [(ChainId, BlockHeaderDb)] -> ResourceT IO TestClientEnv_
 mkEnv rdb tls dbs = do
-    let pdb = newPayloadDb rdb
+    pdb <- liftIO $ newPayloadDbWith <$> testPayloadDbConfig <*> pure rdb
     liftIO $ initializePayloadDb version pdb
     clientEnvWithChainwebTestServer ValidateSpec tls version emptyChainwebServerDbs
         { _chainwebServerBlockHeaderDbs = dbs

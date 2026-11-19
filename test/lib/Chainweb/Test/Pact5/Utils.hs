@@ -58,6 +58,7 @@ import Chainweb.Pact4.Transaction qualified as Pact4
 import Chainweb.Pact5.Transaction qualified as Pact5
 import Chainweb.Payload.PayloadStore
 import Chainweb.Payload.PayloadStore.RocksDB
+import Chainweb.Test.Utils.Storage (testPayloadDbConfig)
 import Chainweb.Storage.Table.RocksDB
 import Chainweb.Utils
 import Chainweb.Version
@@ -97,7 +98,7 @@ import Pact.Core.Names
 withBlockDbs :: ChainwebVersion -> RocksDb -> ResourceT IO (PayloadDb RocksDbTable, WebBlockHeaderDb)
 withBlockDbs v rdb = do
     webBHDb <- liftIO $ initWebBlockHeaderDb rdb v
-    let payloadDb = newPayloadDb rdb
+    payloadDb <- liftIO $ newPayloadDbWith <$> testPayloadDbConfig <*> pure rdb
     liftIO $ initializePayloadDb v payloadDb
     return (payloadDb, webBHDb)
 

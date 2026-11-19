@@ -105,6 +105,7 @@ tests = testGroup "Requests"
     , testCase "--allow-reads-in-local takes a required true|false" allowReadsOption
     , testCase "--oracle-local-timeout takes 1 to 3600 seconds and reaches the run options" oracleLocalTimeoutOption
     , testCase "an oracle lookup is sent once after a status other than 429 or 503, a closed connection or a response timeout; 429, 503, 200 arrive 3 times" lookupNotResent
+    , testCase "an oracle lookup through oracleServiceApi on a reused connection that the server closes without an answer is sent once more and succeeds" lookupResentOnReusedConnection
     , testCase "a custom Pact set fails closed: a cont entry needs a step; a live entry needs a bound, step 0, no scan" customPactSet
     , testCase "a request file holds only the read requests of the 7 classes, pinned ones with {rewindDepth} and a target" requestFileAllowlist
     , testCase "a class whose every compared answer is the same non-2xx is at best PartialPass" sameNon2xxOnly
@@ -915,6 +916,42 @@ lookupNotResent = do
                 n <- readIORef arrivals
                 assertEqual (name <> ": arrivals") expected n
 
+-- | The manager of 'oracleServiceApi' keeps http-client's one resend: a
+-- 'ServiceApi' carries only idempotent reads, never @/local@. The first
+-- lookup leaves its connection in the pool; the server closes it without an
+-- answer to the next request of the second lookup, which http-client sends
+-- again on a new connection. The lookup succeeds, and it arrives once more
+-- than a lookup on a healthy connection (the dropped request and its resend
+-- are two arrivals for one request).
+--
+lookupResentOnReusedConnection :: Assertion
+lookupResentOnReusedConnection = do
+    arrivals <- newIORef (0 :: Int)
+    dropNext <- newIORef False
+    inner <- newIORef (0 :: Int)
+    let app req respond = do
+            atomicModifyIORef' arrivals (\k -> (k + 1, ()))
+            drop' <- atomicModifyIORef' dropNext (\d -> (False, d))
+            if drop'
+                then do
+                    _ <- strictRequestBody req
+                    respond $ responseRaw (\_ _ -> return ()) (responseLBS status500 [] "no raw")
+                else oracleAppWith hasTxs inner req respond
+        measure api = do
+            before <- readIORef arrivals
+            r <- try @SomeException (gen api 1 ClsHeader 10)
+            seen <- readIORef arrivals
+            return (r, seen - before)
+    testWithApplication (return app) $ \port -> do
+        hl <- newHostLimiters 1_000 Nothing
+        api <- oracleServiceApi hl mainnet ("http://127.0.0.1:" <> tshow port)
+        (r1, healthy) <- measure api
+        assertBool ("the first lookup succeeds: " <> show r1) (either (const False) (const True) r1)
+        writeIORef dropNext True
+        (r2, resent) <- measure api
+        assertBool ("the lookup succeeds after the resend: " <> show r2) (either (const False) (const True) r2)
+        assertEqual "the lookup arrives once more than on a healthy connection" (healthy + 1) resent
+
 -- | Loads a Pact set from YAML text through a file, as @--pact-set@ does.
 --
 loadText :: B.ByteString -> IO (Either SomeException PactSet)
@@ -1012,6 +1049,15 @@ requestFileAllowlist = do
         meta = defaultLocalMeta
     refusedFor "a cont at step 1" "step other than 0" $
         withBody (localCommandWith mainnet cid0 meta (LocalCont "some-pact-id" 1) 1)
+    -- P0-C review M1: a rollback at step 0 runs the step's rollback code
+    let contAt0 = localCommandWith mainnet cid0 meta (LocalCont "some-pact-id" 0) 1
+        rollbackFalse = "\\\"rollback\\\":false"
+        (rbBefore, rbAfter) = B8.breakSubstring rollbackFalse contAt0
+        rollbackTrue = rbBefore <> "\\\"rollback\\\":true" <> B8.drop (B8.length rollbackFalse) rbAfter
+    assertBool ("the generator writes rollback false: " <> B8.unpack contAt0) (not (B8.null rbAfter))
+    refusedFor "a cont at step 0 with rollback true" "rollback: true" $ withBody rollbackTrue
+    refusedFor "a cont whose rollback is not a boolean" "not a command" $
+        withBody (rbBefore <> "\\\"rollback\\\":\\\"true\\\"" <> B8.drop (B8.length rollbackFalse) rbAfter)
     refusedFor "txids in an exec" "table scan" $
         withBody (localCommand mainnet cid0 "(txids coin.coin-table 0)" 1)
     refusedFor "keys on a large table in an exec" "coin.allocation-table" $

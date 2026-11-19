@@ -2,6 +2,7 @@
 {-# LANGUAGE DeriveAnyClass #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE ExistentialQuantification #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
@@ -54,6 +55,17 @@ module Chainweb.Payload.PayloadStore
 -- * Payload Database
 , PayloadDb
 , PayloadDb_(..)
+, payloadDbConfig
+
+-- * Payload Store Configuration
+, StoreMerkleTrees(..)
+, PayloadDbConfig(..)
+, defaultPayloadDbConfig
+
+-- * Batch Inserts
+, PayloadInsert(..)
+, PayloadBatch(..)
+
 , CanPayloadCas
 , CanReadablePayloadCas
 , payloadCache
@@ -94,6 +106,8 @@ import Chainweb.Payload
 import Chainweb.Version
 
 import Chainweb.Storage.Table
+import Chainweb.Storage.Table.HashMap (HashMapTable)
+import Chainweb.Storage.Table.RocksDB (RocksDbTable, RocksDbUpdate(..), updateBatch)
 import Chainweb.BlockHeight
 
 -- -------------------------------------------------------------------------- --
@@ -196,7 +210,62 @@ type PayloadDb tbl = PayloadDb_ ChainwebMerkleHashAlgorithm tbl
 data PayloadDb_ a tbl = PayloadDb
     { _transactionDb :: !(TransactionDb_ a tbl)
     , _payloadCache :: !(PayloadCache_ a tbl)
+    , _payloadDbConfig :: !PayloadDbConfig
     }
+
+-- -------------------------------------------------------------------------- --
+-- Payload Store Configuration
+
+-- | Whether 'addPayload' writes the Merkle trees of a payload, the
+-- 'TransactionTree' and the 'OutputTree'.
+--
+-- Nothing reads the stored trees: SPV proofs rebuild them from the stored
+-- payload. The tables stay in the store either way, so that a store without
+-- trees can still be read by a node that writes them, and vice versa.
+--
+data StoreMerkleTrees
+    = StoreMerkleTrees
+    | DoNotStoreMerkleTrees
+    deriving stock (Show, Eq, Ord, Bounded, Enum, Generic)
+
+newtype PayloadDbConfig = PayloadDbConfig
+    { _payloadDbConfigStoreTrees :: StoreMerkleTrees
+    }
+    deriving stock (Show, Eq, Generic)
+
+-- | The configuration of chainweb-node 3.2.1: the Merkle trees are stored.
+--
+defaultPayloadDbConfig :: PayloadDbConfig
+defaultPayloadDbConfig = PayloadDbConfig
+    { _payloadDbConfigStoreTrees = StoreMerkleTrees
+    }
+
+-- -------------------------------------------------------------------------- --
+-- Batch Inserts
+
+-- | An insert into one of the tables of a payload store.
+--
+data PayloadInsert tbl
+    = forall k v . Table (tbl k v) k v => PayloadInsert !(tbl k v) !k !v
+
+-- | Table types that can insert the entries of one payload together.
+--
+class PayloadBatch tbl where
+    payloadInsertBatch :: [PayloadInsert tbl] -> IO ()
+
+-- | One 'updateBatch', which is atomic: either all entries are written or
+-- none is. All tables must belong to the same RocksDB instance; otherwise an
+-- error is raised before anything is written.
+--
+instance PayloadBatch RocksDbTable where
+    payloadInsertBatch = updateBatch . fmap toUpdate
+      where
+        toUpdate (PayloadInsert t k v) = RocksDbInsert t k v
+
+-- | Sequential inserts.
+--
+instance PayloadBatch HashMapTable where
+    payloadInsertBatch = traverse_ $ \(PayloadInsert t k v) -> tableInsert t k v
 
 type HeightedCas c t v = c (t (BlockHeight, CasKeyType v) v) (BlockHeight, CasKeyType v) v
 type CanReadablePayloadCas tbl = CanReadablePayloadCas_ ChainwebMerkleHashAlgorithm tbl
@@ -227,6 +296,7 @@ type CanPayloadCas_ a tbl =
     , CanCas tbl (BlockPayload_ a)
     , HeightedCas Table tbl (BlockPayload_ a)
     , Table (tbl (BlockPayloadHash_ a) BlockHeight) (BlockPayloadHash_ a) BlockHeight
+    , PayloadBatch tbl
     )
 
 -- -------------------------------------------------------------------------- --
@@ -339,6 +409,10 @@ initializePayloadDb v db = traverse_ initForChain $ chainIds v
 
 -- | Insert block payload data in to the database.
 --
+-- All entries are inserted with a single 'payloadInsertBatch', which is
+-- atomic for 'RocksDbTable'. The Merkle trees are inserted only with
+-- 'StoreMerkleTrees'.
+--
 addPayload
     :: MerkleHashAlgorithm a
     => CanPayloadCas_ a tbl
@@ -349,15 +423,21 @@ addPayload
     -> BlockOutputs_ a
     -> OutputTree_ a
     -> IO ()
-addPayload db height txs txTree outs outTree = do
-    tableInsert (_newTransactionDbBlockPayloadsTbl $ _transactionDb db) (height, casKey payload) payload
-    tableInsert (_transactionDbBlockPayloadHeightsTbl $ _transactionDb db) (casKey payload) height
-    tableInsert (_newTransactionDbBlockTransactionsTbl $ _transactionDb db) (height, casKey txs) txs
-    tableInsert (_newBlockOutputsTbl $ _payloadCacheBlockOutputs $ _payloadCache db) (height, casKey outs) outs
-    tableInsert (_newTransactionTreeStoreTbl $ _payloadCacheTransactionTrees $ _payloadCache db) (height, casKey txTree) txTree
-    tableInsert (_newOutputTreeStoreTbl $ _payloadCacheOutputTrees $ _payloadCache db) (height, casKey outTree) outTree
+addPayload db height txs txTree outs outTree = payloadInsertBatch $
+    [ PayloadInsert (_newTransactionDbBlockPayloadsTbl $ _transactionDb db) (height, casKey payload) payload
+    , PayloadInsert (_transactionDbBlockPayloadHeightsTbl $ _transactionDb db) (casKey payload) height
+    , PayloadInsert (_newTransactionDbBlockTransactionsTbl $ _transactionDb db) (height, casKey txs) txs
+    , PayloadInsert (_newBlockOutputsTbl $ _payloadCacheBlockOutputs $ _payloadCache db) (height, casKey outs) outs
+    ]
+    <> trees
   where
     payload = blockPayload txs outs
+    trees = case _payloadDbConfigStoreTrees (_payloadDbConfig db) of
+        StoreMerkleTrees ->
+            [ PayloadInsert (_newTransactionTreeStoreTbl $ _payloadCacheTransactionTrees $ _payloadCache db) (height, casKey txTree) txTree
+            , PayloadInsert (_newOutputTreeStoreTbl $ _payloadCacheOutputTrees $ _payloadCache db) (height, casKey outTree) outTree
+            ]
+        DoNotStoreMerkleTrees -> []
 
 -- | Create block payload data from a sequence of transaction and insert it into
 -- the database.

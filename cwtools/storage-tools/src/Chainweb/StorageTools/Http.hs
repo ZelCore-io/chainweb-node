@@ -18,6 +18,7 @@ module Chainweb.StorageTools.Http
 , newLimiter
 , throttled
 , limiterPermits
+, pausePollMicros
 
   -- * Service API
 , ServiceApi(..)
@@ -159,10 +160,21 @@ data ServiceApi = ServiceApi
 -- | A service API with a TLS capable connection manager. Every request is
 -- throttled by the limiter.
 --
+-- The manager keeps http-client's default @managerRetryableException@: a
+-- request is sent once more on a new connection when a pooled connection
+-- closed before any response. 'ServiceApi' carries only idempotent reads,
+-- never @/local@, so one such library resend is accepted. The manager of
+-- the comparison runner, which does carry @/local@, never resends (see
+-- 'Chainweb.StorageTools.Compare.Run.newCompareManager').
+--
+-- The manager is made with 'HTTP.newManager': 'HTTP.newTlsManagerWith' would
+-- replace @managerRetryableException@ with http-client-tls's own, so the
+-- default is kept by not using it.
+--
 newServiceApi :: T.Text -> ChainwebVersion -> Limiter -> IO ServiceApi
 newServiceApi url v lim = do
     _ <- parseBaseUrl (T.unpack url)
-    mgr <- HTTP.newTlsManagerWith HTTP.tlsManagerSettings
+    mgr <- HTTP.newManager HTTP.tlsManagerSettings
         { HTTP.managerResponseTimeout = HTTP.responseTimeoutMicro 120_000_000
         }
     return $ ServiceApi url v mgr lim

@@ -28,11 +28,13 @@ module Chainweb.Storage.Table.RocksDB.Tuning
   , RocksDbTuning(..)
   , defaultTuning
   , payloadZstdTuning
+  , payloadBlockCacheBytes
   , coldStoreTuning
   , applyTuning
 
   -- * SST inspection
   , sstCompressionInfo
+  , sstFileCompression
   , readSstProperties
 
   -- * Foreign imports
@@ -49,6 +51,7 @@ module Chainweb.Storage.Table.RocksDB.Tuning
   , c_rocksdb_options_set_compression_options
   , c_rocksdb_options_set_compression_options_zstd_max_train_bytes
   , c_rocksdb_options_set_use_direct_reads
+  , c_rocksdb_options_set_max_subcompactions
   , c_rocksdb_options_set_block_based_table_factory
 
   -- ** Block-based table options
@@ -144,6 +147,9 @@ data RocksDbTuning = RocksDbTuning
         -- ^ an LRU block cache of the given capacity, owned by this database
     , _tuningDirectReads :: !Bool
         -- ^ @use_direct_reads@
+    , _tuningMaxSubcompactions :: !(Maybe Int)
+        -- ^ @max_subcompactions@: how many threads a compaction, a manual one
+        -- included, may split into (RocksDB's default is 1)
     }
     deriving (Show, Eq, Generic)
 
@@ -156,10 +162,12 @@ defaultTuning = RocksDbTuning
     , _tuningBloomBitsPerKey = Nothing
     , _tuningBlockCacheBytes = Nothing
     , _tuningDirectReads = False
+    , _tuningMaxSubcompactions = Nothing
     }
 
 -- | zstd level 3 with a 64 KB dictionary trained on 6.4 MB of samples (100x
--- the dictionary), 32 KB blocks (spec 4.2).
+-- the dictionary), 32 KB blocks (spec 4.2), and a block cache of
+-- 'payloadBlockCacheBytes'.
 --
 payloadZstdTuning :: RocksDbTuning
 payloadZstdTuning = defaultTuning
@@ -169,7 +177,20 @@ payloadZstdTuning = defaultTuning
         , _zstdMaxTrainBytes = 6553600
         }
     , _tuningBlockSize = Just 32768
+    , _tuningBlockCacheBytes = Just payloadBlockCacheBytes
     }
+
+-- | The block cache of 'payloadZstdTuning': 256 MiB.
+--
+-- The cache holds uncompressed blocks, so a warm read of a cached block skips
+-- the zstd decompression that otherwise makes zstd reads slower than Snappy
+-- reads. Without it the database uses RocksDB's default cache (32 MB in 8.x),
+-- which 32 KB zstd blocks fill after about a thousand blocks. 256 MiB is a
+-- quarter of the cold store's 1 GB ('coldStoreTuning'): the node opens one
+-- database for all chains, and its other memory use stays the same.
+--
+payloadBlockCacheBytes :: Int
+payloadBlockCacheBytes = 268435456
 
 -- | 'payloadZstdTuning' plus a bloom filter with 10 bits per key and a 1 GB
 -- block cache (spec 4.3, 8.2).
@@ -195,6 +216,8 @@ applyTuning t opts = do
     when needsTableFactory setTableFactory
     when (_tuningDirectReads t) $
         c_rocksdb_options_set_use_direct_reads opts 1
+    forM_ (_tuningMaxSubcompactions t) $ \n ->
+        c_rocksdb_options_set_max_subcompactions opts =<< toCUInt32 "max subcompactions" n
   where
     applyCompression KeepBindingCompression = return ()
     applyCompression (Zstd level dictBytes trainBytes) = do
@@ -254,6 +277,11 @@ toCLevel n
     | toInteger n > toInteger (maxBound :: CInt) = invalid "zstd level" n
     | otherwise = return (fromIntegral n)
 
+toCUInt32 :: String -> Int -> IO Word32
+toCUInt32 what n
+    | n <= 0 || toInteger n > toInteger (maxBound :: Word32) = invalid what n
+    | otherwise = return (fromIntegral n)
+
 toCSize :: String -> Int -> IO CSize
 toCSize what n
     | n <= 0 || toInteger n > toInteger (maxBound :: CSize) = invalid what n
@@ -286,9 +314,20 @@ sstCompressionInfo dir = do
     names <- liveFiles dir
     fmap M.fromList $ forM names $ \name -> do
         let path = dir </> dropWhile (== '/') name
-        props <- readSstProperties path
-        let prop k = M.findWithDefault "" k props
-        return (path, (prop "rocksdb.compression", prop "rocksdb.compression_options"))
+        (,) path <$> sstFileCompression path
+
+-- | The values of the table properties @rocksdb.compression@ and
+-- @rocksdb.compression_options@ of one SST file, as 'sstCompressionInfo'
+-- gives them. Unlike 'sstCompressionInfo', it opens no database, so it can
+-- read a few live files of a database that is open in this process: list them
+-- with the open handle, then read only those. A file that a compaction
+-- deleted meanwhile makes it throw.
+--
+sstFileCompression :: FilePath -> IO (ByteString, ByteString)
+sstFileCompression path = do
+    props <- readSstProperties path
+    let prop k = M.findWithDefault "" k props
+    return (prop "rocksdb.compression", prop "rocksdb.compression_options")
 
 liveFiles :: FilePath -> IO [FilePath]
 liveFiles dir =
@@ -453,6 +492,12 @@ foreign import ccall safe "rocksdb_options_set_compression_options_zstd_max_trai
 foreign import ccall safe "rocksdb_options_set_use_direct_reads"
     c_rocksdb_options_set_use_direct_reads
         :: C.OptionsPtr -> CUChar -> IO ()
+
+-- | @void rocksdb_options_set_max_subcompactions(rocksdb_options_t*,
+-- uint32_t);@
+foreign import ccall safe "rocksdb_options_set_max_subcompactions"
+    c_rocksdb_options_set_max_subcompactions
+        :: C.OptionsPtr -> Word32 -> IO ()
 
 -- | @void rocksdb_options_set_block_based_table_factory(rocksdb_options_t* opt,
 -- rocksdb_block_based_table_options_t* table_options);@
