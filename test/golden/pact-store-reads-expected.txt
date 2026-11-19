@@ -1,0 +1,104 @@
+== Pact 4 tip, parent height 6 (limit 13)
+  read t1 zz: ok: Just (RowData {_rdVersion = RDV1, _rdData = ObjectMap {_objectMap = fromList [(FieldKey "v",RDLiteral (LInteger {_lInteger = 9}))]}})
+  read t1 a: ok: Just (RowData {_rdVersion = RDV1, _rdData = ObjectMap {_objectMap = fromList [(FieldKey "v",RDLiteral (LInteger {_lInteger = 8}))]}})
+  read t1 B: ok: Just (RowData {_rdVersion = RDV1, _rdData = ObjectMap {_objectMap = fromList [(FieldKey "v",RDLiteral (LInteger {_lInteger = 15}))]}})
+  read t1 nokey: ok: Nothing
+  read t2 x: ok: Just (RowData {_rdVersion = RDV1, _rdData = ObjectMap {_objectMap = fromList [(FieldKey "v",RDLiteral (LInteger {_lInteger = 11}))]}})
+  read t2 nokey: ok: Nothing
+  keys t1: ok: ["B","C","a","b","k10","k9","zz"]
+  keys t2: ok: ["x","y"]
+  read keyset ks1: ok: Just (KeySet {_ksKeys = fromList [PublicKeyText {_pubKey = "pk-ks1"}], _ksPredFun = Name (BareName {_bnName = "keys-all", _bnInfo = })})
+  read keyset ks2: ok: Just (KeySet {_ksKeys = fromList [PublicKeyText {_pubKey = "pk-ks2"}], _ksPredFun = Name (BareName {_bnName = "keys-all", _bnInfo = })})
+  read keyset nokeyset: ok: Nothing
+  keys SYS:KeySets: ok: [KeySetName {_ksnName = "ks1", _ksnNamespace = Nothing},KeySetName {_ksnName = "ks2", _ksnNamespace = Nothing}]
+== Pact 4 rewound, parent height 5 (limit 12)
+  read t1 zz: ok: Just (RowData {_rdVersion = RDV1, _rdData = ObjectMap {_objectMap = fromList [(FieldKey "v",RDLiteral (LInteger {_lInteger = 9}))]}})
+  read t1 a: ok: Just (RowData {_rdVersion = RDV1, _rdData = ObjectMap {_objectMap = fromList [(FieldKey "v",RDLiteral (LInteger {_lInteger = 8}))]}})
+  read t1 B: ok: Nothing
+  read t1 nokey: ok: Nothing
+  read t2 x: ok: Just (RowData {_rdVersion = RDV1, _rdData = ObjectMap {_objectMap = fromList [(FieldKey "v",RDLiteral (LInteger {_lInteger = 11}))]}})
+  read t2 nokey: ok: Nothing
+  keys t1: ok: ["C","a","b","k10","k9","zz"]
+  keys t2: ok: ["x","y"]
+  read keyset ks1: ok: Just (KeySet {_ksKeys = fromList [PublicKeyText {_pubKey = "pk-ks1"}], _ksPredFun = Name (BareName {_bnName = "keys-all", _bnInfo = })})
+  read keyset ks2: ok: Just (KeySet {_ksKeys = fromList [PublicKeyText {_pubKey = "pk-ks2"}], _ksPredFun = Name (BareName {_bnName = "keys-all", _bnInfo = })})
+  read keyset nokeyset: ok: Nothing
+  keys SYS:KeySets: ok: [KeySetName {_ksnName = "ks1", _ksnNamespace = Nothing},KeySetName {_ksnName = "ks2", _ksnNamespace = Nothing}]
+== Pact 4 rewound, parent height 2 (limit 7)
+  read t1 zz: ok: Nothing
+  read t1 a: ok: Just (RowData {_rdVersion = RDV1, _rdData = ObjectMap {_objectMap = fromList [(FieldKey "v",RDLiteral (LInteger {_lInteger = 8}))]}})
+  read t1 B: ok: Nothing
+  read t1 nokey: ok: Nothing
+  read t2 x: ok: Just (RowData {_rdVersion = RDV1, _rdData = ObjectMap {_objectMap = fromList [(FieldKey "v",RDLiteral (LInteger {_lInteger = 7}))]}})
+  read t2 nokey: ok: Nothing
+  keys t1: ok: ["a","b","C"]
+  keys t2: ok: ["x"]
+  read keyset ks1: ok: Just (KeySet {_ksKeys = fromList [PublicKeyText {_pubKey = "pk-ks1"}], _ksPredFun = Name (BareName {_bnName = "keys-all", _bnInfo = })})
+  read keyset ks2: ok: Nothing
+  read keyset nokeyset: ok: Nothing
+  keys SYS:KeySets: ok: [KeySetName {_ksnName = "ks1", _ksnNamespace = Nothing}]
+== Pact 4 rewound, parent height 1 (limit 4)
+  read t1 zz: ok: Nothing
+  read t1 a: ok: Just (RowData {_rdVersion = RDV1, _rdData = ObjectMap {_objectMap = fromList [(FieldKey "v",RDLiteral (LInteger {_lInteger = 1}))]}})
+  read t1 B: ok: Nothing
+  read t1 nokey: ok: Nothing
+  read t2 x: error: PactInternalError: callDb (doReadRow): user error (Database error: ErrorError)
+  read t2 nokey: error: PactInternalError: callDb (doReadRow): user error (Database error: ErrorError)
+  keys t1: ok: ["a","b","C"]
+  keys t2: error: PactInternalError: callDb (doKeys): user error (Database error: ErrorError)
+  read keyset ks1: ok: Just (KeySet {_ksKeys = fromList [PublicKeyText {_pubKey = "pk-ks1"}], _ksPredFun = Name (BareName {_bnName = "keys-all", _bnInfo = })})
+  read keyset ks2: ok: Nothing
+  read keyset nokeyset: ok: Nothing
+  keys SYS:KeySets: ok: [KeySetName {_ksnName = "ks1", _ksnNamespace = Nothing}]
+== Pact 5 tip, parent height 6 (limit 13)
+  read t1 zz: ok: Just (RowData {_unRowData = fromList [(Field {_field = "v"},PLiteral (LInteger 9))]})
+  read t1 a: ok: Just (RowData {_unRowData = fromList [(Field {_field = "v"},PLiteral (LInteger 8))]})
+  read t1 B: ok: Just (RowData {_unRowData = fromList [(Field {_field = "v"},PLiteral (LInteger 15))]})
+  read t1 nokey: ok: Nothing
+  read t2 x: ok: Just (RowData {_unRowData = fromList [(Field {_field = "v"},PLiteral (LInteger 11))]})
+  read t2 nokey: ok: Nothing
+  keys t1: ok: ["B","C","a","b","k10","k9","zz"]
+  keys t2: ok: ["x","y"]
+  read keyset ks1: ok: Just (KeySet {_ksKeys = fromList [PublicKeyText {_pubKey = "pk-ks1"}], _ksPredFun = KeysAll})
+  read keyset ks2: ok: Just (KeySet {_ksKeys = fromList [PublicKeyText {_pubKey = "pk-ks2"}], _ksPredFun = KeysAll})
+  read keyset nokeyset: ok: Nothing
+  keys SYS:KeySets: ok: [KeySetName {_keysetName = "ks1", _keysetNs = Nothing},KeySetName {_keysetName = "ks2", _keysetNs = Nothing}]
+== Pact 5 rewound, parent height 5 (limit 12)
+  read t1 zz: ok: Just (RowData {_unRowData = fromList [(Field {_field = "v"},PLiteral (LInteger 9))]})
+  read t1 a: ok: Just (RowData {_unRowData = fromList [(Field {_field = "v"},PLiteral (LInteger 8))]})
+  read t1 B: ok: Nothing
+  read t1 nokey: ok: Nothing
+  read t2 x: ok: Just (RowData {_unRowData = fromList [(Field {_field = "v"},PLiteral (LInteger 11))]})
+  read t2 nokey: ok: Nothing
+  keys t1: ok: ["C","a","b","k10","k9","zz"]
+  keys t2: ok: ["x","y"]
+  read keyset ks1: ok: Just (KeySet {_ksKeys = fromList [PublicKeyText {_pubKey = "pk-ks1"}], _ksPredFun = KeysAll})
+  read keyset ks2: ok: Just (KeySet {_ksKeys = fromList [PublicKeyText {_pubKey = "pk-ks2"}], _ksPredFun = KeysAll})
+  read keyset nokeyset: ok: Nothing
+  keys SYS:KeySets: ok: [KeySetName {_keysetName = "ks1", _keysetNs = Nothing},KeySetName {_keysetName = "ks2", _keysetNs = Nothing}]
+== Pact 5 rewound, parent height 2 (limit 7)
+  read t1 zz: ok: Nothing
+  read t1 a: ok: Just (RowData {_unRowData = fromList [(Field {_field = "v"},PLiteral (LInteger 8))]})
+  read t1 B: ok: Nothing
+  read t1 nokey: ok: Nothing
+  read t2 x: ok: Just (RowData {_unRowData = fromList [(Field {_field = "v"},PLiteral (LInteger 7))]})
+  read t2 nokey: ok: Nothing
+  keys t1: ok: ["C","a","b"]
+  keys t2: ok: ["x"]
+  read keyset ks1: ok: Just (KeySet {_ksKeys = fromList [PublicKeyText {_pubKey = "pk-ks1"}], _ksPredFun = KeysAll})
+  read keyset ks2: ok: Nothing
+  read keyset nokeyset: ok: Nothing
+  keys SYS:KeySets: ok: [KeySetName {_keysetName = "ks1", _keysetNs = Nothing}]
+== Pact 5 rewound, parent height 1 (limit 4)
+  read t1 zz: ok: Nothing
+  read t1 a: ok: Just (RowData {_unRowData = fromList [(Field {_field = "v"},PLiteral (LInteger 1))]})
+  read t1 B: ok: Nothing
+  read t1 nokey: ok: Nothing
+  read t2 x: pact 5 error value: PEExecutionError (DbOpFailure (NoSuchTable (TableName {_tableName = "t2", _tableModuleName = ModuleName {_mnName = "m", _mnNamespace = Nothing}}))) [] 0
+  read t2 nokey: pact 5 error value: PEExecutionError (DbOpFailure (NoSuchTable (TableName {_tableName = "t2", _tableModuleName = ModuleName {_mnName = "m", _mnNamespace = Nothing}}))) [] 0
+  keys t1: ok: ["C","a","b"]
+  keys t2: pact 5 error value: PEExecutionError (DbOpFailure (NoSuchTable (TableName {_tableName = "t2", _tableModuleName = ModuleName {_mnName = "m", _mnNamespace = Nothing}}))) [] 0
+  read keyset ks1: ok: Just (KeySet {_ksKeys = fromList [PublicKeyText {_pubKey = "pk-ks1"}], _ksPredFun = KeysAll})
+  read keyset ks2: ok: Nothing
+  read keyset nokeyset: ok: Nothing
+  keys SYS:KeySets: ok: [KeySetName {_keysetName = "ks1", _keysetNs = Nothing}]

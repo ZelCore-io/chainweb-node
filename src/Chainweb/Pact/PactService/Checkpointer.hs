@@ -252,7 +252,7 @@ restoreAndSave ph blocks = do
 findLatestValidBlockHeader' :: (Logger logger) => PactServiceM logger tbl (Maybe BlockHeader)
 findLatestValidBlockHeader' = do
     cp <- view psCheckpointer
-    latestInCheckpointer <- liftIO (Internal.getLatestBlock cp.cpSql)
+    latestInCheckpointer <- liftIO (Internal.getLatestBlock cp.cpStore)
     case latestInCheckpointer of
         Nothing -> return Nothing
         Just (height, hash) -> Just <$> go height hash
@@ -265,7 +265,7 @@ findLatestValidBlockHeader' = do
                     <> " Failed to lookup hash " <> sshow (height, hash) <> " in block header db."
                     <> " Continuing with parent."
                 cp <- view psCheckpointer
-                liftIO (Internal.getBlockParent cp.cpCwVersion cp.cpChainId cp.cpSql (height, hash)) >>= \case
+                liftIO (Internal.getBlockParent cp.cpCwVersion cp.cpChainId cp.cpStore (height, hash)) >>= \case
                     Nothing -> internalError
                         $ "missing block parent of last hash " <> sshow (height, hash)
                     Just predHash -> go (pred height) predHash
@@ -384,12 +384,12 @@ rewindToIncremental rewindLimit (ParentHeader parent) = do
 getEarliestBlock :: PactServiceM logger tbl (Maybe (BlockHeight, BlockHash))
 getEarliestBlock = do
     cp <- view psCheckpointer
-    liftIO $ Internal.getEarliestBlock cp.cpSql
+    liftIO $ Internal.getEarliestBlock cp.cpStore
 
 getLatestBlock :: PactServiceM logger tbl (Maybe (BlockHeight, BlockHash))
 getLatestBlock = do
     cp <- view psCheckpointer
-    liftIO $ Internal.getLatestBlock cp.cpSql
+    liftIO $ Internal.getLatestBlock cp.cpStore
 
 lookupHistorical
     :: BlockHeader
@@ -398,7 +398,7 @@ lookupHistorical
     -> PactServiceM logger tbl (Historical (Maybe (Pact5.TxLog Pact5.RowData)))
 lookupHistorical blockHeader d k = do
     cp <- view psCheckpointer
-    liftIO $ Internal.lookupHistorical cp.cpSql blockHeader d k
+    liftIO $ Internal.lookupHistorical cp.cpStore blockHeader d k
 
 getBlockHistory
     :: BlockHeader
@@ -406,7 +406,7 @@ getBlockHistory
     -> PactServiceM logger tbl (Historical BlockTxHistory)
 getBlockHistory blockHeader d = do
     cp <- view psCheckpointer
-    liftIO $ Internal.getBlockHistory cp.cpSql blockHeader d
+    liftIO $ Internal.getBlockHistory cp.cpStore blockHeader d
 
 -- -------------------------------------------------------------------------- --
 -- Utils
