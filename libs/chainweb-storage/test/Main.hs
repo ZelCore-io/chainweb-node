@@ -20,6 +20,7 @@ module Main
 where
 
 import Chainweb.Storage.Table (IsCasValue(..), Iterator(..), IterableTable(..), Entry(..), ReadableTable(..), casInsert, casInsertBatch, casDelete, casDeleteBatch, tableInsert, tableInsertBatch, tableDelete, tableLookupBatch)
+import Chainweb.Storage.Test.Tuning (tuningTests)
 import Chainweb.Storage.Table.RocksDB (RocksDb, RocksDbTable, RocksDbUpdate(..), Codec(..), updateBatch, newTable, tableMinKey, tableMaxKey, tableMinValue, tableMaxValue, withTempRocksDb)
 import Control.Concurrent.Async (mapConcurrently_)
 import Control.Exception (Exception)
@@ -299,11 +300,13 @@ assertCasEntries t l = do
 -- Main
 
 main :: IO ()
-main = withTempRocksDb "testDb" $ \db -> do
-    tableTests db "testTable0"
-    mapConcurrently_
-        (\i -> tableTests db $ "testTable" <> B8.pack (show i))
-        ([0 .. 100] :: [Int])
-    tableBatchTests db "testTable"
-    casTests db "testTable"
-    casBatchTests db "testTable"
+main = do
+    withTempRocksDb "testDb" $ \db -> do
+        tableTests db "testTable0"
+        mapConcurrently_
+            (\i -> tableTests db $ "testTable" <> B8.pack (show i))
+            ([0 .. 100] :: [Int])
+        tableBatchTests db "testTable"
+        casTests db "testTable"
+        casBatchTests db "testTable"
+    tuningTests

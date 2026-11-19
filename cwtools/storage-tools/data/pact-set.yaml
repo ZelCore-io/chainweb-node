@@ -1,0 +1,221 @@
+# The Pact code that cw-compare sends with /local (classes local and
+# preflight) and, at Pact 4 heights only, with the history functions (class
+# history). It is embedded into cw-compare at build time; --pact-set FILE
+# replaces it for a run.
+#
+# Each request picks one entry of its class with the seeded random generator
+# and fills the placeholders from the oracle's canonical block at the target
+# height:
+#
+#   {account}  the miner account of the block, or the sender of one of its
+#              transactions (accounts with characters other than letters,
+#              digits and - _ : . are not used)
+#   {txid}     the coinbase txid of the block, or the txid of one of its
+#              transactions
+#   {pactId}   the pact id of a continuation in the block; without one, the
+#              request key of a transaction or the coinbase
+#
+# An entry of kind "cont" sends a continuation of {pactId} at the given step
+# (rollback false, no proof) instead of code; it reads the defpact state.
+# The step is required, and only step 0 is allowed: cw-compare refuses a set
+# with another step, as it refuses a set whose production-eligible entries
+# lack a bound or call a table scan.
+#
+# A read of a user table first makes the table-exists check, on Pact 4 and
+# Pact 5 alike: SELECT tablename FROM VersionedTableCreation WHERE
+# createBlockheight < ? AND lower(tablename) = lower(?). Because of lower(),
+# SQLite cannot seek the table name: it scans the (createBlockheight,
+# tablename) index over every table created below the target height. Its
+# cost grows with the number of tables on the chain, not with the rows of
+# any table; "the table-exists check" below means this scan.
+#
+# All entries are reads. /local never commits. Direct table reads (read,
+# keys, txids, txlog, keylog) succeed at Pact 4 heights only on a node with
+# allowReadsInLocal: true, as the mainnet oracle has; the in-process side
+# must be started with the same setting (--allow-reads-in-local).
+#
+# A preflight command runs as a transaction, not in local mode: local-only
+# natives (describe-module, ...) and direct table reads fail there on every
+# node, so the preflight entries call module code only.
+#
+# The oracle is a live production node, and /local there has no timeout: an
+# unbounded query holds the chain's Pact service and stalls the node. So
+# every entry used against it has a bounded cost on a live mainnet node, on
+# the Pact 4 and the Pact 5 code path, and its "why" records that bound
+# after "Bound:". An entry without a known bound, or whose answer depends on
+# the tip, has "sameSnapshotOnly: true": it is generated only with
+# --same-snapshot (two copies of one snapshot), never against a production
+# node. Gas does not bound reads: Pact charges keys a flat 40,000 and the
+# history functions after the reads.
+#
+# "expect" is the Pact result the entry gives on both sides: success (the
+# default), failure, or either (it depends on the target height). A run
+# passes only if every entry that expects success, in each class of the run,
+# has at least one Same answer with Pact result status success; an entry
+# whose answers are all the same error proves nothing about the data. Below
+# that, the run is at best a partial pass.
+
+entries:
+
+  - name: coin-details
+    classes: [local, preflight]
+    code: '(coin.details "{account}")'
+    why: >-
+      coin details for a sampled account; the read every wallet makes.
+      Bound: one indexed read of one coin.coin-table row (rowkey = ? AND txid < ?
+      ORDER BY txid DESC LIMIT 1 on the UNIQUE (rowkey, txid) index, Pact 4 and
+      Pact 5), the table-exists check (a range scan over the
+      VersionedTableCreation index with lower(), one entry per table of the
+      chain) and the load of the coin module and its interfaces (a few SYS:Modules rows of fixed
+      size); the module code runs under the gas limit of 100,000. Preflight adds
+      buy-gas and redeem-gas on the sender's row: a few more indexed reads and
+      writes of one row each, never committed. The preflight sender is a k:
+      account of the block, whose guard coin's enforce-reserved makes a keyset,
+      so buy-gas evaluates no user guard (below Pact 4 height 3,250,348 a
+      guard runs on free gas)
+
+  - name: coin-table-read
+    classes: [local]
+    code: '(read coin.coin-table "{account}")'
+    why: >-
+      a direct row read of coin.coin-table, the largest table on every chain.
+      Bound: one indexed read of one row (rowkey = ? AND txid < ? ORDER BY txid
+      DESC LIMIT 1 on the UNIQUE (rowkey, txid) index, Pact 4 and Pact 5), O(log
+      n) whatever the table's size, and the table-exists check (a range scan
+      over the VersionedTableCreation index with lower(), one entry per table
+      of the chain)
+
+  - name: coin-get-balance
+    classes: [local, preflight]
+    code: '(coin.get-balance "{account}")'
+    why: >-
+      the same row through module code (a different read path and gas).
+      Bound: as coin-details, one indexed row read plus the coin module; in
+      preflight, buy-gas and redeem-gas on a k: sender as for coin-details
+
+  - name: keys-small-table
+    classes: [local]
+    code: '(keys coin.allocation-table)'
+    why: >-
+      keys on a small table (the genesis allocations); the whole answer is
+      compared, so key order counts. Bound: keys reads every row version of the
+      table (SELECT DISTINCT rowkey ... WHERE txid < ?, Pact 4 and Pact 5). Rows
+      are created in genesis only (create-allocation-account requires the GENESIS
+      capability) and updated at most once (release-allocation enforces not
+      redeemed). Counted from pact/genesis/mainnet/mainnet_allocations*.yaml: at
+      most 843 keys and 1,686 versions (chain 0), at most 64 keys on chains 1-9,
+      no allocation file for chains 10-19; the answer is under 64 KB
+
+  - name: keys-large-table
+    classes: [local]
+    code: '(length (keys marmalade-v2.ledger.ledger))'
+    sameSnapshotOnly: true
+    expect: either
+    why: >-
+      keys on a large table; length keeps the answer small, but every key is
+      read. No bound on a live node: gas does not bound keys (a flat 40,000), the
+      table grows with use (106,828 keys on chain 8 of a mainnet 3.2.1 node, 1.9
+      s; not measured on other chains), and (keys coin.coin-table) on chain 0 ran
+      for minutes and blocked the chain's Pact service. Same-snapshot runs only
+      (ruling C2 on Task 6). Below its creation height both sides give the same
+      error
+
+  - name: describe-module
+    classes: [local]
+    code: '(describe-module "coin")'
+    why: >-
+      module code, hash and governance from SYS:Modules at the target height
+      (the coin module was upgraded several times). Bound: one indexed read of
+      the SYS:Modules row of coin, whose size is fixed per coin upgrade
+
+  - name: describe-table
+    classes: [local]
+    code: '(describe-table coin.coin-table)'
+    why: >-
+      table metadata through the module cache. Bound: the load of the coin
+      module (one SYS:Modules row); no row of the table is read
+
+  - name: table-before-creation
+    classes: [local]
+    code: '(read marmalade-v2.ledger.ledger "{account}")'
+    expect: failure
+    why: >-
+      a table created late in the chain's history: below its creation height
+      both sides must give the same table-missing error, above it the same
+      row-not-found (the ledger's keys are token:account, so a bare account
+      never hits; namespace-before-creation is the hit). Bound: the table-exists
+      check (a range scan over the VersionedTableCreation index with lower(),
+      one entry per table of the chain created below the target height) and at
+      most one indexed row read
+
+  - name: namespace-before-creation
+    classes: [local]
+    code: '(describe-namespace "marmalade-v2")'
+    expect: either
+    why: >-
+      a row created late: the marmalade-v2 namespace in SYS:Namespaces. Below
+      its creation height both sides give the same not-found error, above it the
+      same row (found). Before describe-namespace existed, both give the same
+      unknown-native error. Bound: one indexed read of one SYS:Namespaces row
+
+  - name: ns-registry-read
+    classes: [local]
+    code: '(read ns.registry "free")'
+    why: >-
+      a row of a small, rarely written table of another module. Bound: one
+      indexed row read and the table-exists check (a range scan over the
+      VersionedTableCreation index with lower(), one entry per table of the
+      chain)
+
+  - name: defpact-state
+    classes: [local]
+    kind: cont
+    code: '{pactId}'
+    step: 0
+    expect: failure
+    why: >-
+      the defpact state of a continuation (SYS:Pacts). Step 0 never matches a
+      stored pact (a continuation runs step + 1), so both sides answer with the
+      step-mismatch error that carries the stored state, or with the same
+      not-found or completed error. Bound: one indexed read of the SYS:Pacts row;
+      the step check fails before any code of the defpact runs (Pact 4
+      resumePactExec, Pact 5 resumePact). Step 1 would run step 1 of any
+      defpact in a block, user code without a bound
+
+  - name: txids
+    classes: [history]
+    code: '(txids coin.coin-table {txid})'
+    sameSnapshotOnly: true
+    why: >-
+      txids of the largest table from a txid of the target block on (Pact 4
+      history). No bound and tip-dependent: Pact 4 reads every txid above it up
+      to the live tip (SELECT DISTINCT txid ... WHERE txid > ?, no upper bound),
+      and charges gas after the reads. Same-snapshot runs only (ruling C1)
+
+  - name: txlog
+    classes: [history]
+    code: '(txlog coin.coin-table {txid})'
+    why: >-
+      the write log of the largest table at a txid of the target block (Pact 4
+      history). Bound: the rows written at one txid (SELECT rowkey, rowdata ...
+      WHERE txid = ? on the txid index): the writes of one transaction of the
+      target block, a coinbase or a user transaction under the block gas limit,
+      or one genesis transaction (at most a few thousand rows)
+
+  - name: keylog
+    classes: [history]
+    code: '(keylog coin.coin-table "{account}" {txid})'
+    sameSnapshotOnly: true
+    why: >-
+      the write log of one key from a txid of the target block on (Pact 4
+      history). No bound and tip-dependent: Pact 4 reads the txids above it to
+      the live tip and the log of each one. Same-snapshot runs only (ruling C1)
+
+  - name: txids-small-table
+    classes: [history]
+    code: '(txids coin.allocation-table 0)'
+    sameSnapshotOnly: true
+    why: >-
+      history of a small table from the start; the answer is short and covers
+      the whole table. Tip-dependent: txids has no upper bound, so a release
+      above the target height shows. Same-snapshot runs only (ruling C1)
