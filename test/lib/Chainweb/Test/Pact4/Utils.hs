@@ -200,7 +200,9 @@ import Chainweb.Miner.Pact
 import Chainweb.Pact.Backend.Compaction qualified as Sigma
 import Chainweb.Pact.Backend.PactState qualified as PactState
 import Chainweb.Pact.Backend.PactState (TableDiffable(..), Table(..), PactRow(..))
-import Chainweb.Pact.PactService.Checkpointer.Internal (initCheckpointerResources)
+import Chainweb.Pact.PactService.Checkpointer.Internal (initCheckpointerResourcesWith)
+import Chainweb.Pact.Backend.Store.Node (ChainStorage(..), ChainStore(..))
+import Chainweb.Test.Utils.Storage (acquireTestChainStorage, withTestChainStorage)
 import Chainweb.Pact.Backend.SQLite.DirectV2
 
 import Chainweb.Pact.Backend.Utils hiding (tbl, withSqliteDb)
@@ -670,8 +672,24 @@ testPactCtxSQLite
   -> SQLiteEnv
   -> PactServiceConfig
   -> IO (TestPactCtx logger tbl)
-testPactCtxSQLite logger v cid bhdb pdb sqlenv conf = do
-    cp <- initCheckpointerResources defaultModuleCacheLimit sqlenv DoNotPersistIntraBlockWrites cpLogger v cid
+testPactCtxSQLite logger v cid bhdb pdb sqlenv =
+    testPactCtxStorage logger v cid bhdb pdb sqlenv ChainStoreSqlite
+
+-- | 'testPactCtxSQLite' on a chain's store (split and shadow:
+-- 'Chainweb.Test.Utils.Storage.withTestChainStorage').
+testPactCtxStorage
+  :: forall logger tbl. (Logger logger, CanReadablePayloadCas tbl)
+  => logger
+  -> ChainwebVersion
+  -> Version.ChainId
+  -> BlockHeaderDb
+  -> PayloadDb tbl
+  -> SQLiteEnv
+  -> ChainStore
+  -> PactServiceConfig
+  -> IO (TestPactCtx logger tbl)
+testPactCtxStorage logger v cid bhdb pdb sqlenv store conf = do
+    cp <- initCheckpointerResourcesWith defaultModuleCacheLimit sqlenv store DoNotPersistIntraBlockWrites cpLogger v cid
     let rs = readRewards
     !ctx <- TestPactCtx
       <$!> newMVar (PactServiceState mempty)
@@ -732,26 +750,20 @@ withWebPactExecutionServiceCompaction logger v pactConfig bdb mempools act =
 
     act (srcWeb, srcPacts, targetWeb, targetPacts)
   where
-    mkPacts :: [SQLiteEnv] -> IO (HM.HashMap ChainId (SQLiteEnv, PactExecutionService))
-    mkPacts sqlEnvs = fmap HM.fromList
-      $ traverse (\(dbEnv, cid) -> (cid,) . (dbEnv,) <$> mkTestPactExecutionService dbEnv cid)
-      $ zip sqlEnvs
-      $ toList
-      $ chainIds v
+    mkPacts :: [(ChainId, ChainStorage)] -> IO (HM.HashMap ChainId (SQLiteEnv, PactExecutionService))
+    mkPacts dbs = fmap HM.fromList
+      $ traverse (\(cid, st) -> (cid,) . (_cstSql st,) <$> mkTestPactExecutionService st cid) dbs
 
-    withDbs :: ([SQLiteEnv] -> IO x) -> IO x
-    withDbs f = foldl' (\soFar _ -> withDb soFar) f (chainIds v) []
-
-    withDb :: ([SQLiteEnv] -> IO x) -> [SQLiteEnv] -> IO x
-    withDb g envs = withTempSQLiteConnection chainwebPragmas $ \s -> g (s : envs)
+    withDbs :: ([(ChainId, ChainStorage)] -> IO x) -> IO x
+    withDbs = withTestChainStorages v
 
     mkTestPactExecutionService :: ()
-      => SQLiteEnv
+      => ChainStorage
       -> ChainId
       -> IO PactExecutionService
-    mkTestPactExecutionService sqlenv c = do
+    mkTestPactExecutionService st c = do
         bhdb <- getBlockHeaderDb c bdb
-        ctx <- testPactCtxSQLite logger v c bhdb (_bdbPayloadDb bdb) sqlenv pactConfig
+        ctx <- testPactCtxStorage logger v c bhdb (_bdbPayloadDb bdb) (_cstSql st) (_cstStore st) pactConfig
         return $ PactExecutionService
           { _pactNewBlock = \_ m fill ph ->
               evalPactServiceM_ ctx $ fmap NewBlockInProgress <$> execNewBlock (mempools ^?! atChain c) m fill ph
@@ -787,21 +799,15 @@ withWebPactExecutionService
     -> ((WebPactExecutionService,HM.HashMap ChainId (SQLiteEnv, PactExecutionService)) -> IO a)
     -> IO a
 withWebPactExecutionService logger v pactConfig bdb mempools act =
-  withDbs $ \sqlenvs -> do
+  withTestChainStorages v $ \dbs -> do
     pacts <- fmap HM.fromList
-           $ traverse (\(dbEnv, cid) -> (cid,) . (dbEnv,) <$> mkPact dbEnv cid)
-           $ zip sqlenvs
-           $ toList
-           $ chainIds v
+           $ traverse (\(cid, st) -> (cid,) . (_cstSql st,) <$> mkPact st cid) dbs
     act (mkWebPactExecutionService (snd <$> pacts), pacts)
   where
-    withDbs f = foldl' (\soFar _ -> withDb soFar) f (chainIds v) []
-    withDb g envs = withTempSQLiteConnection chainwebPragmas $ \s -> g (s : envs)
-
-    mkPact :: SQLiteEnv -> ChainId -> IO PactExecutionService
-    mkPact sqlenv c = do
+    mkPact :: ChainStorage -> ChainId -> IO PactExecutionService
+    mkPact st c = do
         bhdb <- getBlockHeaderDb c bdb
-        ctx <- testPactCtxSQLite logger v c bhdb (_bdbPayloadDb bdb) sqlenv pactConfig
+        ctx <- testPactCtxStorage logger v c bhdb (_bdbPayloadDb bdb) (_cstSql st) (_cstStore st) pactConfig
         return $ PactExecutionService
           { _pactNewBlock = \_ m fill ph ->
               evalPactServiceM_ ctx $ fmap NewBlockInProgress <$> execNewBlock (mempools ^?! atChain c) m fill ph
@@ -1026,12 +1032,14 @@ withPactTestBlockDb version cid rdb mempoolIO pactConfig f =
         mempool <- mempoolIO
         bhdb <- getWebBlockHeaderDb (_bdbWebBlockHeaderDb bdb) cid
         let pdb = _bdbPayloadDb bdb
-        sqlEnv <- startSqliteDb cid logger dir False
+        -- sqlite mode: the SQLite file in dir, as before; split and shadow
+        -- (CHAINWEB_TEST_STORAGE): a temporary split or shadow layout
+        (st, release) <- acquireTestChainStorage version cid (startSqliteDb cid logger dir False) stopSqliteDb
         a <- async $ runForever (\_ _ -> return ()) "Chainweb.Test.Pact4.Utils.withPactTestBlockDb" $
-            runPactService version cid logger Nothing reqQ mempool bhdb pdb sqlEnv pactConfig
-        return (a, (sqlEnv,reqQ,bdb))
+            runPactServiceStorage version cid logger Nothing reqQ mempool bhdb pdb st pactConfig
+        return ((a, release), (_cstSql st,reqQ,bdb))
 
-    stopPact (a, (sqlEnv, _, _)) = cancel a >> stopSqliteDb sqlEnv
+    stopPact ((a, release), _) = cancel a >> release
 
     -- Ideally, we should throw 'error' when the logger is invoked, because
     -- error logs should not happen in production and should always be resolved.
@@ -1116,3 +1124,12 @@ throwIfNotPact4 h = case h of
         pure a
     Version.ForSomePactVersion Version.Pact5T _ -> do
         assertFailure "throwIfNotPact4: should be pact4"
+
+-- | The storage of every chain of @v@ ('withTestChainStorage'): in sqlite
+-- mode a temporary SQLite file per chain, as before.
+withTestChainStorages :: ChainwebVersion -> ([(ChainId, ChainStorage)] -> IO x) -> IO x
+withTestChainStorages v f = go (toList (chainIds v)) []
+  where
+    go [] acc = f (reverse acc)
+    go (c : cs) acc = withTestChainStorage v c (withTempSQLiteConnection chainwebPragmas) $ \st ->
+        go cs ((c, st) : acc)

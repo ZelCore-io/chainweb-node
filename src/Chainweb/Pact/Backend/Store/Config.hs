@@ -247,7 +247,7 @@ pPactHistoryConfig = id
     <*< phColdBlockCacheBytes .:: option (positiveReader "--pact-cold-block-cache")
         % long "pact-cold-block-cache"
         <> metavar "BYTES"
-        <> help "With split or shadow: the block cache of the cold store."
+        <> help "With split or shadow: the block cache of the cold store, in bytes (default 1 GiB, 1073741824)."
     <*< phTrimDutyCycle .:: option dutyCycleReader
         % long "pact-trim-duty-cycle"
         <> metavar "X"
@@ -295,7 +295,7 @@ validatePactHistoryVersion v s
     | allowed = Right ()
     | otherwise = Left $ "--pact-history-store " <> pactHistoryStoreToText s
         <> " is refused on chainweb version " <> getChainwebVersionName (_versionName v)
-        <> ": split and shadow are allowed on mainnet01 only. Use --pact-history-store sqlite."
+        <> ": split and shadow are allowed on mainnet01, development and the test versions only. Use --pact-history-store sqlite."
   where
     code = _versionCode v
     allowed = code == _versionCode mainnet

@@ -149,6 +149,8 @@ import qualified Chainweb.Pact.PactService.Checkpointer as Checkpointer
 import Chainweb.Pact.PactService.Checkpointer (SomeBlockM(..))
 import Chainweb.Pact.Backend.Store.Node (ChainStorage(..), sqliteChainStorage, withChainFreezer)
 import Chainweb.Pact.Backend.Store.Split (SplitStoreError)
+import qualified Chainweb.Pact.Backend.Store.SQLite as StoreSQLite
+import Chainweb.Pact.Backend.Store.Types (PactStore(_psGetLatestBlock))
 import Chainweb.Pact.Service.PactQueue (pactQueueBlockWaiting)
 import Control.Monad.Cont (evalContT)
 import qualified Data.List.NonEmpty as NonEmpty
@@ -228,7 +230,20 @@ withPactServiceStorage
     -> PactServiceM logger tbl a
     -> IO (T2 a PactServiceState)
 withPactServiceStorage ver cid chainwebLogger txFailuresCounter bhDb pdb storage blockWaiting config act = do
-    Checkpointer.withCheckpointerResources checkpointerLogger (_pactModuleCacheLimit config) (_cstSql storage) (_cstStore storage) (_pactPersistIntraBlockWrites config) ver cid $ \checkpointer -> withChainFreezer storage (\io -> withMVar (cpModuleCacheVar checkpointer) (const io)) blockWaiting latestBlockTime $ do
+    Checkpointer.withCheckpointerResources checkpointerLogger (_pactModuleCacheLimit config) (_cstSql storage) (_cstStore storage) (_pactPersistIntraBlockWrites config) ver cid $ \checkpointer -> do
+      let underLock :: forall x. IO x -> IO x
+          underLock io = withMVar (cpModuleCacheVar checkpointer) (const io)
+          -- The creation time of the latest committed block, which the trim
+          -- gate compares with the wall clock to tell catching up from the
+          -- tip. Not the newest header: during a Pact replay against a
+          -- current block header database the newest header is recent while
+          -- the committed blocks lag behind.
+          latestBlockTime = do
+              tip <- underLock (_psGetLatestBlock (StoreSQLite.sqlitePactStore (_cstSql storage)))
+              case tip of
+                  Nothing -> return Nothing
+                  Just (_, h) -> fmap (_bct . view blockCreationTime) <$> lookup bhDb h
+      withChainFreezer storage underLock blockWaiting latestBlockTime $ \startFreezer -> do
         let !rs = readRewards
         let !pse = PactServiceEnv
                     { _psMempoolAccess = Nothing
@@ -280,9 +295,12 @@ withPactServiceStorage ver cid chainwebLogger txFailuresCounter bhDb pdb storage
             -- avaliable header in the block header database.
             --
             exitOnRewindBelowFrontier $ Checkpointer.exitOnRewindLimitExceeded $ initializeLatestBlock (_pactUnlimitedInitialRewind config)
+            -- the freezer starts only after the startup rewind: otherwise it
+            -- could advance the frontier from the stale SQLite tip above the
+            -- rewind target, and the rewind would be refused
+            liftIO startFreezer
             act
   where
-    latestBlockTime = Just . _bct . view blockCreationTime <$> maxEntry bhDb
     pactServiceLogger = setComponent "pact" chainwebLogger
     checkpointerLogger = addLabel ("sub-component", "checkpointer") pactServiceLogger
     gasLogger = addLabel ("transaction", "GasLogs") pactServiceLogger

@@ -2,6 +2,7 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 -- |
 -- Module: Chainweb.Pact.Backend.Store.Node
@@ -357,13 +358,24 @@ withChainStorage logger st cid reset k = do
         , _cfLogger = forwardingLogger logger
         }
 
+    -- A failed write is logged at Error and not rethrown: the chain runs on
+    -- the legacy store alone either way, but the next start compares it
+    -- again.
     persistBroken f = do
         let tmp = f <.> "tmp"
-        BL.writeFile tmp $ A.encode $ object
-            [ "chain" .= chainIdToText cid
-            , "message" .= ("the split side of this chain broke in shadow mode; remove sqlite-split and pactCold to compare again" :: Text)
-            ]
-        renameFile tmp f
+        r <- try $ do
+            BL.writeFile tmp $ A.encode $ object
+                [ "chain" .= chainIdToText cid
+                , "message" .= ("the split side of this chain broke in shadow mode; remove sqlite-split and pactCold to compare again" :: Text)
+                ]
+            renameFile tmp f
+        case r of
+            Right () -> return ()
+            Left (e :: IOException) -> logg Error $ T.unwords
+                [ "Shadow mode: could not write the broken flag of chain", chainIdToText cid
+                , "to", T.pack f <> ":", T.pack (displayException e) <> "."
+                , "The chain runs on the legacy store alone; the next start compares it again."
+                ]
 
 -- | The start checks of a chain in split mode.
 splitStartChecks :: ChainId -> SQLiteEnv -> ColdChain -> IO ()
@@ -394,9 +406,13 @@ splitStartChecks cid hot cc = do
         Just (h, b) -> "height " <> sshow h <> ", block " <> sshow b
 
 -- | Runs a chain's freezer ('runFreezer') next to an action, in split and
--- shadow when '_phFreezerEnabled'; otherwise just the action. The freezer
--- stops when the action ends. Start it only after the checkpointer exists
--- ('withCheckpointerResources').
+-- shadow when '_phFreezerEnabled'; otherwise just the action. Use it only
+-- after the checkpointer exists ('withCheckpointerResources'). The freezer
+-- does nothing until the action runs the start action it is given: the Pact
+-- service runs it after the startup rewind ('initializeLatestBlock'), so that
+-- the freezer cannot advance the frontier from the stale SQLite tip above the
+-- rewind target. The freezer stops when the action ends; starting it twice is
+-- harmless.
 --
 withChainFreezer
     :: ChainStorage
@@ -405,9 +421,9 @@ withChainFreezer
     -> STM Bool
         -- ^ a block waits for validation ('pactQueueBlockWaiting')
     -> IO (Maybe (Time Micros))
-        -- ^ the creation time of the latest block of the block header
-        -- database
-    -> IO b
+        -- ^ the creation time of the latest committed block
+    -> (IO () -> IO b)
+        -- ^ the action, given the start action of the freezer
     -> IO b
 withChainFreezer cst underLock blockWaiting latestTime inner = case _cstFreezer cst of
     Just cf | _phFreezerEnabled (_pstHistory (_cfStorage cf)) -> do
@@ -439,10 +455,12 @@ withChainFreezer cst underLock blockWaiting latestTime inner = case _cstFreezer 
                 , _feHooks = noHooks
                 , _feStats = stats
                 }
-        withAsync (runFreezer env (_pstFreezerSem st)) $ \a -> do
+        started <- newEmptyMVar
+        withAsync (readMVar started >> runFreezer env (_pstFreezerSem st)) $ \a -> do
             writeIORef (_cstDrain cst) (Just (cancel a >> drainFreezer env))
-            inner `finally` writeIORef (_cstDrain cst) Nothing
-    _ -> inner
+            inner (void $ tryPutMVar started ())
+                `finally` writeIORef (_cstDrain cst) Nothing
+    _ -> inner (return ())
 
 -- | Stops the chain's freezer and runs it to the end (@--only-sync-pact@).
 -- 'False' when no freezer runs.

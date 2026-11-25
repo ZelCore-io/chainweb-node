@@ -15,17 +15,19 @@ module Chainweb.Test.Pact.Store.SplitNode
 ( tests
 ) where
 
+import Control.Concurrent (threadDelay)
 import Control.Concurrent.MVar
 import Control.Exception
 import Control.Lens ((&), (.~))
 import Control.Monad
 
 import Data.IORef
+import System.LogLevel (LogLevel(..))
 import Data.Maybe (isJust, isNothing)
 import qualified Data.Text as T
 
 import System.Directory
-import System.FilePath ((</>))
+import System.FilePath ((<.>), (</>))
 import System.IO.Temp (withSystemTempDirectory)
 
 import Test.Tasty
@@ -34,6 +36,7 @@ import Test.Tasty.HUnit
 -- internal modules
 
 import Chainweb.Backup
+import Chainweb.Logger (genericLogger)
 import Chainweb.BlockHeader.Internal
 import Chainweb.Pact.Backend.Store.Cold
 import Chainweb.Pact.Backend.Store.Config
@@ -59,6 +62,8 @@ tests = testGroup "Split store node"
     , testCase "backup API and --reset-chain-databases refused in split and shadow" refusalsTest
     , testCase "only-sync-pact in split: freezers drained before Replayed" drainTest
     , testCase "shadow: a broken chain is persisted; a restart runs it on legacy alone, without a freezer" shadowBrokenTest
+    , testCase "shadow: a failed write of the broken flag is logged at Error" shadowBrokenWriteFailsTest
+    , testCase "restart at freeze depth 3: the freezer waits for the startup rewind, so a recent rewind is not refused" freezerAfterRewindTest
     ]
 
 v :: ChainwebVersion
@@ -80,7 +85,7 @@ isStore = \case
 withChain :: PactStorage -> (ChainStorage -> IO a) -> IO a
 withChain st k = withChainStorage quietLogger st cid False $ \cst -> do
     lock <- newMVar ()
-    withChainFreezer cst (\io -> withMVar lock (const io)) (return False) (return Nothing) (k cst)
+    withChainFreezer cst (\io -> withMVar lock (const io)) (return False) (return Nothing) (\start -> start >> k cst)
 
 defaultModeTest :: Assertion
 defaultModeTest = withSystemTempDirectory "split-node" $ \tmp -> do
@@ -223,3 +228,47 @@ shadowBrokenTest = withFixture $ \root _twin -> do
             _psGetLatestBlock (chainStorePactStore (_cstSql cst) (_cstStore cst))
                 >>= (@?= Just (fromIntegral tipHeight, mkHash tipHeight 0))
         _ -> assertFailure "expected shadow"
+
+-- | The broken flag cannot be written (a directory is in the way of its
+-- temporary file): the write is logged at Error and the chain goes on.
+shadowBrokenWriteFailsTest :: Assertion
+shadowBrokenWriteFailsTest = withFixture $ \root _twin -> do
+    let cfg = testConfig { _phStore = HistoryShadow }
+        brokenFile = root </> splitDirName </> shadowBrokenFileName cid
+    logs <- newIORef []
+    let logger = genericLogger Warn (\t -> modifyIORef' logs (t :))
+    withPactStorage quietLogger v cfg root False $ \st ->
+        withChainStorage logger st cid False $ \cst -> case _cstStore cst of
+            ChainStoreShadow env -> do
+                createDirectoryIfMissing True (brokenFile <.> "tmp")
+                _shOnBroken env
+                doesFileExist brokenFile >>= assertBool "not persisted" . not
+                ls <- readIORef logs
+                assertBool ("logged at Error: " <> show ls) $ any
+                    (\t -> "could not write the broken flag" `T.isInfixOf` t && "[Error]" `T.isInfixOf` t) ls
+            _ -> assertFailure "expected shadow"
+
+-- | A restart at freeze depth 3 whose startup rewind goes back to a recent
+-- block (height 6 of tip 12). A freezer that ran from the stale SQLite tip
+-- before the rewind would advance the frontier to height 8 and the rewind
+-- would be refused ('RewindBelowFrontier'). The freezer waits for the start
+-- action, which the Pact service runs after 'initializeLatestBlock'.
+freezerAfterRewindTest :: Assertion
+freezerAfterRewindTest = withFixture $ \root _twin -> do
+    let cfg = testConfig { _phFreezeDepth = 3 }
+    withPactStorage quietLogger v cfg root False $ \st ->
+        withChainStorage quietLogger st { _pstFreezerPollMicros = 10_000 } cid False $ \cst -> do
+            lock <- newMVar ()
+            Just cf <- return (_cstFreezer cst)
+            withChainFreezer cst (\io -> withMVar lock (const io)) (return False) (return Nothing) $ \start -> do
+                -- the startup: the freezer would have taken many polls by now
+                threadDelay 500_000
+                _ccWritten (_cfCold cf) >>= (@?= Nothing)
+                let store = chainStorePactStore (_cstSql cst) (_cstStore cst)
+                void $ _psRewindDbTo store (Just (parentAt 6))
+                _psGetLatestBlock store >>= (@?= Just (6, mkHash 6 0))
+                -- after the rewind the freezer runs, below the new tip
+                start
+                drainChainFreezer cst >>= (@?= True)
+                _ccVerified (_cfCold cf) >>= \f -> assertBool ("frontier below the tip: " <> show f)
+                    (maybe False ((<= 3) . _frHeight) f)

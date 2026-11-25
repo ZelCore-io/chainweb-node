@@ -19,7 +19,8 @@ module Chainweb.Test.Pact5.TransactionExecTest (tests) where
 import Chainweb.BlockHeader
 import Chainweb.Graph (singletonChainGraph, petersenChainGraph)
 import Chainweb.Miner.Pact (Miner(..), MinerId(..), MinerKeys(..), noMiner)
-import Chainweb.Pact.PactService (initialPayloadState, withPactService)
+import Chainweb.Pact.PactService (initialPayloadState, withPactServiceStorage)
+import Chainweb.Test.Utils.Storage (testChainStorageResource)
 import Chainweb.Pact.PactService.Checkpointer (readFrom, SomeBlockM(..))
 import Chainweb.Pact.Types
 import Chainweb.Pact5.Transaction
@@ -107,12 +108,12 @@ tests baseRdb = testGroup "Pact5 TransactionExecTest"
 -- PactServiceTest or RemotePactTest.
 readFromAfterGenesis :: ChainwebVersion -> RocksDb -> PactBlockM GenericLogger RocksDbTable a -> IO a
 readFromAfterGenesis ver rdb act = runResourceT $ do
-    sql <- withTempSQLiteResource
+    storage <- testChainStorageResource ver cid withTempSQLiteResource
     tdb <- mkTestBlockDb ver rdb
     liftIO $ do
         bhdb <- getWebBlockHeaderDb (_bdbWebBlockHeaderDb tdb) cid
         logger <- testLogger
-        T2 a _finalPactState <- withPactService ver cid logger Nothing bhdb (_bdbPayloadDb tdb) sql testPactServiceConfig $ do
+        T2 a _finalPactState <- withPactServiceStorage ver cid logger Nothing bhdb (_bdbPayloadDb tdb) storage (return False) testPactServiceConfig $ do
             initialPayloadState ver cid
             throwIfNoHistory =<<
                 readFrom

@@ -47,6 +47,7 @@ import Chainweb.Mempool.InMem
 import Chainweb.Mempool.Mempool (InsertType (..), LookupResult(..), MempoolBackend (..), TransactionHash(..))
 --import Chainweb.Pact.Backend.RelationalCheckpointer
 import Chainweb.Pact.PactService.Checkpointer.Internal (initCheckpointerResources)
+import Chainweb.Test.Utils.Storage (testChainStorageResource)
 import Chainweb.Pact.Backend.Types (Checkpointer, IntraBlockPersistence(..), SQLiteEnv)
 import Chainweb.Pact.Backend.Utils (openSQLiteConnection, closeSQLiteConnection, chainwebPragmas)
 import Chainweb.Pact.PactService
@@ -143,13 +144,15 @@ withRunPactService :: (Logger logger)
     -> PactServiceConfig
     -> ResourceT IO ()
 withRunPactService logger v cid pactQueue mempool webBHDb payloadDb pactServiceConfig = do
-    sqlite <- withTempSQLiteResource
+    -- sqlite mode: a temporary SQLite file, as before; split and shadow
+    -- (CHAINWEB_TEST_STORAGE): a temporary split or shadow layout
+    storage <- testChainStorageResource v cid withTempSQLiteResource
     blockHeaderDb <- liftIO $ getWebBlockHeaderDb webBHDb cid
     mempoolConsensus <- liftIO $ mkMempoolConsensus mempool blockHeaderDb (Just payloadDb)
     let mempoolAccess = pactMemPoolAccess mempoolConsensus logger
 
     void $ Resource.allocate
-        (forkIO $ runPactService v cid logger Nothing pactQueue mempoolAccess blockHeaderDb payloadDb sqlite pactServiceConfig) --bhdb (_bdbPayloadDb tdb) sqlite pactServiceConfig)
+        (forkIO $ runPactServiceStorage v cid logger Nothing pactQueue mempoolAccess blockHeaderDb payloadDb storage pactServiceConfig)
         (\tid -> throwTo tid ThreadKilled)
 
 -- | Insert a 'Pact5.Transaction' into the mempool. The mempool currently operates by default on

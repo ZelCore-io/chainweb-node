@@ -36,6 +36,7 @@ import Chainweb.Mempool.Mempool (InsertType (..), MempoolBackend (..))
 import Chainweb.Miner.Pact
 import Chainweb.Pact.PactService
 import Chainweb.Pact.PactService.Pact4.ExecBlock ()
+import Chainweb.Test.Utils.Storage (testChainStorageResource)
 import Chainweb.Pact.Service.BlockValidation
 import Chainweb.Pact.Service.PactInProcApi
 import Chainweb.Pact.Service.PactQueue
@@ -103,7 +104,9 @@ mkFixtureWith pactServiceConfig v' baseRdb = do
 
     tdb <- mkTestBlockDb v' baseRdb
     perChain <- iforM (HashSet.toMap (chainIds v')) $ \chain () -> do
-        sqlite <- withInMemSQLiteResource
+        -- sqlite mode: in memory, as before; split and shadow
+        -- (CHAINWEB_TEST_STORAGE): a temporary split or shadow layout
+        storage <- testChainStorageResource v' chain withInMemSQLiteResource
         bhdb <- liftIO $ getWebBlockHeaderDb (_bdbWebBlockHeaderDb tdb) chain
         pactQueue <- liftIO $ newPactQueue 2_000
         pactExecutionServiceVar <- liftIO $ newMVar (mkPactExecutionService pactQueue)
@@ -114,7 +117,7 @@ mkFixtureWith pactServiceConfig v' baseRdb = do
         mempoolConsensus <- liftIO $ mkMempoolConsensus mempool bhdb (Just (_bdbPayloadDb tdb))
         let mempoolAccess = pactMemPoolAccess mempoolConsensus logger
         _ <- Resource.allocate
-            (forkIO $ runPactService v' chain logger Nothing pactQueue mempoolAccess bhdb (_bdbPayloadDb tdb) sqlite pactServiceConfig)
+            (forkIO $ runPactServiceStorage v' chain logger Nothing pactQueue mempoolAccess bhdb (_bdbPayloadDb tdb) storage pactServiceConfig)
             (\tid -> throwTo tid ThreadKilled)
         return (mempool, pactQueue)
     let fixture = Fixture

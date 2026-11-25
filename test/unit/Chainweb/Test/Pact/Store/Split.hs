@@ -354,7 +354,20 @@ straddleTest = withSplit $ \s0 -> do
     n <- coldReads s
     assertBool "the cold store was read" (n > 0)
 
-data StepAt = StepBeforeHot | StepAfterHot
+-- | Where the probes' freezer step runs, inside the hot statement wrapper.
+--
+-- * 'StepAfterHot' is the race of the current order: the hot rows come from
+--   the state before the step, and the frontier read after the hot statement
+--   is the one after it.
+-- * 'SteadyStepBeforeHot' is a steady-state check for the current order: the
+--   step has finished before the hot statement and the frontier read. It is
+--   also the case that catches a frontier read before the hot statement (the
+--   order before 0e6549c2a): that read sees the old frontier, the step then
+--   trims, and the hot statement misses the trimmed rows. A mutation check
+--   (2026-11-25, Task 27 fix round 1) put that order back in @keyRead@: n2
+--   failed in 'SteadyStepBeforeHot' (readNewest, readPrev, readHistorical of
+--   bob and SYS:Pacts at 65 answered Nothing) and passed in 'StepAfterHot'.
+data StepAt = SteadyStepBeforeHot | StepAfterHot
     deriving Show
 
 -- | Reads outside @cpModuleCacheVar@ (@lookupHistorical@, @getBlockHistory@)
@@ -366,7 +379,7 @@ data StepAt = StepBeforeHot | StepAfterHot
 -- @[30, 60)@ which the probes ask about. Every probe must equal the twin.
 trimRaceTest :: Assertion
 trimRaceTest = do
-    bad <- fmap concat $ forM [(w, p) | w <- [StepBeforeHot, StepAfterHot], p <- probes] $ \(when', (what0, op)) -> withFixture $ \root twin -> withPlainNode root $ \n -> do
+    bad <- fmap concat $ forM [(w, p) | w <- [SteadyStepBeforeHot, StepAfterHot], p <- probes] $ \(when', (what0, op)) -> withFixture $ \root twin -> withPlainNode root $ \n -> do
         let what = show when' <> ": " <> what0
             first = frontierAt 2
             next = frontierAt 5
@@ -379,7 +392,7 @@ trimRaceTest = do
                 a <- atomicModifyIORef' armed (\x -> (False, x))
                 when a $ freezeOnce (_nEnv n) >>= expectFroze next
             thenStep act = case when' of
-                StepBeforeHot -> fire *> act
+                SteadyStepBeforeHot -> fire *> act
                 StepAfterHot -> act <* fire
             hot = sqlitePactStore (_nPact n)
             hot' = hot
@@ -439,7 +452,7 @@ trimRaceTest = do
 -- twin.
 trimResumeRaceTest :: Assertion
 trimResumeRaceTest = do
-    bad <- fmap concat $ forM [(w, p) | w <- [StepBeforeHot, StepAfterHot], p <- probes] $ \(when', (what0, op)) -> withFixture $ \root twin -> do
+    bad <- fmap concat $ forM [(w, p) | w <- [SteadyStepBeforeHot, StepAfterHot], p <- probes] $ \(when', (what0, op)) -> withFixture $ \root twin -> do
         crash <- newIORef False
         let what = show when' <> ": " <> what0
             hooks _ = noHooks
@@ -463,7 +476,7 @@ trimResumeRaceTest = do
                     a <- atomicModifyIORef' armed (\x -> (False, x))
                     when a $ void $ runToEnd (_nEnv n)
                 thenStep act = case when' of
-                    StepBeforeHot -> fire *> act
+                    SteadyStepBeforeHot -> fire *> act
                     StepAfterHot -> act <* fire
                 hot = sqlitePactStore (_nPact n)
                 hot' = hot
