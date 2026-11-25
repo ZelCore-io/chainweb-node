@@ -262,7 +262,7 @@ withRocksDb_ path = bracket (openRocksDb_ path) closeRocksDb_
   where
     openRocksDb_ :: FilePath -> IO RocksDb
     openRocksDb_ p = do
-        db <- RocksDb <$> R.open p opts <*> mempty
+        db <- RocksDb <$> R.open p opts <*> mempty <*> pure Nothing
         initializeRocksDb_ db
         return db
 
