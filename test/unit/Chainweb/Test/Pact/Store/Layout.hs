@@ -18,6 +18,7 @@ import Control.Monad
 
 import Data.Aeson (eitherDecodeFileStrict)
 import Data.IORef
+import qualified Data.Map.Strict as M
 import qualified Data.Text as T
 import Database.SQLite3.Direct (Utf8(..))
 
@@ -220,10 +221,11 @@ ensureSplitDirTest = withRoot $ \r -> withLogger $ \logger _ -> do
     _smFirstTrimHeight m @?= Just 1234
     doesFileExist (markerIn (splitDir r) <.> "tmp") >>= assertBool "temporary marker left" . not
 
-    -- the second call changes nothing, even with another chain
+    -- the second call changes nothing but the trim frontier it records,
+    -- even with another chain
     ensureSplitDir logger l (unsafeChainId 5) 99
     m' <- eitherDecodeFileStrict (markerIn (splitDir r)) >>= either fail return
-    m' @?= m
+    m' @?= m { _smTrimFrontiers = M.fromList [("3", 1234), ("5", 99)] }
     currentSqliteDir l >>= (@?= splitDir r)
 
     -- a restart in split mode sees state C; sqlite mode refuses it
@@ -438,8 +440,10 @@ shadowMarkerTest = withLogger $ \logger _ -> withRoot $ \r -> do
     _smFirstTrimHeight m1 @?= Just 77
     doesFileExist (markerIn (splitDir r) <.> "tmp") >>= assertBool "temporary marker left" . not
     ensureSplitDir logger l (unsafeChainId 5) 99
-    readMarkerFile (splitDir r) >>= (@?= m1)
-    -- a restart keeps the recorded trim
+    let frontiers fs = m1 { _smTrimFrontiers = M.fromList fs }
+    readMarkerFile (splitDir r) >>= (@?= frontiers [("4", 77), ("5", 99)])
+    -- a restart keeps the recorded trim; a lower trim frontier is not recorded
     l2 <- resolvePactLayout logger HistoryShadow False r
     ensureSplitDir logger l2 (unsafeChainId 6) 123
-    readMarkerFile (splitDir r) >>= (@?= m1)
+    ensureSplitDir logger l2 (unsafeChainId 4) 50
+    readMarkerFile (splitDir r) >>= (@?= frontiers [("4", 77), ("5", 99), ("6", 123)])

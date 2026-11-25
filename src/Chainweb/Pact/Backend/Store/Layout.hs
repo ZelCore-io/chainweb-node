@@ -24,6 +24,12 @@
 -- it, because trimmed files are not legacy files: @SYS:Pacts@ keeps no
 -- anchors, so continuations of old defpacts would fail.
 --
+-- The marker also binds @sqlite-split@ to its cold store: it holds the
+-- store id that the cold store holds too, and per chain the frontier of the
+-- newest trim, which the cold store's verified frontier must reach. The start
+-- refuses a pair that does not belong together
+-- ('Chainweb.Pact.Backend.Store.Node.bindSplitStore', @splitStartChecks@).
+--
 -- The rename is safe for open connections: they keep their file descriptors,
 -- SQLite's locks are on the inode, and no new connection opens while the
 -- rename runs ('withSqliteDirLock').
@@ -55,6 +61,8 @@ module Chainweb.Pact.Backend.Store.Layout
 , splitMarkerVersion
 , readSplitMarker
 , writeSplitMarker
+, writeMarkerFile
+, markerTrimFrontier
 
   -- * Guard of the sqlite-only tools
 , NonSqliteLayout(..)
@@ -73,6 +81,7 @@ import Control.Monad
 import Data.Aeson
 import qualified Data.ByteString.Lazy as BL
 import Data.IORef
+import qualified Data.Map.Strict as M
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Time.Clock (getCurrentTime)
@@ -123,6 +132,15 @@ data SplitMarker = SplitMarker
     , _smFirstTrimHeight :: !(Maybe BlockHeight)
     , _smCreated :: !Text
         -- ^ ISO 8601
+    , _smStoreId :: !(Maybe Text)
+        -- ^ the id that binds this directory to its cold store, which holds
+        -- the same id ('Chainweb.Pact.Backend.Store.Node.bindSplitStore').
+        -- 'Nothing' in a marker written before store ids existed.
+    , _smTrimFrontiers :: !(M.Map Text BlockHeight)
+        -- ^ per chain, the frontier height of the newest trim that started:
+        -- the SQLite files hold no complete history below it, so the cold
+        -- store's verified frontier must be at or above it. Written before
+        -- the trim deletes anything ('ensureSplitDir').
     } deriving (Show, Eq, Generic)
 
 splitMarkerFormat :: Text
@@ -138,6 +156,8 @@ instance ToJSON SplitMarker where
         , "firstTrimChain" .= _smFirstTrimChain m
         , "firstTrimHeight" .= _smFirstTrimHeight m
         , "created" .= _smCreated m
+        , "storeId" .= _smStoreId m
+        , "trimFrontiers" .= _smTrimFrontiers m
         ]
 
 instance FromJSON SplitMarker where
@@ -147,6 +167,8 @@ instance FromJSON SplitMarker where
         <*> o .: "firstTrimChain"
         <*> o .: "firstTrimHeight"
         <*> o .: "created"
+        <*> o .:? "storeId"
+        <*> o .:? "trimFrontiers" .!= mempty
 
 -- | Reads the marker of a directory: 'Nothing' if there is none. A marker
 -- that does not parse, or has another format or version, is an
@@ -169,12 +191,12 @@ readSplitMarker dir = do
 -- rename, @fsync@ of the directory.
 --
 writeSplitMarker :: FilePath -> ChainId -> BlockHeight -> IO SplitMarker
-writeSplitMarker dir cid h = writeMarker dir (Just (cid, h))
+writeSplitMarker dir cid h = writeMarker dir Nothing (Just (cid, h))
 
 -- | Writes a marker durably, with or without a first trim.
 --
-writeMarker :: FilePath -> Maybe (ChainId, BlockHeight) -> IO SplitMarker
-writeMarker dir firstTrim = do
+writeMarker :: FilePath -> Maybe Text -> Maybe (ChainId, BlockHeight) -> IO SplitMarker
+writeMarker dir storeId firstTrim = do
     now <- getCurrentTime
     let m = SplitMarker
             { _smFormat = splitMarkerFormat
@@ -182,9 +204,22 @@ writeMarker dir firstTrim = do
             , _smFirstTrimChain = fst <$> firstTrim
             , _smFirstTrimHeight = snd <$> firstTrim
             , _smCreated = T.pack (iso8601Show now)
+            , _smStoreId = storeId
+            , _smTrimFrontiers = M.fromList [ (chainIdToText c, h) | (c, h) <- maybe [] pure firstTrim ]
             }
     writeMarkerValue dir m
     return m
+
+-- | Replaces a marker durably (temporary file, @fsync@, rename).
+--
+writeMarkerFile :: FilePath -> SplitMarker -> IO ()
+writeMarkerFile = writeMarkerValue
+
+-- | The frontier height of the newest trim of a chain that the marker
+-- records.
+--
+markerTrimFrontier :: ChainId -> SplitMarker -> Maybe BlockHeight
+markerTrimFrontier c = M.lookup (chainIdToText c) . _smTrimFrontiers
 
 writeMarkerValue :: FilePath -> SplitMarker -> IO ()
 writeMarkerValue dir m = do
@@ -310,6 +345,9 @@ data PactLayout = PactLayout
     , _plFirstTrimPending :: !(IORef Bool)
         -- ^ the marker of @sqlite-split@ has no first trim yet, which only
         -- shadow mode writes (M2)
+    , _plStoreId :: !(IORef (Maybe Text))
+        -- ^ the store id that the first trim writes into the marker; set at
+        -- the start of the node ('Chainweb.Pact.Backend.Store.Node.bindSplitStore')
     }
 
 -- | The directory of the SQLite files the node runs on.
@@ -460,6 +498,7 @@ resolvePactLayout logger mode reset root = do
                 then maybe False ((== Nothing) . _smFirstTrimChain) <$> readSplitMarker dir
                 else return False
             pendingRef <- newIORef pending
+            storeIdRef <- newIORef Nothing
             return $ PactLayout
                 { _plRoot = root
                 , _plMode = mode
@@ -468,6 +507,7 @@ resolvePactLayout logger mode reset root = do
                 , _plColdDir = cold
                 , _plRenameLock = lock
                 , _plFirstTrimPending = pendingRef
+                , _plStoreId = storeIdRef
                 }
     case mode of
         HistorySqlite -> do
@@ -514,7 +554,7 @@ resolvePactLayout logger mode reset root = do
                     tmpExists <- doesDirectoryExist splitTmpDir
                     when tmpExists $ removeDirectoryRecursive splitTmpDir
                     createDirectory splitTmpDir
-                    void $ writeMarker splitTmpDir Nothing
+                    void $ writeMarker splitTmpDir Nothing Nothing
                     renameDirectory splitTmpDir splitDir
                     syncPath root
                     logg Info $ "Created the split side " <> T.pack splitDir <> " for shadow mode."
@@ -550,7 +590,8 @@ ensureSplitDir logger l cid h = do
             dir <- currentSqliteDir l
             unless (takeFileName dir == splitDirName) $ do
                 let new = _plRoot l </> splitDirName
-                m <- writeSplitMarker dir cid h
+                sid <- readIORef (_plStoreId l)
+                m <- writeMarker dir sid (Just (cid, h))
                 renameDirectory dir new
                 syncPath (_plRoot l)
                 writeIORef (_plSqliteDir l) new
@@ -558,6 +599,20 @@ ensureSplitDir logger l cid h = do
                     <> ", height " <> T.pack (show h) <> "): renamed " <> T.pack dir
                     <> " to " <> T.pack new <> " with format marker created "
                     <> _smCreated m
+    recordTrimFrontier l cid h
+
+-- | Records in the marker that a trim of a chain up to the frontier at
+-- height @h@ starts, unless it records that height or a higher one. Under
+-- the rename lock; one small durable write per freezer step of the chain.
+--
+recordTrimFrontier :: PactLayout -> ChainId -> BlockHeight -> IO ()
+recordTrimFrontier l cid h = modifyMVar_ (_plRenameLock l) $ \() -> do
+    dir <- currentSqliteDir l
+    readSplitMarker dir >>= \case
+        Just m | maybe True (< h) (markerTrimFrontier cid m) ->
+            writeMarkerValue dir m
+                { _smTrimFrontiers = M.insert (chainIdToText cid) h (_smTrimFrontiers m) }
+        _ -> return ()
 
 -- | Fills in the first trim of a marker that shadow mode wrote without one
 -- (M2). Under the rename lock; later calls return at once.

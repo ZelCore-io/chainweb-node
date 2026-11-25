@@ -63,6 +63,8 @@ import Data.IORef
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
+import qualified Data.UUID as UUID
+import qualified Data.UUID.V4 as UUID
 import Data.Word
 
 import GHC.Clock (getMonotonicTime)
@@ -74,6 +76,7 @@ import System.LogLevel
 
 -- internal modules
 
+import Chainweb.BlockHeight (BlockHeight)
 import Chainweb.ChainId
 import Chainweb.Logger
 import Chainweb.Pact.Backend.Store.Cold
@@ -179,7 +182,93 @@ withPactStorageMode mode logger v cfg root reset k = do
     let st cold = PactStorage layout cold cfg sem defaultFreezerPollMicros
     case _plColdDir layout of
         Nothing -> k (st Nothing)
-        Just d -> withColdStore d mode (_phColdBlockCacheBytes cfg) (k . st . Just)
+        Just d -> withColdStore d mode (_phColdBlockCacheBytes cfg) $ \cs -> do
+            bindSplitStore mode layout cs
+            k (st (Just cs))
+
+-- | Binds the cold store to the SQLite files by a store id (spec 7.4, "whole
+-- snapshots only"): a random id in the cold store and the same id in the
+-- format marker of @sqlite-split@. Refuses the start ('SplitStartRefused')
+-- when the ids differ, or when the files were trimmed and the cold store has
+-- no id: an empty or recreated @pactCold@ next to a trimmed @sqlite-split@
+-- would lose the history below the frontier (trimmed @SYS:Pacts@ rows fail
+-- continuations of old defpacts).
+--
+-- The rules:
+--
+-- * Before the first trim (no @sqlite-split@ yet) the cold store gets an id
+--   if it has none; the first trim writes it into the marker
+--   ('ensureSplitDir').
+-- * A marker that has no first trim yet (shadow mode) and its cold store
+--   take a new id, or the one of the side that has it.
+-- * Migration: a trimmed @sqlite-split@ whose marker predates store ids gets
+--   one once, when the cold store is consistent with it: its verified
+--   frontier on the marker's first-trim chain is at or above the first-trim
+--   height. The id goes into the cold store first, then into the marker; a
+--   crash between the two is completed at the next start.
+--
+-- A read-only open (tools) checks but writes nothing.
+--
+bindSplitStore :: ColdOpenMode -> PactLayout -> ColdStore -> IO ()
+bindSplitStore omode layout cs = do
+    dir <- currentSqliteDir layout
+    marker <- if takeFileName dir == splitDirName then readSplitMarker dir else return Nothing
+    coldId <- coldStoreId cs
+    case marker of
+        Nothing -> case coldId of
+            Just c -> bind c
+            Nothing -> whenWritable $ do
+                sid <- fresh
+                setColdStoreId cs sid
+                bind sid
+        Just m -> case (_smStoreId m, coldId) of
+            (Just a, Just b)
+                | a == b -> bind a
+                | otherwise -> refuse
+                    [ "the store id of the format marker in", T.pack dir, "is", a <> ","
+                    , "but the cold store", T.pack coldDir, "has the store id", b <> "."
+                    , "The two belong to different stores."
+                    ]
+            (Just a, Nothing)
+                | trimmed m -> refuse
+                    [ "the SQLite files in", T.pack dir, "are trimmed and bound to the store id", a <> ","
+                    , "but the cold store", T.pack coldDir, "has no store id: it is empty or was recreated,"
+                    , "so the history below the frontier is missing."
+                    ]
+                | otherwise -> whenWritable (setColdStoreId cs a) >> bind a
+            (Nothing, Just b) -> do
+                consistent m
+                whenWritable (writeMarkerFile dir m { _smStoreId = Just b })
+                bind b
+            (Nothing, Nothing) -> do
+                consistent m
+                whenWritable $ do
+                    sid <- fresh
+                    setColdStoreId cs sid
+                    writeMarkerFile dir m { _smStoreId = Just sid }
+                    bind sid
+  where
+    coldDir = maybe "pactCold" id (_plColdDir layout)
+    whenWritable = when (omode == ColdReadWrite)
+    bind sid = writeIORef (_plStoreId layout) (Just sid)
+    fresh = UUID.toText <$> UUID.nextRandom
+    trimmed m = _smFirstTrimChain m /= Nothing
+    consistent m = case (_smFirstTrimChain m, _smFirstTrimHeight m) of
+        (Just c, Just h) -> coldVerifiedFrontier cs c >>= \case
+            Just f | _frHeight f >= h -> return ()
+            v -> refuse
+                [ "the SQLite files were first trimmed on chain", chainIdToText c, "at height", sshow h <> ","
+                , "but the verified frontier of the cold store", T.pack coldDir, "on that chain is"
+                , maybe "missing" (\f -> "at height " <> sshow (_frHeight f)) v <> ":"
+                , "the cold store is empty, recreated or older than the SQLite files."
+                ]
+        _ -> return ()
+    refuse msg = throwIO $ SplitStartRefused $ T.unwords $
+        [ "Refusing to start with --pact-history-store", pactHistoryStoreToText (_plMode layout) <> ":" ]
+        ++ msg ++
+        [ "Restore a whole snapshot (block database, SQLite and cold store together),"
+        , "or remove the SQLite files and the cold store and replay Pact from the chain database."
+        ]
 
 -- | The storage of the @storage/3.2.1@ head on a SQLite directory, for tests
 -- and tools: sqlite mode, no cold store, no freezer.
@@ -189,6 +278,7 @@ sqliteOnlyStorage dir = do
     ref <- newIORef dir
     lock <- newMVar ()
     pending <- newIORef False
+    storeIdRef <- newIORef Nothing
     sem <- newQSem 1
     return PactStorage
         { _pstLayout = PactLayout
@@ -199,6 +289,7 @@ sqliteOnlyStorage dir = do
             , _plColdDir = Nothing
             , _plRenameLock = lock
             , _plFirstTrimPending = pending
+            , _plStoreId = storeIdRef
             }
         , _pstCold = Nothing
         , _pstHistory = defaultPactHistoryConfig
@@ -294,7 +385,12 @@ withChainStorage logger st cid reset k = do
             "internal error: no cold store in mode " <> pactHistoryStoreToText mode
         (HistorySplit, Just cs) -> withHot $ \hot -> do
             cc <- openColdChain cs cid
-            splitStartChecks cid hot cc
+            trimmedTo <- do
+                dir <- currentSqliteDir layout
+                if takeFileName dir == splitDirName
+                then (markerTrimFrontier cid =<<) <$> readSplitMarker dir
+                else return Nothing
+            splitStartChecks cid hot cc trimmedTo
             counters <- newIORef emptySplitCounters
             let env = SplitEnv cid (sqlitePactStore hot) cc counters
             k ChainStorage
@@ -398,9 +494,23 @@ withChainStorage logger st cid reset k = do
                 ]
 
 -- | The start checks of a chain in split mode.
-splitStartChecks :: ChainId -> SQLiteEnv -> ColdChain -> IO ()
-splitStartChecks cid hot cc = withSqliteErrorDetail hot $ do
+splitStartChecks :: ChainId -> SQLiteEnv -> ColdChain -> Maybe BlockHeight -> IO ()
+splitStartChecks cid hot cc trimmedTo = withSqliteErrorDetail hot $ do
     let store = sqlitePactStore hot
+    -- the format marker records the frontier of the newest trim of the chain:
+    -- a cold store whose verified frontier is below it is older than the
+    -- SQLite files (a mixed restore), and the rows between are in neither
+    ver <- _ccVerified cc
+    forM_ trimmedTo $ \th -> unless (maybe False ((>= th) . _frHeight) ver) $
+        throwIO $ SplitStartRefused $ T.unwords
+            [ "Refusing to start chain", chainIdToText cid, "with --pact-history-store split:"
+            , "its SQLite file was trimmed up to the frontier at height", sshow th <> ","
+            , "but the verified frontier of the cold store is"
+            , maybe "missing" (\f -> "at height " <> sshow (_frHeight f)) ver <> ";"
+            , "the cold store is older than the SQLite files, and the history between is in neither."
+            , "Restore a whole snapshot (block database, SQLite and cold store together),"
+            , "or replay Pact from the chain database."
+            ]
     -- A new hot file (a fresh node or test directory) has no schema until the
     -- checkpointer creates it: it is empty, and holds no frontier block.
     hasHistory <- sqliteHasBlockHistory hot

@@ -72,6 +72,7 @@ import Chainweb.Pact.Backend.Utils (withSqliteDb)
 import Chainweb.Pact.Backend.Store.Types
 import Chainweb.Storage.Table.RocksDB (withTempRocksDb)
 import Chainweb.Test.Pact.Store.Freezer hiding (tests)
+import Chainweb.Pact.Backend.Store.Freezer (freezeOnce)
 import Chainweb.Test.TestVersions (slowForkingCpmTestVersion)
 import Chainweb.Test.Utils.Storage (checkShadowNotBroken, testStorageLogger)
 import Chainweb.Test.Utils (petersen)
@@ -98,6 +99,8 @@ tests = testGroup "Split store node"
     , testCase "test storage: a shadow chain whose split side broke fails the test, with the storage log" shadowBrokenFailsTestTest
     , testCase "test storage: the release closes the storage also when the shadow check fails" releaseAfterFailedCheckTest
     , testCase "test storage: when the shadow check and the release both fail, the check's error stays, with the release's attached" releaseFailsTooTest
+    , testCase "split start with an empty or recreated pactCold next to a trimmed sqlite-split refuses (store id)" emptyColdTest
+    , testCase "split start with an older pactCold restored next to a newer sqlite-split refuses (trim frontier)" olderColdTest
     , testCase "restart with the block header database below the frontier: initializeLatestBlock, exitOnRewindBelowFrontier, the fatal-error handler gets the refusal unwrapped" restartBelowFrontierTest
     , testGroup "W5"
         [ testCase "Pact 5: fork point above the written frontier; /local at every height equals a sqlite-mode twin fed the same blocks" (w5Test W5P5)
@@ -732,3 +735,65 @@ restartBelowFrontierTest = withSystemTempDirectory "split-node" $ \tmp -> do
                 _psGetLatestBlock (chainStorePactStore (_cstSql cst) (_cstStore cst))
                     >>= (@?= Just (9, view blockHash (last mainH)))
         closeBlockHeaderDb bhdb
+
+-- | Starts the split store of the fixture chain: 'Right' when it starts.
+startSplit :: FilePath -> IO (Either PactStorageError ())
+startSplit root = try $ withPactStorage quietLogger v testConfig root False $ \st ->
+    withChainStorage quietLogger st cid False (\_ -> return ())
+
+recreateCold :: FilePath -> IO ()
+recreateCold root = do
+    removeDirectoryRecursive (root </> coldDirName)
+    createDirectory (root </> coldDirName)
+
+assertRefused :: String -> [Text] -> Either PactStorageError () -> Assertion
+assertRefused what needles = \case
+    Left (SplitStartRefused t) -> forM_ needles $ \n ->
+        assertBool (what <> ": names " <> T.unpack n <> ": " <> T.unpack t) (n `T.isInfixOf` t)
+    Left e -> assertFailure (what <> ": unexpected " <> show e)
+    Right () -> assertFailure (what <> ": expected a refusal")
+
+-- | Spec 7.4 names the hazard: a trimmed @SYS:Pacts@ without its cold rows
+-- fails continuations of old defpacts. An empty @pactCold@ opens with
+-- create-if-missing, so only the store id binds the two sides.
+emptyColdTest :: Assertion
+emptyColdTest = do
+    -- a split dir from before the store id, next to an empty cold store
+    withFixture $ \root _twin -> do
+        withPlainNode root $ \n -> void $ runToEnd (_nEnv n)
+        recreateCold root
+        startSplit root >>= assertRefused "no id yet, empty cold" ["cold store"]
+    -- bound by a start, then the cold store is recreated
+    withFixture $ \root _twin -> do
+        withPlainNode root $ \n -> void $ runToEnd (_nEnv n)
+        startSplit root >>= either (assertFailure . show) return
+        readSplitMarker (root </> splitDirName) >>= \case
+            Just m -> assertBool "the start wrote the store id into the marker" (isJust (_smStoreId m))
+            Nothing -> assertFailure "no marker"
+        startSplit root >>= either (assertFailure . show) return
+        recreateCold root
+        startSplit root >>= assertRefused "recreated cold" ["store id"]
+    -- a cold store of another node: both ids present, different
+    withFixture $ \root _twin -> do
+        withPlainNode root $ \n -> void $ runToEnd (_nEnv n)
+        startSplit root >>= either (assertFailure . show) return
+        Just m <- readSplitMarker (root </> splitDirName)
+        writeMarkerFile (root </> splitDirName) m { _smStoreId = Just "another-store" }
+        startSplit root >>= assertRefused "other store" ["store id", "another-store"]
+
+-- | A mixed restore: the cold store of an older snapshot, the SQLite files of
+-- a newer one. The rows between the two frontiers are in neither store.
+olderColdTest :: Assertion
+olderColdTest = withFixture $ \root _twin -> withSystemTempDirectory "older-cold" $ \tmp -> do
+    withPlainNode root $ \n -> void $ freezeOnce (_nEnv n)
+    startSplit root >>= either (assertFailure . show) return
+    copyDir (root </> coldDirName) (tmp </> "cold")
+    withPlainNode root $ \n -> void $ runToEnd (_nEnv n)
+    startSplit root >>= either (assertFailure . show) return
+    removeDirectoryRecursive (root </> coldDirName)
+    copyDir (tmp </> "cold") (root </> coldDirName)
+    startSplit root >>= assertRefused "older cold" ["trimmed", "height 8", "height 2"]
+  where
+    copyDir from to = do
+        createDirectory to
+        listDirectory from >>= mapM_ (\f -> copyFile (from </> f) (to </> f))

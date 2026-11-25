@@ -39,6 +39,8 @@ module Chainweb.Pact.Backend.Store.Cold
 , ColdOpenMode(..)
 , ColdStoreException(..)
 , withColdStore
+, coldStoreId
+, setColdStoreId
 , coldCacheStats
 , coldStoreRocksDb
 , coldRawGet
@@ -270,6 +272,20 @@ coldStoreRocksDb = _csDb
 --
 coldRawGet :: ColdStore -> B.ByteString -> IO (Maybe B.ByteString)
 coldRawGet cs = R.get (_rocksDbHandle (_csDb cs)) mempty
+
+-- | The key of the node-wide store id. Not in a keyspace (no capital
+-- letter first), so no prefix scan of the chains' entries meets it.
+storeIdKey :: B.ByteString
+storeIdKey = "pact-split-store-id"
+
+-- | The store id that binds the cold store to its @sqlite-split@ directory,
+-- whose format marker holds the same id; 'Nothing' if none is written.
+coldStoreId :: ColdStore -> IO (Maybe T.Text)
+coldStoreId cs = fmap T.decodeUtf8 <$> coldRawGet cs storeIdKey
+
+-- | Writes the store id, synced.
+setColdStoreId :: ColdStore -> T.Text -> IO ()
+setColdStoreId cs sid = writeBatchSync (_csDb cs) [R.Put storeIdKey (T.encodeUtf8 sid)]
 
 -- | Every key of the store, in order. Reads the whole store: for tests.
 --
