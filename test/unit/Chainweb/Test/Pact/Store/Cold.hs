@@ -164,16 +164,20 @@ frontierTest = withDir $ \dir -> do
         assertEqual "verified after publish" (Just (fr 1 10)) =<< _ccVerified cc
         _ccWriteStep cc (stp (fr 2 20) rows2)
         _ccPublish cc
-        assertEqual "second publish" (ColdMeta (Just (fr 2 20)) (Just (fr 2 20)) 10) =<< _ccMeta cc
+        -- the first step was never trimmed: the publish keeps the trim
+        -- position at 0, so no trim range is skipped
+        assertEqual "second publish" (ColdMeta (Just (fr 2 20)) (Just (fr 2 20)) 0) =<< _ccMeta cc
         -- publishing without a new step changes nothing
         _ccPublish cc
-        assertEqual "idempotent publish" (ColdMeta (Just (fr 2 20)) (Just (fr 2 20)) 10) =<< _ccMeta cc
+        assertEqual "idempotent publish" (ColdMeta (Just (fr 2 20)) (Just (fr 2 20)) 0) =<< _ccMeta cc
+        _ccTrimProgress cc 20
+        assertEqual "trimmed to the verified frontier" (ColdMeta (Just (fr 2 20)) (Just (fr 2 20)) 20) =<< _ccMeta cc
         _ccWriteStep cc (stp (fr 3 30) rows3)
         stats <- coldCacheStats cs
         assertBool "cache statistics" (stats /= Nothing)
     withStore dir $ \cs -> do
         cc <- openColdChain cs cid
-        assertEqual "after reopen" (ColdMeta (Just (fr 3 30)) (Just (fr 2 20)) 10) =<< _ccMeta cc
+        assertEqual "after reopen" (ColdMeta (Just (fr 3 30)) (Just (fr 2 20)) 20) =<< _ccMeta cc
         assertEqual "verified after reopen" (Just (fr 2 20)) =<< _ccVerified cc
         assertEqual "written after reopen" (Just (fr 3 30)) =<< _ccWritten cc
         _ccPublish cc

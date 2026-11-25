@@ -363,7 +363,8 @@ data ColdChain = ColdChain
         -- ^ writes a step as one synced batch, with the written frontier
         -- '_stpTo'; the verified frontier and '_cmTrimFrom' stay
     , _ccPublish :: !(IO ())
-        -- ^ verified := written, '_cmTrimFrom' := the old verified end txid
+        -- ^ verified := written, '_cmTrimFrom' := the old verified end txid,
+        -- or the trim position if a trim below it is unfinished
         -- (synced); then the in-memory frontier moves and the new catalog
         -- entries become visible to readers. Does nothing when verified equals
         -- written.
@@ -492,7 +493,12 @@ openColdChainHooked writer midPublish cs c = do
                 else do
                     let m' = m
                             { _cmVerified = _cmWritten m
-                            , _cmTrimFrom = frontierTxId (_cmVerified m)
+                            -- the old verified end, unless a trim below
+                            -- it is unfinished: then the position stays, so
+                            -- the next trim walks that range too. Today
+                            -- 'freezeOnce' finishes such a trim before it
+                            -- writes a step, so this is the old end.
+                            , _cmTrimFrom = min (_cmTrimFrom m) (frontierTxId (_cmVerified m))
                             }
                     writer db [R.Put (metaKey c) (encodeColdMeta m')]
                     -- the catalog first, then the frontier: a reader that
