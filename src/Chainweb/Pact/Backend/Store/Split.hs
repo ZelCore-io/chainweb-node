@@ -131,7 +131,7 @@ txIdWord (Pact4.TxId w) = w
 splitPactStore :: SplitEnv -> PactStore
 splitPactStore env = hot
     { _psReadNewest = \t k mb -> readNewest env t k mb
-    , _psReadPrev = \t k b -> readNewest env t k (Just b)
+    , _psReadPrev = readPrev env
     , _psReadHistorical = readHistorical env
     , _psDistinctKeys = distinctKeys env
     , _psTxIdsAfter = txIdsAfter env
@@ -172,14 +172,19 @@ cold env t def act = _ccTableId (_seCold env) t >>= \case
 
 -- | 'cold' for a @SYS:Pacts@ read: also counted, timed and its hit counted.
 coldPacts :: SplitEnv -> Text -> IO (Maybe a) -> IO (Maybe a)
-coldPacts env t act = _ccTableId (_seCold env) t >>= \case
-    Nothing -> return Nothing
+coldPacts env t = coldPactsBy env t Nothing (maybe False (const True))
+
+-- | 'coldPacts' for any result: @def@ when the table is not in the catalog,
+-- @isHit@ decides what counts as a hit.
+coldPactsBy :: SplitEnv -> Text -> a -> (a -> Bool) -> IO a -> IO a
+coldPactsBy env t def isHit act = _ccTableId (_seCold env) t >>= \case
+    Nothing -> return def
     Just _ -> do
         t0 <- getMonotonicTimeNSec
         r <- act
         t1 <- getMonotonicTimeNSec
         let us = (t1 - t0) `div` 1000
-            hit = maybe 0 (const 1) r
+            hit = if isHit r then 1 else 0
         bump env $ \c -> c
             { _scColdReads = _scColdReads c + 1
             , _scSysPactsColdReads = _scSysPactsColdReads c + 1
@@ -233,6 +238,13 @@ readNewest env t k mb = keyRead env t mb
     (_psReadNewest (_seHot env) t k mb)
     (\b -> fmap snd <$> _ccReadNewest (_seCold env) t k b)
 
+-- | The hot @readPrev@ statement runs first (its own text and error, not
+-- @readNewest@'s); the cold part is the same bounded read.
+readPrev :: SplitEnv -> Text -> ByteString -> TxId -> IO (Either SQ3.Error (Maybe ByteString))
+readPrev env t k b = keyRead env t (Just b)
+    (_psReadPrev (_seHot env) t k b)
+    (\b' -> fmap snd <$> _ccReadNewest (_seCold env) t k b')
+
 readHistorical :: SplitEnv -> Text -> ByteString -> TxId -> IO (Either SQ3.Error (Maybe (ByteString, ByteString)))
 readHistorical env t k b = keyRead env t (Just b)
     (_psReadHistorical (_seHot env) t k b)
@@ -252,7 +264,7 @@ distinctKeys env q t = do
             | f == 0 || not (frozenTable t) -> return (Right hot)
             | isPacts t -> do
                 let b = maybe f (min f) bound
-                cs <- if b == 0 then return [] else cold env t [] (_ccDistinctKeys (_seCold env) t b)
+                cs <- if b == 0 then return [] else coldPactsBy env t [] (not . null) (_ccDistinctKeys (_seCold env) t b)
                 return $ Right $ S.toAscList (S.fromList cs <> S.fromList hot)
             | otherwise -> case bound of
                 Just b | b < f -> Right <$> cold env t [] (_ccDistinctKeys (_seCold env) t b)
@@ -305,7 +317,7 @@ rowsInTxIdRange env t from to = do
             | otherwise -> do
                 let hot' = [ r | r@(x, _, _) <- hot, x >= f ]
                 cs <- if from < min to f
-                    then cold env t [] (_ccRowsInTxIdRange (_seCold env) t from to)
+                    then cold env t [] (_ccRowsInTxIdRange (_seCold env) t from (min to f))
                     else return []
                 return (Right (hot' ++ cs))
 

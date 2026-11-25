@@ -399,6 +399,11 @@ liftDbError :: IO (Either Error a) -> IO a
 liftDbError = liftEither
 
 -- TODO: do this in ChainwebPactDb instead?
+--
+-- In split mode (storage redesign P3) the rows of a @SYS:*@ table within one
+-- txid come back in key order, not rowid order (the cold store keeps no
+-- by-txid lists for system tables). Test-only today; do not expose this to
+-- production callers without revisiting that.
 getBlockHistory
   :: PactStore
   -> BlockHeader

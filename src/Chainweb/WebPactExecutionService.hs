@@ -138,6 +138,11 @@ data PactExecutionService = PactExecutionService
         IO (Historical BlockTxHistory)
         )
     -- ^ Obtain all transaction history in block for specified table/domain.
+    --
+    -- Not for production callers in split mode (storage redesign P3): there
+    -- the rows of a @SYS:*@ table within one txid come back in key order, not
+    -- rowid order, because the cold store keeps no by-txid lists for system
+    -- tables. Revisit that before exposing this through an API.
     , _pactHistoricalLookup :: !(
         BlockHeader ->
         Pact5.Domain Pact5.RowKey Pact5.RowData Pact5.CoreBuiltin Pact5.Info ->

@@ -27,6 +27,9 @@ import Data.Ord (Down(..))
 import Data.Text (Text)
 import qualified Data.Text as T
 
+import System.FilePath ((</>))
+import System.IO.Temp (withSystemTempDirectory)
+
 import Test.Tasty
 import Test.Tasty.HUnit
 
@@ -64,6 +67,7 @@ tests = testGroup "Split store"
     , testCase "rewind to a parent above the written frontier: reads equal the rewound legacy twin" rewindAboveTest
     , testCase "rewind below the written frontier, also after a crash between write and publish: RewindBelowFrontier, SQLite unchanged" rewindBelowTest
     , testCase "SYS:Pacts: a continuation read whose row is only in cold returns its bytes; counters move" sysPactsTest
+    , testCase "a publish between the split's frontier read and the cold read: no duplicate rows, order as legacy" straddleTest
     , testCase "backup is refused" backupTest
     ]
 
@@ -312,9 +316,44 @@ sysPactsTest = withSplit $ \s -> do
     _psReadNewest (_sStore s) pacts "p-none" Nothing >>= (@?= Right Nothing)
     c2 <- counters s
     (_scColdReads c2, _scSysPactsColdReads c2, _scSysPactsColdHits c2, _scSysPactsHotHits c2) @?= (3, 3, 2, 1)
+    -- the keys of SYS:Pacts below F are a cold read of SYS:Pacts too
+    Right ks <- _psDistinctKeys (_sStore s) (KeysOrderedByKey 30) pacts
+    assertBool "keys below F come from cold" (not (null ks))
+    c3 <- counters s
+    (_scColdReads c3, _scSysPactsColdReads c3, _scSysPactsColdHits c3) @?= (4, 4, 3)
+
+-- | A freezer publish lands between the split's read of F and the cold
+-- read: the split store sees the older frontier (height 4, end txid 50) while
+-- the cold readers already see the newer one (end txid 90). The hot store is
+-- the untrimmed twin, as it is before the trim (which waits for the lock the
+-- request holds). Every read must still equal the twin, in particular
+-- 'rowsInTxIdRange': no row of [50, 90) twice, and txid descending.
+straddleTest :: Assertion
+straddleTest = withSplit $ \s0 -> do
+    let older = frontierAt 4
+        cold' = (_nCold (_sNode s0)) { _ccVerified = return (Just older) }
+    ref <- newIORef emptySplitCounters
+    let env = SplitEnv
+            { _seChain = cid
+            , _seHot = _sLegacy s0
+            , _seCold = cold'
+            , _seCounters = ref
+            }
+        s = s0 { _sStore = splitPactStore env, _sCounters = ref }
+    _ccVerified (_nCold (_sNode s0)) >>= (@?= Just finalFrontier)
+    forM_ (dataTables ++ [missingTable]) $ \t -> compareTable s bounds t t
+    -- the straddling window explicitly: [50, 90) is in both parts
+    forM_ dataTables $ \t -> do
+        Right rs <- _psRowsInTxIdRange (_sStore s) t 0 131
+        let xs = [ x | (x, _, _) <- rs ]
+        assertBool ("txid descending, " <> T.unpack t) (xs == sortOn Down xs)
+        Right lg <- _psRowsInTxIdRange (_sLegacy s) t 0 131
+        length rs @?= length lg
+    n <- coldReads s
+    assertBool "the cold store was read" (n > 0)
 
 backupTest :: Assertion
-backupTest = withSplit $ \s ->
-    try (_psBackupTo (_sStore s) "backup.sqlite") >>= \case
+backupTest = withSplit $ \s -> withSystemTempDirectory "split-backup" $ \tmp ->
+    try (_psBackupTo (_sStore s) (tmp </> "backup.sqlite")) >>= \case
         Left e -> e @?= BackupRefused HistorySplit
         Right () -> assertFailure "expected BackupRefused"
