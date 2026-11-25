@@ -136,6 +136,7 @@ withShadowWith f k = withFixture $ \root twin -> withPlainNode root $ \n -> do
             , _shBroken = broken
             , _shClock = readIORef time
             , _shLogState = logState
+            , _shOnBroken = return ()
             }
     k Shadow
         { _shStore = shadowPactStore env

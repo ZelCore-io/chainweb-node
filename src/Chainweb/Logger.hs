@@ -32,6 +32,7 @@ module Chainweb.Logger
 -- * Generic Test Logger
 , GenericLogger
 , genericLogger
+, forwardingLogger
 ) where
 
 import Control.Lens
@@ -107,12 +108,15 @@ data GenericLogger = GenericLogger
     , _glLevel :: !LogLevel
     , _glPolicy :: !L.LogPolicy
     , _glFun :: !(T.Text -> IO ())
+    , glForwardTo :: !(Maybe (L.LogLevel -> SomeLogMessage -> IO ()))
+        -- ^ 'forwardingLogger': every message goes to another logger as it is
     }
 
 makeLenses 'GenericLogger
 
 instance L.LoggerCtx GenericLogger SomeLogMessage where
     loggerFunIO ctx level msg
+        | Just fwd <- glForwardTo ctx = fwd level msg
         | level <= l2l (_glLevel ctx) = do
             now <- getCurrentTime
             view glFun ctx
@@ -139,4 +143,15 @@ instance L.LoggerCtx GenericLogger SomeLogMessage where
 -- logging framework should be used.
 --
 genericLogger :: LogLevel -> (T.Text -> IO ()) -> GenericLogger
-genericLogger level fun = GenericLogger [] level L.LogPolicyBlock fun
+genericLogger level fun = GenericLogger [] level L.LogPolicyBlock fun Nothing
+
+-- | A 'GenericLogger' that hands every message, with its level, to a chainweb
+-- logger. That logger's level, scope and queue policy apply; the scope and
+-- level of the 'GenericLogger' are not used.
+--
+-- To never block the caller on a full queue, pass a logger whose policy is
+-- 'L.LogPolicyDiscard' (@set L.setLoggerPolicy L.LogPolicyDiscard@).
+--
+forwardingLogger :: Logger l => l -> GenericLogger
+forwardingLogger l = GenericLogger [] Debug L.LogPolicyBlock (\_ -> return ())
+    (Just (L.loggerFunIO l))

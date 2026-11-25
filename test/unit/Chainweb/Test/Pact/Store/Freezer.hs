@@ -223,6 +223,7 @@ withNodeW tw root cfg writer mkHooks gate k = do
                     , _fePollMicros = 50_000
                     , _feSplitCounters = Nothing
                     , _feCacheStats = coldCacheStats cs
+                    , _feShadowDifferences = return Nothing
                     , _feTrimWindow = tw
                     , _feLogger = quietLogger
                     , _feHooks = mkHooks node

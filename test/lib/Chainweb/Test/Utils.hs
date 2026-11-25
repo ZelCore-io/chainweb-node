@@ -232,7 +232,7 @@ import Chainweb.Test.Pact5.Utils (getTestLogLevel)
 import Chainweb.Test.P2P.Peer.BootstrapConfig
     (testBootstrapCertificate, testBootstrapKey, testBootstrapPeerConfig)
 import Chainweb.Test.Utils.BlockHeader
-import Chainweb.Test.Utils.Storage (testPayloadDbConfig, testStorageTuning)
+import Chainweb.Test.Utils.Storage (testPayloadDbConfig, testStorageTuning, withTestPactStorage)
 import Chainweb.Time
 import Chainweb.TreeDB
 import Chainweb.Utils
@@ -1096,7 +1096,8 @@ node
         -- ^ Unique Node Id. The node id 0 is used for the bootstrap node
     -> IO ()
 node rdb rawLogger nowServingRef peerInfoVar conf pactDbDir backupDir nid = do
-    withChainweb conf logger rdb pactDbDir backupDir False $ \case
+    withTestPactStorage (_configChainwebVersion conf) pactDbDir $ \pactStorage ->
+     withChainweb conf logger rdb pactStorage backupDir False $ \case
         StartedChainweb cw -> do
             -- If this is the bootstrap node we extract the port number and publish via an MVar.
             when (nid == 0) $ do

@@ -25,6 +25,7 @@ module Chainweb.Chainweb.ChainResources
 , chainResMempool
 , chainResLogger
 , chainResPact
+, chainResDrainFreezer
 , withChainResources
 ) where
 
@@ -46,6 +47,7 @@ import qualified Chainweb.Mempool.Consensus as MPCon
 import qualified Chainweb.Mempool.InMem as Mempool
 import qualified Chainweb.Mempool.InMemTypes as Mempool
 import Chainweb.Mempool.Mempool (MempoolBackend)
+import Chainweb.Pact.Backend.Store.Node (PactStorage)
 import Chainweb.Pact.Service.PactInProcApi
 import Chainweb.Pact.Types
 import Chainweb.Payload.PayloadStore
@@ -64,6 +66,9 @@ data ChainResources logger = ChainResources
     , _chainResLogger :: !logger
     , _chainResMempool :: !(MempoolBackend Pact4.UnparsedTransaction)
     , _chainResPact :: PactExecutionService
+    , _chainResDrainFreezer :: IO Bool
+        -- ^ stops the chain's freezer and runs it to the end
+        -- (@--only-sync-pact@); 'False' when no freezer runs
     }
 
 makeLenses ''ChainResources
@@ -87,8 +92,8 @@ withChainResources
     -> logger
     -> (MVar PactExecutionService -> Mempool.InMemConfig Pact4.UnparsedTransaction)
     -> PayloadDb tbl
-    -> FilePath
-        -- ^ database directory for checkpointer
+    -> PactStorage
+        -- ^ the Pact history storage of the node
     -> PactServiceConfig
     -> Counter "txFailures"
     -> (ChainResources logger -> IO a)
@@ -100,8 +105,8 @@ withChainResources
       let mempoolCfg = mempoolCfg0 pexMv
       Mempool.withInMemoryMempool (setComponent "mempool" logger) mempoolCfg v $ \mempool -> do
         mpc <- MPCon.mkMempoolConsensus mempool cdb $ Just payloadDb
-        withPactService v cid logger (Just txFailuresCounter) mpc cdb
-                        payloadDb pactDbDir pactConfig $ \requestQ -> do
+        withPactServiceDrain v cid logger (Just txFailuresCounter) mpc cdb
+                        payloadDb pactDbDir pactConfig $ \requestQ drain -> do
             let pex = pes requestQ
             putMVar pexMv pex
 
@@ -111,6 +116,7 @@ withChainResources
                 , _chainResLogger = logger
                 , _chainResMempool = mempool
                 , _chainResPact = pex
+                , _chainResDrainFreezer = drain
                 }
   where
     pes requestQ

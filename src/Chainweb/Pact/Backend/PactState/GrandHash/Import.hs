@@ -84,6 +84,7 @@ import System.Directory (copyFile, createDirectoryIfMissing)
 import System.Environment (setEnv)
 import System.LogLevel (LogLevel(..))
 import qualified Chainweb.Pact.PactService.Checkpointer.Internal as Checkpointer.Internal
+import Chainweb.Pact.Backend.Store.Node (ChainStore(..))
 
 -- | Verifies that the hashes and headers match @grands@.
 --
@@ -186,7 +187,7 @@ pactDropPostVerified logger v srcDir tgtDir snapshotBlockHeight snapshotChainHas
       let logger' = addChainIdLabel cid logger
       logFunctionText logger' Info
         $ "Dropping anything post verified state (BlockHeight " <> sshow snapshotBlockHeight <> ")"
-      Checkpointer.Internal.withCheckpointerResources logger defaultModuleCacheLimit sqliteEnv DoNotPersistIntraBlockWrites v cid $ \cp -> do
+      Checkpointer.Internal.withCheckpointerResources logger defaultModuleCacheLimit sqliteEnv ChainStoreSqlite DoNotPersistIntraBlockWrites v cid $ \cp -> do
         Checkpointer.Internal.rewindTo cp (Just $ ParentHeader $ blockHeader $ snapshotChainHashes ^?! ix cid)
 
 data PactImportConfig = PactImportConfig

@@ -49,7 +49,7 @@ import Chainweb.Pact.Backend.Types (SQLiteEnv)
 import Chainweb.Storage.Table.RocksDB (writeBatchSync)
 import Chainweb.Test.Pact.Store.Freezer
     ( cid, mkHash, block, commitAll, dataTables, withFixture, Node(..), Crash(..)
-    , testConfig, withNode, withPlainNode, runToEnd, finalFrontier, frontierAt
+    , testConfig, withNode, withNodeW, withPlainNode, runToEnd, finalFrontier, frontierAt
     , dumpTables, bookkeeping, masterOf
     )
 import Chainweb.Test.TestVersions (slowForkingCpmTestVersion)
@@ -69,6 +69,7 @@ tests = testGroup "Split store"
     , testCase "SYS:Pacts: a continuation read whose row is only in cold returns its bytes; counters move" sysPactsTest
     , testCase "a publish between the split's frontier read and the cold read: no duplicate rows, order as legacy" straddleTest
     , testCase "a freezer step and its trim between the hot statement and the frontier read: every read op equals the legacy twin" trimRaceTest
+    , testCase "a trim cut short at one frontier resumes, and the next step's trim removes stale anchors, inside a read's hot statement: every read op equals the legacy twin (n2)" trimResumeRaceTest
     , testCase "backup is refused" backupTest
     ]
 
@@ -428,6 +429,86 @@ trimRaceTest = do
         , ("rowsInTxIdRange coin_table 0 131", \p -> sh (_psRowsInTxIdRange p coin 0 131))
         , ("rowsInTxIdRange coin_table 35 55", \p -> sh (_psRowsInTxIdRange p coin 35 55))
         , ("rowsInTxIdRange SYS:Pacts 0 131", \p -> sh (normaliseSysRange pacts <$> _psRowsInTxIdRange p pacts 0 131))
+        ]
+
+-- | n2, the two-step race: the step to height 5 publishes and its trim stops
+-- after one chunk (a crash). Inside a probe's hot statement (just before or
+-- just after it), the freezer then resumes that trim, steps to height 8 and
+-- trims again, which removes anchors that were current at height 5 (bob at
+-- 41, replaced by 81 below the new frontier). Every probe must equal the
+-- twin.
+trimResumeRaceTest :: Assertion
+trimResumeRaceTest = do
+    bad <- fmap concat $ forM [(w, p) | w <- [StepBeforeHot, StepAfterHot], p <- probes] $ \(when', (what0, op)) -> withFixture $ \root twin -> do
+        crash <- newIORef False
+        let what = show when' <> ": " <> what0
+            hooks _ = noHooks
+                { _fhAfterTrimChunk = do
+                    c <- atomicModifyIORef' crash (\x -> (False, x))
+                    when c $ throwIO (Crash 0)
+                }
+        withNodeW (TrimWindow 1 1 1) root testConfig writeBatchSync hooks (const (return ())) $ \n -> do
+            freezeOnce (_nEnv n) >>= \case
+                Froze f -> assertEqual (what <> ": first step") (frontierAt 2) f
+                o -> assertFailure (what <> ": expected the first step, got " <> show o)
+            writeIORef crash True
+            try (freezeOnce (_nEnv n)) >>= \case
+                Left (Crash _) -> return ()
+                Right o -> assertFailure (what <> ": expected the trim to stop, got " <> show o)
+            _ccVerified (_nCold n) >>= assertEqual (what <> ": the second step published") (Just (frontierAt 5))
+            -- the anchor bob@41 is still hot before the resumed trims
+            _psRowsAtTxId (sqlitePactStore (_nPact n)) coin 41 >>= assertBool (what <> ": bob@41 hot") . (/= Right [])
+            armed <- newIORef True
+            let fire = do
+                    a <- atomicModifyIORef' armed (\x -> (False, x))
+                    when a $ void $ runToEnd (_nEnv n)
+                thenStep act = case when' of
+                    StepBeforeHot -> fire *> act
+                    StepAfterHot -> act <* fire
+                hot = sqlitePactStore (_nPact n)
+                hot' = hot
+                    { _psReadNewest = \t k mb -> thenStep (_psReadNewest hot t k mb)
+                    , _psReadPrev = \t k b -> thenStep (_psReadPrev hot t k b)
+                    , _psReadHistorical = \t k b -> thenStep (_psReadHistorical hot t k b)
+                    , _psDistinctKeys = \q t -> thenStep (_psDistinctKeys hot q t)
+                    , _psTxIdsAfter = \t x -> thenStep (_psTxIdsAfter hot t x)
+                    , _psRowsAtTxId = \t x -> thenStep (_psRowsAtTxId hot t x)
+                    , _psRowsInTxIdRange = \t a b -> thenStep (_psRowsInTxIdRange hot t a b)
+                    }
+            ref <- newIORef emptySplitCounters
+            let sp = splitPactStore SplitEnv
+                    { _seChain = cid
+                    , _seHot = hot'
+                    , _seCold = _nCold n
+                    , _seCounters = ref
+                    }
+            got <- op sp
+            want <- op (sqlitePactStore twin)
+            readIORef armed >>= assertBool (what <> ": the steps ran inside the hot statement") . not
+            _ccVerified (_nCold n) >>= assertEqual (what <> ": verified frontier") (Just finalFrontier)
+            -- the stale anchor bob@41 and the rows of 61 left the hot store
+            _psRowsAtTxId hot coin 41 >>= assertEqual (what <> ": txid 41 trimmed") (Right [])
+            _psRowsAtTxId hot coin 61 >>= assertEqual (what <> ": txid 61 trimmed") (Right [])
+            return [ what <> "\n  expected: " <> want <> "\n   but got: " <> got | got /= want ]
+    assertBool (unlines bad) (null bad)
+  where
+    coin = "coin_table"
+    pacts = "SYS:Pacts"
+    sh :: Show a => IO a -> IO String
+    sh = fmap show
+    probes :: [(String, PactStore -> IO String)]
+    probes =
+        [ ("readHistorical bob 45", \p -> sh (_psReadHistorical p coin "bob" 45))
+        , ("readHistorical bob 65", \p -> sh (_psReadHistorical p coin "bob" 65))
+        , ("readNewest bob 45", \p -> sh (_psReadNewest p coin "bob" (Just 45)))
+        , ("readNewest bob 65", \p -> sh (_psReadNewest p coin "bob" (Just 65)))
+        , ("readPrev bob 65", \p -> sh (_psReadPrev p coin "bob" 65))
+        , ("readNewest SYS:Pacts p5 65", \p -> sh (_psReadNewest p pacts "p5" (Just 65)))
+        , ("keys coin_table by key 45", \p -> sh (_psDistinctKeys p (KeysOrderedByKey 45) coin))
+        , ("txIdsAfter coin_table 35", \p -> sh (_psTxIdsAfter p coin 35))
+        , ("rowsAtTxId coin_table 61", \p -> sh (_psRowsAtTxId p coin 61))
+        , ("rowsInTxIdRange coin_table 35 75", \p -> sh (_psRowsInTxIdRange p coin 35 75))
+        , ("rowsInTxIdRange coin_table 0 131", \p -> sh (_psRowsInTxIdRange p coin 0 131))
         ]
 
 backupTest :: Assertion

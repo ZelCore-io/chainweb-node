@@ -21,6 +21,7 @@
 
 module Chainweb.Pact.Service.PactInProcApi
     ( withPactService
+    , withPactServiceDrain
     , withPactService'
     , pactMemPoolAccess
     , pactQueueBlockWaiting
@@ -42,7 +43,6 @@ import Chainweb.Logger
 import Chainweb.Mempool.Consensus
 import Chainweb.Mempool.Mempool
 
-import Chainweb.Pact.Backend.Utils
 import Chainweb.Pact.Types
 import qualified Chainweb.Pact.PactService as PS
 import Chainweb.Pact.Service.PactQueue
@@ -57,6 +57,7 @@ import GHC.Stack (HasCallStack)
 import Chainweb.Counter (Counter)
 import Chainweb.BlockCreationTime
 import Chainweb.Pact.Backend.Types
+import Chainweb.Pact.Backend.Store.Node
 
 -- | Initialization for Pact (in process) Api
 withPactService
@@ -69,13 +70,34 @@ withPactService
     -> MempoolConsensus
     -> BlockHeaderDb
     -> PayloadDb tbl
-    -> FilePath
+    -> PactStorage
     -> PactServiceConfig
     -> (PactQueue -> IO a)
     -> IO a
-withPactService ver cid logger txFailuresCounter mpc bhdb pdb pactDbDir config action =
-    withSqliteDb cid logger pactDbDir (_pactResetDb config) $ \sqlenv ->
-        withPactService' ver cid logger txFailuresCounter mpa bhdb pdb sqlenv config action
+withPactService ver cid logger txFailuresCounter mpc bhdb pdb storage config action =
+    withPactServiceDrain ver cid logger txFailuresCounter mpc bhdb pdb storage config (\q _ -> action q)
+
+-- | 'withPactService', also handing the action a drain of the chain's
+-- freezer ('drainChainFreezer'; @--only-sync-pact@). It returns 'False' when
+-- no freezer runs.
+withPactServiceDrain
+    :: CanReadablePayloadCas tbl
+    => Logger logger
+    => ChainwebVersion
+    -> ChainId
+    -> logger
+    -> Maybe (Counter "txFailures")
+    -> MempoolConsensus
+    -> BlockHeaderDb
+    -> PayloadDb tbl
+    -> PactStorage
+    -> PactServiceConfig
+    -> (PactQueue -> IO Bool -> IO a)
+    -> IO a
+withPactServiceDrain ver cid logger txFailuresCounter mpc bhdb pdb storage config action =
+    withChainStorage logger storage cid (_pactResetDb config) $ \cst ->
+        withPactServiceStorage' ver cid logger txFailuresCounter mpa bhdb pdb cst config
+            (\q -> action q (drainChainFreezer cst))
   where
     mpa = pactMemPoolAccess mpc $ addLabel ("sub-component", "MempoolAccess") logger
 
@@ -97,13 +119,31 @@ withPactService'
     -> (PactQueue -> IO a)
     -> IO a
 withPactService' ver cid logger txFailuresCounter memPoolAccess bhDb pdb sqlenv config action = do
+    cst <- sqliteChainStorage sqlenv
+    withPactServiceStorage' ver cid logger txFailuresCounter memPoolAccess bhDb pdb cst config action
+
+withPactServiceStorage'
+    :: CanReadablePayloadCas tbl
+    => Logger logger
+    => ChainwebVersion
+    -> ChainId
+    -> logger
+    -> Maybe (Counter "txFailures")
+    -> MemPoolAccess
+    -> BlockHeaderDb
+    -> PayloadDb tbl
+    -> ChainStorage
+    -> PactServiceConfig
+    -> (PactQueue -> IO a)
+    -> IO a
+withPactServiceStorage' ver cid logger txFailuresCounter memPoolAccess bhDb pdb cst config action = do
     reqQ <- newPactQueue (_pactQueueSize config)
     race (concurrently_ (monitor reqQ) (server reqQ)) (action reqQ) >>= \case
         Left () -> error "Chainweb.Pact.Service.PactInProcApi: pact service terminated unexpectedly"
         Right a -> return a
   where
     server reqQ = runForever logg "pact-service"
-        $ PS.runPactService ver cid logger txFailuresCounter reqQ memPoolAccess bhDb pdb sqlenv config
+        $ PS.runPactServiceStorage ver cid logger txFailuresCounter reqQ memPoolAccess bhDb pdb cst config
     logg = logFunction logger
     monitor = runPactServiceQueueMonitor $ addLabel ("sub-component", "PactQueue") logger
 

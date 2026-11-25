@@ -24,6 +24,7 @@
 module Chainweb.Pact.PactService.Checkpointer.Internal
   ( Checkpointer(..)
   , initCheckpointerResources
+  , initCheckpointerResourcesWith
   , withCheckpointerResources
   , rewindTo
   , readFrom
@@ -83,7 +84,7 @@ import qualified Chainweb.Pact5.Backend.ChainwebPactDb as Pact5
 
 import Chainweb.Pact.Backend.DbCache
 import Chainweb.Pact.Backend.Types
-import Chainweb.Pact.Backend.Store.SQLite (sqlitePactStore)
+import Chainweb.Pact.Backend.Store.Node (ChainStore(..), chainStorePactStore)
 import Chainweb.Pact.Backend.Store.Types (PactStore(..))
 import Chainweb.Pact.Types
 import Chainweb.Utils
@@ -98,13 +99,15 @@ withCheckpointerResources
     => logger
     -> DbCacheLimitBytes
     -> SQLiteEnv
+    -> ChainStore
+        -- ^ 'cpStore' is 'chainStorePactStore' of it
     -> IntraBlockPersistence
     -> ChainwebVersion
     -> ChainId
     -> (Checkpointer logger -> IO a)
     -> IO a
-withCheckpointerResources logger dbCacheLimit sqlenv p v cid inner = do
-    cp <- initCheckpointerResources dbCacheLimit sqlenv p logger v cid
+withCheckpointerResources logger dbCacheLimit sqlenv chainStore p v cid inner = do
+    cp <- initCheckpointerResourcesWith dbCacheLimit sqlenv chainStore p logger v cid
     withAsync (logModuleCacheStats (cpModuleCacheVar cp)) $ \_ -> inner cp
     where
     logFun = logFunctionText logger
@@ -115,6 +118,8 @@ withCheckpointerResources logger dbCacheLimit sqlenv p v cid inner = do
         logFunctionJson logger Info stats
         threadDelay 60_000_000 {- 1 minute -}
 
+-- | 'initCheckpointerResourcesWith' on 'ChainStoreSqlite': the store of the
+-- @storage/3.2.1@ head.
 initCheckpointerResources
     :: (Logger logger)
     => DbCacheLimitBytes
@@ -124,15 +129,27 @@ initCheckpointerResources
     -> ChainwebVersion
     -> ChainId
     -> IO (Checkpointer logger)
-initCheckpointerResources dbCacheLimit sql p loggr v cid = do
-    let store = sqlitePactStore sql
+initCheckpointerResources dbCacheLimit sql =
+    initCheckpointerResourcesWith dbCacheLimit sql ChainStoreSqlite
+
+initCheckpointerResourcesWith
+    :: (Logger logger)
+    => DbCacheLimitBytes
+    -> SQLiteEnv
+    -> ChainStore
+    -> IntraBlockPersistence
+    -> logger
+    -> ChainwebVersion
+    -> ChainId
+    -> IO (Checkpointer logger)
+initCheckpointerResourcesWith dbCacheLimit sql chainStore p loggr v cid = do
+    let store = chainStorePactStore sql chainStore
     _psInitSchema store
     moduleCacheVar <- newMVar (emptyDbCache dbCacheLimit)
     return Checkpointer
         { cpLogger = loggr
         , cpCwVersion = v
         , cpChainId = cid
-        , cpSql = sql
         , cpStore = store
         , cpIntraBlockPersistence = p
         , cpModuleCacheVar = moduleCacheVar

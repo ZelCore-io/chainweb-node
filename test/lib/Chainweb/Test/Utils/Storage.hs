@@ -1,4 +1,5 @@
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE NumericUnderscores #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TypeApplications #-}
 
@@ -29,6 +30,7 @@ module Chainweb.Test.Utils.Storage
 , testStorageTuning
 , testPactHistoryConfig
 , testPactHistoryConfigFor
+, withTestPactStorage
 ) where
 
 import qualified Data.Text as T
@@ -39,6 +41,11 @@ import System.Environment (lookupEnv)
 import Text.Read (readMaybe)
 
 -- internal modules
+
+import Chainweb.Logger (genericLogger)
+import Chainweb.Pact.Backend.Store.Node
+import Chainweb.Version (ChainwebVersion)
+import System.LogLevel (LogLevel(..))
 
 import Chainweb.BlockHeight (BlockHeight(..))
 import Chainweb.Chainweb.Configuration (PayloadCompression(..), payloadCompressionTuning)
@@ -124,3 +131,18 @@ testPactHistoryConfigFor = foldl apply defaultPactHistoryConfig
         TestPactShadow -> c { _phStore = HistoryShadow }
         TestFreezeDepth d -> c { _phFreezeDepth = d }
         _ -> c
+
+-- | The Pact history storage of a test node on the directory @dir@: with
+-- @pact-split@ or @pact-shadow@, @dir@ is the root (@<db-dir>/0@) of a split
+-- or shadow layout (its cold store in @dir/pactCold@), with a 100 ms freezer
+-- poll and freeze steps of one height; otherwise the SQLite files of
+-- chainweb-node 3.2.1 directly in @dir@ ('sqliteOnlyStorage').
+--
+withTestPactStorage :: ChainwebVersion -> FilePath -> (PactStorage -> IO a) -> IO a
+withTestPactStorage v dir k = do
+    cfg0 <- testPactHistoryConfig
+    case _phStore cfg0 of
+        HistorySqlite -> sqliteOnlyStorage dir >>= k
+        _ -> withPactStorage (genericLogger Error (\_ -> return ())) v
+            cfg0 { _phFreezeStepHeights = 1 } dir False
+            $ \st -> k st { _pstFreezerPollMicros = 100_000 }

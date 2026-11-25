@@ -104,6 +104,8 @@ import Configuration.Utils hiding (Error, Lens', disabled)
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async
 import Control.Concurrent.MVar (MVar, readMVar)
+import Control.Concurrent.QSem (signalQSem, waitQSem)
+import Control.Exception (bracket_)
 import Control.DeepSeq
 import Control.Lens hiding ((.=), (<.>))
 import Control.Monad
@@ -120,6 +122,7 @@ import Data.These (These(..))
 import qualified Data.Vector as V
 import Data.Word
 
+import GHC.Clock (getMonotonicTime)
 import GHC.Generics
 
 import qualified Network.HTTP.Client as HTTP
@@ -159,6 +162,9 @@ import qualified Chainweb.Mempool.Mempool as Mempool
 import Chainweb.Mempool.P2pConfig
 import Chainweb.Miner.Config
 import qualified Chainweb.OpenAPIValidation as OpenAPIValidation
+import Chainweb.Pact.Backend.Store.Config (PactHistoryStore(..), PactHistoryConfig(..))
+import Chainweb.Pact.Backend.Store.Layout (currentSqliteDir)
+import Chainweb.Pact.Backend.Store.Node (PactStorage(..))
 import Chainweb.Pact.Backend.Types(IntraBlockPersistence(..))
 import Chainweb.Pact.RestAPI.Server (PactServerData(..))
 import Chainweb.Pact.Types (PactServiceConfig(..))
@@ -225,7 +231,7 @@ withChainweb
     => ChainwebConfiguration
     -> logger
     -> RocksDb
-    -> FilePath
+    -> PactStorage
     -> FilePath
     -> Bool
     -> (StartedChainweb logger -> IO ())
@@ -360,12 +366,13 @@ withChainwebInternal
     -> PeerResources logger
     -> (Port, Socket)
     -> RocksDb
-    -> FilePath
+    -> PactStorage
     -> FilePath
     -> Bool
     -> (StartedChainweb logger -> IO ())
     -> IO ()
-withChainwebInternal conf logger peer serviceSock rocksDb pactDbDir backupDir resetDb inner = do
+withChainwebInternal conf logger peer serviceSock rocksDb pactStorage backupDir resetDb inner = do
+    pactDbDir <- currentSqliteDir (_pstLayout pactStorage)
 
     unless (_configOnlySyncPact conf || _configReadOnlyReplay conf) $
         initializePayloadDb v payloadDb
@@ -417,7 +424,7 @@ withChainwebInternal conf logger peer serviceSock rocksDb pactDbDir backupDir re
                     (chainLogger cid)
                     mcfg
                     payloadDb
-                    pactDbDir
+                    pactStorage
                     (pactConfig maxGasLimit)
                     txFailuresCounter
                     x
@@ -476,6 +483,7 @@ withChainwebInternal conf logger peer serviceSock rocksDb pactDbDir backupDir re
         :: HM.HashMap ChainId (ChainResources logger)
         -> IO ()
     global cs = do
+        backupPactDbDir <- currentSqliteDir (_pstLayout pactStorage)
         let !webchain = mkWebBlockHeaderDb v (HM.map _chainResBlockHeaderDb cs)
             !pact = mkWebPactExecutionService (HM.map _chainResPact cs)
             !cutLogger = setComponent "cut" logger
@@ -557,6 +565,7 @@ withChainwebInternal conf logger peer serviceSock rocksDb pactDbDir backupDir re
                 newCut <- _cut mCutDb
                 synchronizePactDb pactSyncChains newCut
                 logg Info "finished replaying Pact DBs to fast forward cut"
+                drainFreezers pactSyncChains
                 logFunctionJson logger Info PactReplaySuccessful
                 inner $ Replayed initialCut (Just newCut)
             else do
@@ -598,7 +607,8 @@ withChainwebInternal conf logger peer serviceSock rocksDb pactDbDir backupDir re
                                 , _chainwebBackup = BackupEnv
                                     { _backupRocksDb = rocksDb
                                     , _backupDir = backupDir
-                                    , _backupPactDbDir = pactDbDir
+                                    , _backupPactDbDir = backupPactDbDir
+                                    , _backupPactHistory = _phStore (_pstHistory pactStorage)
                                     , _backupChainIds = cids
                                     , _backupLogger = backupLogger
                                     }
@@ -633,6 +643,23 @@ withChainwebInternal conf logger peer serviceSock rocksDb pactDbDir backupDir re
         }
       where
         cutConf = _configCuts conf
+
+    -- @--only-sync-pact@ in split and shadow: run every synced chain's freezer
+    -- to the end before returning, at most '_phFreezerConcurrency' chains at
+    -- once. The drain time is logged apart from the replay.
+    drainFreezers :: HM.HashMap ChainId (ChainResources logger) -> IO ()
+    drainFreezers cs = when (_phStore (_pstHistory pactStorage) /= HistorySqlite) $ do
+        logg Info "start draining the Pact freezers"
+        t0 <- getMonotonicTime
+        let sem = _pstFreezerSem pactStorage
+        drained <- forConcurrently (HM.toList cs) $ \(cid, cr) ->
+            bracket_ (waitQSem sem) (signalQSem sem) $ do
+                ok <- _chainResDrainFreezer cr
+                unless ok $ logg Warn $ "no Pact freezer runs on chain " <> toText cid
+                return ok
+        t1 <- getMonotonicTime
+        logg Info $ "finished draining the Pact freezers of " <> sshow (length (filter id drained))
+            <> " chains in " <> sshow (t1 - t0) <> " s (apart from the replay)"
 
     synchronizePactDb :: HM.HashMap ChainId (ChainResources logger) -> Cut -> IO ()
     synchronizePactDb cs targetCut = do

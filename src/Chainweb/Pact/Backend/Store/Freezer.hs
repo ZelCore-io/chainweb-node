@@ -174,6 +174,8 @@ data FreezerStats = FreezerStats
     , _fsCacheHits :: !(Maybe Word64)
         -- ^ the cold store's block cache, as of the last log
     , _fsCacheMisses :: !(Maybe Word64)
+    , _fsShadowDifferences :: !(Maybe Word64)
+        -- ^ shadow mode: the differences found on the chain so far
     , _fsHotFileBytes :: !Integer
         -- ^ @page_count * page_size@ of the hot file after the last step
     , _fsHotLiveBytes :: !Integer
@@ -185,7 +187,7 @@ data FreezerStats = FreezerStats
 
 emptyFreezerStats :: FreezerStats
 emptyFreezerStats = FreezerStats
-    0 0 0 0 0 0 0 0 0 0 Seq.empty 0 Nothing Nothing Nothing Nothing Nothing 0 0 0
+    0 0 0 0 0 0 0 0 0 0 Seq.empty 0 Nothing Nothing Nothing Nothing Nothing Nothing 0 0 0
 
 trimSampleCap :: Int
 trimSampleCap = 8192
@@ -217,6 +219,7 @@ freezerStatsJson c st = object
         , "split" .= fmap splitJson (_fsSplitCounters st)
         , "coldCacheHits" .= _fsCacheHits st
         , "coldCacheMisses" .= _fsCacheMisses st
+        , "shadowDifferences" .= _fsShadowDifferences st
         , "hotFileBytes" .= _fsHotFileBytes st
         , "hotLiveBytes" .= _fsHotLiveBytes st
         , "hotPeakBytes" .= _fsHotPeakBytes st
@@ -269,6 +272,8 @@ data FreezerEnv = FreezerEnv
         -- ^ the split store's counters of the chain, for the stats log
     , _feCacheStats :: !(IO (Maybe (Word64, Word64)))
         -- ^ the cold block cache hits and misses ('coldCacheStats')
+    , _feShadowDifferences :: !(IO (Maybe Word64))
+        -- ^ shadow mode: the differences of the chain ('_shDifferences')
     , _feTrimWindow :: !TrimWindow
     , _feLogger :: !GenericLogger
     , _feHooks :: !FreezerHooks
@@ -825,9 +830,11 @@ logStats :: FreezerEnv -> IO ()
 logStats env = do
     sc <- traverse readIORef (_feSplitCounters env)
     cache <- _feCacheStats env
+    diffs <- _feShadowDifferences env
     st <- atomicModifyIORef' (_feStats env) $ \st ->
         let st' = st
-                { _fsSplitCounters = sc
+                { _fsShadowDifferences = diffs
+                , _fsSplitCounters = sc
                 , _fsCacheHits = fst <$> cache
                 , _fsCacheMisses = snd <$> cache
                 }

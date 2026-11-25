@@ -38,7 +38,9 @@ module Chainweb.Pact.PactService
     , execReadOnlyReplay
     , execSyncToBlock
     , runPactService
+    , runPactServiceStorage
     , withPactService
+    , withPactServiceStorage
     , execNewGenesisBlock
     ) where
 
@@ -61,6 +63,8 @@ import Data.Maybe
 import Data.Monoid
 import Data.Text (Text)
 import qualified Data.Text as Text
+import qualified GHC.Stack
+import Chainweb.BlockCreationTime (BlockCreationTime(..))
 import Data.Vector (Vector)
 import qualified Data.Vector as V
 import qualified Data.UUID as UUID
@@ -143,6 +147,9 @@ import qualified Pact.Core.Errors as Pact5
 import Chainweb.Pact.Backend.Types
 import qualified Chainweb.Pact.PactService.Checkpointer as Checkpointer
 import Chainweb.Pact.PactService.Checkpointer (SomeBlockM(..))
+import Chainweb.Pact.Backend.Store.Node (ChainStorage(..), sqliteChainStorage, withChainFreezer)
+import Chainweb.Pact.Backend.Store.Split (SplitStoreError)
+import Chainweb.Pact.Service.PactQueue (pactQueueBlockWaiting)
 import Control.Monad.Cont (evalContT)
 import qualified Data.List.NonEmpty as NonEmpty
 
@@ -161,8 +168,28 @@ runPactService
     -> SQLiteEnv
     -> PactServiceConfig
     -> IO ()
-runPactService ver cid chainwebLogger txFailuresCounter reqQ mempoolAccess bhDb pdb sqlenv config =
-    void $ withPactService ver cid chainwebLogger txFailuresCounter bhDb pdb sqlenv config $ do
+runPactService ver cid chainwebLogger txFailuresCounter reqQ mempoolAccess bhDb pdb sqlenv config = do
+    storage <- sqliteChainStorage sqlenv
+    runPactServiceStorage ver cid chainwebLogger txFailuresCounter reqQ mempoolAccess bhDb pdb storage config
+
+-- | 'runPactService' on a chain's storage ('withChainStorage'). In split and
+-- shadow the chain's freezer runs next to the service.
+runPactServiceStorage
+    :: Logger logger
+    => CanReadablePayloadCas tbl
+    => ChainwebVersion
+    -> ChainId
+    -> logger
+    -> Maybe (Counter "txFailures")
+    -> PactQueue
+    -> MemPoolAccess
+    -> BlockHeaderDb
+    -> PayloadDb tbl
+    -> ChainStorage
+    -> PactServiceConfig
+    -> IO ()
+runPactServiceStorage ver cid chainwebLogger txFailuresCounter reqQ mempoolAccess bhDb pdb storage config =
+    void $ withPactServiceStorage ver cid chainwebLogger txFailuresCounter bhDb pdb storage (pactQueueBlockWaiting reqQ) config $ do
         initialPayloadState ver cid
         serviceRequests mempoolAccess reqQ
 
@@ -179,7 +206,29 @@ withPactService
     -> PactServiceM logger tbl a
     -> IO (T2 a PactServiceState)
 withPactService ver cid chainwebLogger txFailuresCounter bhDb pdb sqlenv config act = do
-    Checkpointer.withCheckpointerResources checkpointerLogger (_pactModuleCacheLimit config) sqlenv (_pactPersistIntraBlockWrites config) ver cid $ \checkpointer -> do
+    storage <- sqliteChainStorage sqlenv
+    withPactServiceStorage ver cid chainwebLogger txFailuresCounter bhDb pdb storage (return False) config act
+
+-- | 'withPactService' on a chain's storage. The checkpointer's store is the
+-- chain's 'ChainStore'. In split and shadow, with '_phFreezerEnabled', the
+-- chain's freezer starts once the checkpointer exists and stops when the
+-- service ends.
+withPactServiceStorage
+    :: (Logger logger, CanReadablePayloadCas tbl)
+    => ChainwebVersion
+    -> ChainId
+    -> logger
+    -> Maybe (Counter "txFailures")
+    -> BlockHeaderDb
+    -> PayloadDb tbl
+    -> ChainStorage
+    -> STM Bool
+        -- ^ a block waits for validation ('pactQueueBlockWaiting')
+    -> PactServiceConfig
+    -> PactServiceM logger tbl a
+    -> IO (T2 a PactServiceState)
+withPactServiceStorage ver cid chainwebLogger txFailuresCounter bhDb pdb storage blockWaiting config act = do
+    Checkpointer.withCheckpointerResources checkpointerLogger (_pactModuleCacheLimit config) (_cstSql storage) (_cstStore storage) (_pactPersistIntraBlockWrites config) ver cid $ \checkpointer -> withChainFreezer storage (\io -> withMVar (cpModuleCacheVar checkpointer) (const io)) blockWaiting latestBlockTime $ do
         let !rs = readRewards
         let !pse = PactServiceEnv
                     { _psMempoolAccess = Nothing
@@ -230,12 +279,22 @@ withPactService ver cid chainwebLogger txFailuresCounter bhDb pdb sqlenv config 
             -- 'initalPayloadState.readContracts'. We therefore rewind to the latest
             -- avaliable header in the block header database.
             --
-            Checkpointer.exitOnRewindLimitExceeded $ initializeLatestBlock (_pactUnlimitedInitialRewind config)
+            exitOnRewindBelowFrontier $ Checkpointer.exitOnRewindLimitExceeded $ initializeLatestBlock (_pactUnlimitedInitialRewind config)
             act
   where
+    latestBlockTime = Just . _bct . view blockCreationTime <$> maxEntry bhDb
     pactServiceLogger = setComponent "pact" chainwebLogger
     checkpointerLogger = addLabel ("sub-component", "checkpointer") pactServiceLogger
     gasLogger = addLabel ("transaction", "GasLogs") pactServiceLogger
+
+-- | A startup rewind below the frontier of the split store (owner decision
+-- 2) stops the node with the refusal's message, which names the frontier and
+-- the target.
+exitOnRewindBelowFrontier :: GHC.Stack.HasCallStack => PactServiceM logger tbl a -> PactServiceM logger tbl a
+exitOnRewindBelowFrontier = handle $ \(e :: SplitStoreError) -> do
+    killFunction <- asks _psOnFatalError
+    let msg = Text.pack (displayException e)
+    liftIO $ killFunction (PactInternalError GHC.Stack.callStack msg) msg
 
 initializeLatestBlock :: (Logger logger) => CanReadablePayloadCas tbl => Bool -> PactServiceM logger tbl ()
 initializeLatestBlock unlimitedRewind = Checkpointer.findLatestValidBlockHeader' >>= \case

@@ -34,6 +34,8 @@ import Servant
 
 import Chainweb.ChainId
 import Chainweb.Logger
+import Chainweb.Pact.Backend.Store.Config (PactHistoryStore(..))
+import Chainweb.Pact.Backend.Store.Layout (PactLayoutError(..))
 import Chainweb.Pact.Backend.Store.SQLite (sqlitePactStore)
 import Chainweb.Pact.Backend.Store.Types (PactStore(..))
 import Chainweb.Pact.Backend.Utils(chainDbFileName, withSqliteDb)
@@ -50,6 +52,8 @@ data BackupEnv logger = BackupEnv
   { _backupRocksDb :: !RocksDb
   , _backupDir :: !FilePath
   , _backupPactDbDir :: !FilePath
+  , _backupPactHistory :: !PactHistoryStore
+      -- ^ the backup API is refused in split and shadow ('BackupRefused')
   , _backupChainIds :: !(HashSet ChainId)
   , _backupLogger :: !logger
   }
@@ -76,6 +80,8 @@ instance MimeUnrender PlainText BackupStatus where
 
 makeBackup :: Logger logger => BackupEnv logger -> BackupOptions -> IO ()
 makeBackup env options = do
+    when (_backupPactHistory env /= HistorySqlite) $
+        throwM $ BackupRefused (_backupPactHistory env)
     logCr Info ("making backup to " <> T.pack thisBackup)
     createDirectoryIfMissing True (thisBackup </> "0" </> "sqlite")
     -- we don't create the rocksDb checkpoint folder ourselves,

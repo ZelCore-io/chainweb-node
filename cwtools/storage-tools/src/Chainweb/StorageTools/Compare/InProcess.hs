@@ -76,6 +76,7 @@ import Chainweb.CutDB
 import Chainweb.Logger
 import Chainweb.Mempool.Consensus (mkMempoolConsensus)
 import Chainweb.Mempool.Mempool (MempoolBackend, noopMempool)
+import Chainweb.Pact.Backend.Store.Node (sqliteOnlyStorage)
 import Chainweb.Pact.Backend.Store.Config (PactHistoryConfig(..))
 import Chainweb.Pact.Backend.Types (IntraBlockPersistence(..))
 import Chainweb.Pact.Backend.Utils (chainDbFileName)
@@ -350,5 +351,6 @@ withPacts v conf logger wbhdb pdb mempool sqliteDir cids0 k = go cids0 []
         bhdb <- getWebBlockHeaderDb wbhdb cid
         mpc <- mkMempoolConsensus mempool bhdb (Just pdb)
         let l = addLabel ("chain", toText cid) logger
-        withPactService v cid l Nothing mpc bhdb pdb sqliteDir conf $ \q ->
+        storage <- sqliteOnlyStorage sqliteDir
+        withPactService v cid l Nothing mpc bhdb pdb storage conf $ \q ->
             go rest ((cid, mkPactExecutionService q) : acc)

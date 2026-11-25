@@ -116,6 +116,7 @@ import Chainweb.Pact.Backend.PactState.GrandHash.Algorithm (ChainGrandHash(..))
 import Chainweb.Pact.Backend.PactState.GrandHash.Calc qualified as GrandHash.Calc
 import Chainweb.Pact.Backend.PactState.GrandHash.Import qualified as GrandHash.Import
 import Chainweb.Pact.Backend.PactState.GrandHash.Utils qualified as GrandHash.Utils
+import Chainweb.Test.Utils.Storage (withTestPactStorage)
 import Chainweb.Test.P2P.Peer.BootstrapConfig
 import Chainweb.Test.Pact4.Utils (sigmaCompact)
 import Chainweb.Test.TestVersions
@@ -266,7 +267,8 @@ multiNode
     -> IO ()
 multiNode loglevel write bootstrapPeerInfoVar conf rdb pactDbDir nid inner = do
     withSystemTempDirectory "multiNode-backup-dir" $ \backupTmpDir ->
-            withChainweb conf logger namespacedNodeRocksDb (pactDbDir </> show nid) backupTmpDir False $ \cw -> do
+            withTestPactStorage (_configChainwebVersion conf) (pactDbDir </> show nid) $ \pactStorage ->
+             withChainweb conf logger namespacedNodeRocksDb pactStorage backupTmpDir False $ \cw -> do
                 case cw of
                     StartedChainweb cw' ->
                         when (nid == bootstrapNodeId) $ putMVar bootstrapPeerInfoVar

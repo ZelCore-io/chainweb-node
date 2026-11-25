@@ -73,7 +73,6 @@ data Checkpointer logger
     { cpLogger :: logger
     , cpCwVersion :: ChainwebVersion
     , cpChainId :: ChainId
-    , cpSql :: SQLiteEnv
     , cpStore :: PactStore
     , cpIntraBlockPersistence :: IntraBlockPersistence
     , cpModuleCacheVar :: MVar (DbCache Pact4.PersistModuleData)

@@ -137,6 +137,10 @@ data ShadowEnv = ShadowEnv
         -- tests use a virtual clock)
     , _shLogState :: !ShadowLogState
         -- ^ per-op counts of the rate limit ('newShadowLogState')
+    , _shOnBroken :: !(IO ())
+        -- ^ runs once when the chain becomes broken, before the record is
+        -- logged; the node persists the broken state with it, so that a
+        -- restart stays on the legacy store
     }
 
 -- | Per op: the differences logged in full, the ones suppressed in all and
@@ -412,6 +416,7 @@ rateLimit now o
 markBroken :: ShadowEnv -> Text -> Text -> IO ()
 markBroken env op cause = do
     was <- atomicModifyIORef' (_shBroken env) (\b -> (True, b))
+    unless was $ void $ trySync $ _shOnBroken env
     unless was $ void $ trySync $ logJson env Error $ object
         [ "ShadowBroken" .= object
             [ "chain" .= chainIdToText (_shChain env)

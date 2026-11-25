@@ -61,6 +61,7 @@ import Chainweb.Mempool.Consensus (ReintroducedTxsLog)
 import Chainweb.Mempool.InMemTypes (MempoolStats(..))
 import Chainweb.Miner.Coordinator (MiningStats)
 import Chainweb.Pact.Backend.DbCache (DbCacheStats)
+import Chainweb.Pact.Backend.Store.Node (PactStorage, pactStorageDirs, refuseReset, withPactStorage)
 import Chainweb.Pact.RestAPI.Server (PactCmdLog(..))
 import Chainweb.Pact.Service.PactQueue (PactQueueStats)
 import Chainweb.Pact.Types
@@ -292,14 +293,18 @@ data DbStats = DbStats
     , dbStatsSize :: !Integer
     } deriving (Generic, NFData, ToJSON)
 
-runDatabaseMonitor :: Logger logger => logger -> FilePath -> FilePath -> IO ()
-runDatabaseMonitor logger rocksDbDir pactDbDir = L.withLoggerLabel ("component", "database-monitor") logger go
+-- | Logs the sizes of the RocksDB directory, the current Pact SQLite
+-- directory (@pactDb@) and, in split and shadow, the cold store (@pactCold@).
+runDatabaseMonitor :: Logger logger => logger -> FilePath -> PactStorage -> IO ()
+runDatabaseMonitor logger rocksDbDir pactStorage = L.withLoggerLabel ("component", "database-monitor") logger go
   where
     go l = do
         runMonitorLoop "ChainwebNode.runDatabaseMonitor" l $ do
             logFunctionText l Debug $ "logging database stats"
             logFunctionJson l Info . DbStats "rocksDb" =<< sizeOf rocksDbDir
-            logFunctionJson l Info . DbStats "pactDb" =<< sizeOf pactDbDir
+            dirs <- pactStorageDirs pactStorage
+            forM_ dirs $ \(name, dir) ->
+                logFunctionJson l Info . DbStats name =<< sizeOf dir
             approximateThreadDelay 1_200_000_000 {- 20 minutes -}
     sizeOf path = do
         dir <- doesDirectoryExist path
@@ -317,6 +322,8 @@ runDatabaseMonitor logger rocksDbDir pactDbDir = L.withLoggerLabel ("component",
 node :: HasCallStack => Logger logger => ChainwebNodeConfiguration -> logger -> IO ()
 node conf logger = do
     dbBaseDir <- getDbBaseDir conf
+    -- refused in split and shadow, before anything is removed
+    refuseReset (_configPactHistory cwConf) (_nodeConfigResetChainDbs conf)
     when (_nodeConfigResetChainDbs conf) $ removeDirectoryRecursive dbBaseDir
     rocksDbDir <- getRocksDbDir conf
     pactDbDir <- getPactDbDir conf
@@ -335,7 +342,8 @@ node conf logger = do
     withRocksDb' rocksDbDir modernDefaultOptions (chainwebRocksDbTuning cwConf) $ \rocksDb -> do
         logFunctionText logger Info $ "opened rocksdb in directory " <> sshow rocksDbDir
         logFunctionText logger Debug $ "backup config: " <> sshow (_configBackup cwConf)
-        withChainweb cwConf logger rocksDb pactDbDir dbBackupsDir (_nodeConfigResetChainDbs conf) $ \case
+        withPactStorage logger (_configChainwebVersion cwConf) (_configPactHistory cwConf) (takeDirectory pactDbDir) (_nodeConfigResetChainDbs conf) $ \pactStorage ->
+         withChainweb cwConf logger rocksDb pactStorage dbBackupsDir (_nodeConfigResetChainDbs conf) $ \case
             Replayed _ _ -> return ()
             StartedChainweb cw -> do
                 let telemetryEnabled =
@@ -352,7 +360,7 @@ node conf logger = do
                     , when telemetryEnabled $
                         runBlockUpdateMonitor (_chainwebLogger cw) (_cutResCutDb $ _chainwebCutResources cw)
                     , when telemetryEnabled $
-                        runDatabaseMonitor (_chainwebLogger cw) rocksDbDir pactDbDir
+                        runDatabaseMonitor (_chainwebLogger cw) rocksDbDir pactStorage
                     ]
   where
     cwConf = _nodeConfigChainweb conf
