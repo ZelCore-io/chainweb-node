@@ -682,6 +682,7 @@ test-suite chainweb-tests
         Chainweb.Test.Pact5.TransactionTests
         Chainweb.Test.Pact.Store.Cold
         Chainweb.Test.Pact.Store.ColdKey
+        Chainweb.Test.Pact.Store.ColdRead
         Chainweb.Test.Payload.Store
         Chainweb.Test.ResponseSizeLimiter
         Chainweb.Test.RestAPI

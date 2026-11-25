@@ -49,6 +49,9 @@ module Chainweb.Pact.Backend.Store.Cold
 , ColdChain(..)
 , openColdChain
 , openColdChainWith
+
+  -- * Reads
+, coldReadNewest
 ) where
 
 import Control.Concurrent.MVar
@@ -61,6 +64,8 @@ import qualified Data.ByteString.Builder as BB
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.HashMap.Strict as HM
 import Data.IORef
+import Data.List (sortOn)
+import Data.Ord (Down(..))
 import qualified Data.Map.Strict as M
 import qualified Data.Set as S
 import Data.Text (Text)
@@ -308,6 +313,11 @@ data ColdChain = ColdChain
         -- written.
     , _ccTableId :: !(Text -> IO (Maybe TableId))
         -- ^ the published catalog, looked up with the folded name
+    , _ccReadNewest :: !(Text -> B.ByteString -> Pact4.TxId -> IO (Maybe (B.ByteString, B.ByteString)))
+    , _ccDistinctKeys :: !(Text -> Pact4.TxId -> IO [B.ByteString])
+    , _ccTxIdsBetween :: !(Text -> Pact4.TxId -> Pact4.TxId -> IO [Pact4.TxId])
+    , _ccRowsAtTxId :: !(Text -> Pact4.TxId -> IO (Maybe [(B.ByteString, B.ByteString)]))
+    , _ccRowsInTxIdRange :: !(Text -> Pact4.TxId -> Pact4.TxId -> IO [(Pact4.TxId, B.ByteString, B.ByteString)])
     }
 
 -- | The writer state of a chain. It changes only after a batch is written.
@@ -347,6 +357,12 @@ openColdChainWith writer cs c = do
     catalog <- readCatalog
     metaRef <- newIORef meta
     catalogRef <- newIORef catalog
+    let readers = Readers
+            { _rdDb = db
+            , _rdChain = c
+            , _rdFrontier = txIdWord . frontierTxId . _cmVerified <$> readIORef metaRef
+            , _rdTable = \name -> HM.lookup (foldTableName name) <$> readIORef catalogRef
+            }
     writerVar <- newMVar WriterState
         { _wsMeta = meta
         , _wsTables = catalog
@@ -383,6 +399,11 @@ openColdChainWith writer cs c = do
                         (foldl' (\acc (n, t) -> HM.insert n t acc) cat (_wsUnpublished ws), ())
                     return ws { _wsMeta = m', _wsUnpublished = [] }
         , _ccTableId = \name -> HM.lookup (foldTableName name) <$> readIORef catalogRef
+        , _ccReadNewest = readNewest readers
+        , _ccDistinctKeys = distinctKeys readers
+        , _ccTxIdsBetween = txIdsBetween readers
+        , _ccRowsAtTxId = rowsAtTxId readers
+        , _ccRowsInTxIdRange = rowsInTxIdRange readers
         }
   where
     db = _csDb cs
@@ -500,6 +521,160 @@ openColdChainWith writer cs c = do
         return (next', seen', keyOps', byTxId')
 
 -- -------------------------------------------------------------------------- --
+-- Reads
+--
+-- Every read looks the table up in the published catalog (an unknown table
+-- gives the empty answer) and clamps its upper bound to the verified frontier
+-- @F@, read once per call: rows written but not yet verified are invisible.
+
+data Readers = Readers
+    { _rdDb :: !RocksDb
+    , _rdChain :: !ChainId
+    , _rdFrontier :: !(IO Word64)
+        -- ^ the verified frontier's end txid; 0 for none
+    , _rdTable :: !(Text -> IO (Maybe TableId))
+    }
+
+-- | Runs the read with the table id and the frontier, or gives the default
+-- for an unknown table.
+withTable :: Readers -> Text -> a -> (TableId -> Word64 -> IO a) -> IO a
+withTable rd name def act = _rdTable rd name >>= \case
+    Nothing -> return def
+    Just t -> _rdFrontier rd >>= act t
+
+-- | @R c t@, @T c t@: the six-byte header of a table's range in a keyspace.
+tablePrefix :: B.ByteString -> B.ByteString
+tablePrefix = B.take 6
+
+-- | The stored row key and row data of the newest version with
+-- @txid < min bound F@: one seek-for-prev to @R c t esc(key) (bound - 1)@,
+-- accepted only if the entry is a version of the key. This is spec 4.3's
+-- seek and step back without the step back (ruling 3).
+readNewest :: Readers -> Text -> B.ByteString -> Pact4.TxId -> IO (Maybe (B.ByteString, B.ByteString))
+readNewest rd name key bound = withTable rd name Nothing $ \t f -> do
+    let b = min (txIdWord bound) f
+        c = _rdChain rd
+    if b == 0
+    then return Nothing
+    else withIterator (_rdDb rd) $ \it -> do
+        iterSeekForPrev it (rowKey c t key (b - 1))
+        I.iterEntry it >>= \case
+            Just (k, v) | rowKeyPrefix c t key `B.isPrefixOf` k -> return (Just (key, v))
+            _ -> return Nothing
+
+-- | The keys with a version below @min bound F@, in ascending byte order. A
+-- key's first entry is its oldest version; after it, one seek goes to the
+-- next key.
+distinctKeys :: Readers -> Text -> Pact4.TxId -> IO [B.ByteString]
+distinctKeys rd name bound = withTable rd name [] $ \t f -> do
+    let b = min (txIdWord bound) f
+        c = _rdChain rd
+        prefix = tablePrefix (rowKeyPrefix c t "")
+    if b == 0
+    then return []
+    else withIterator (_rdDb rd) $ \it -> do
+        I.iterSeek it prefix
+        let go acc = I.iterKey it >>= \case
+                Just k | prefix `B.isPrefixOf` k -> case decodeRowKey k of
+                    Nothing -> coldError $ "bad R key: " <> T.pack (show k)
+                    Just (_, _, rk, txid) -> do
+                        -- esc(rk) ends with 0x00 0x00; no escaped key holds
+                        -- 0x00 0x01, so this is the first key after every
+                        -- version of rk
+                        I.iterSeek it (B.init (rowKeyPrefix c t rk) <> "\x01")
+                        go (if txid < b then rk : acc else acc)
+                _ -> return (reverse acc)
+        go []
+
+-- | User tables: the txids @x@ with @lo < x < min hi F@, ascending, from the
+-- @T@ keyspace.
+txIdsBetween :: Readers -> Text -> Pact4.TxId -> Pact4.TxId -> IO [Pact4.TxId]
+txIdsBetween rd name lo hi = withTable rd name [] $ \t f -> do
+    let h = min (txIdWord hi) f
+        l = txIdWord lo
+    if l == maxBound || l + 1 >= h
+    then return []
+    else map (Pact4.TxId . fst) <$> scanTxIds rd t (l + 1) h
+
+-- | The @T@ entries of a table with @from <= txid < to@, ascending, with
+-- their decoded key id lists.
+scanTxIds :: Readers -> TableId -> Word64 -> Word64 -> IO [(Word64, B.ByteString)]
+scanTxIds rd t from to = withIterator (_rdDb rd) $ \it -> do
+    let c = _rdChain rd
+        prefix = tablePrefix (txidKey c t 0)
+    I.iterSeek it (txidKey c t from)
+    let go acc = I.iterEntry it >>= \case
+            Just (k, v) | prefix `B.isPrefixOf` k -> case be64 (B.drop 6 k) of
+                Just x | x < to -> I.iterNext it >> go ((x, v) : acc)
+                       | otherwise -> return (reverse acc)
+                Nothing -> coldError $ "bad T key: " <> T.pack (show k)
+            _ -> return (reverse acc)
+    go []
+
+-- | User tables: the rows of a txid below @F@ in stored rowid order, or
+-- Nothing when the table has no @T@ entry for it.
+rowsAtTxId :: Readers -> Text -> Pact4.TxId -> IO (Maybe [(B.ByteString, B.ByteString)])
+rowsAtTxId rd name txid = withTable rd name Nothing $ \t f -> do
+    let x = txIdWord txid
+    if x >= f
+    then return Nothing
+    else R.get (_rocksDbHandle (_rdDb rd)) mempty (txidKey (_rdChain rd) t x) >>= \case
+        Nothing -> return Nothing
+        Just ids -> Just <$> resolveTxId rd t x ids
+
+-- | Resolves a @T@ list: each key id through @I@, then the exact @R@ entry.
+resolveTxId :: Readers -> TableId -> Word64 -> B.ByteString -> IO [(B.ByteString, B.ByteString)]
+resolveTxId rd t x ids = do
+    let c = _rdChain rd
+        get k = R.get (_rocksDbHandle (_rdDb rd)) mempty k
+    kids <- maybe (coldError $ "bad key id list at txid " <> T.pack (show x)) return (decodeKeyIdList ids)
+    forM kids $ \kid -> do
+        rk <- get (idKey c t kid) >>= maybe
+            (coldError $ "missing I entry for " <> T.pack (show kid)) return
+        v <- get (rowKey c t rk x) >>= maybe
+            (coldError $ "missing R entry at txid " <> T.pack (show x)) return
+        return (rk, v)
+
+-- | The rows with @from <= txid < min to F@: txid descending; within a txid,
+-- rowid ascending for user tables and key order for @SYS:*@ tables, which
+-- have no @T@ lists and are read by a scan of their @R@ range.
+rowsInTxIdRange :: Readers -> Text -> Pact4.TxId -> Pact4.TxId -> IO [(Pact4.TxId, B.ByteString, B.ByteString)]
+rowsInTxIdRange rd name from to = withTable rd name [] $ \t f -> do
+    let lo = txIdWord from
+        hi = min (txIdWord to) f
+    if lo >= hi
+    then return []
+    else if isSysTable (T.toUpper (T.take 4 name))
+    then do
+        rows <- scanPrefix (_rdDb rd) (tablePrefix (rowKeyPrefix (_rdChain rd) t ""))
+        sel <- fmap concat $ forM rows $ \(k, v) -> case decodeRowKey k of
+            Nothing -> coldError $ "bad R key: " <> T.pack (show k)
+            Just (_, _, rk, x)
+                | x >= lo && x < hi -> return [(x, rk, v)]
+                | otherwise -> return []
+        -- R order is key, then txid; a stable sort on txid descending keeps
+        -- key order within a txid
+        return [ (Pact4.TxId x, rk, v) | (x, rk, v) <- sortOn (\(x, _, _) -> Down x) sel ]
+    else do
+        ts <- scanTxIds rd t lo hi
+        fmap concat $ forM (reverse ts) $ \(x, ids) ->
+            fmap (\(rk, v) -> (Pact4.TxId x, rk, v)) <$> resolveTxId rd t x ids
+
+-- | The cold read of spec 4.3: seek to @R c t esc(key) bound@, step back one
+-- entry (from the last entry if the seek ran past the end), and accept the
+-- entry if its row key is the key. Returns the newest version with
+-- @txid < bound@. Not clamped to a frontier: for tools and tests.
+--
+coldReadNewest :: R.DB -> ChainId -> TableId -> B.ByteString -> Word64 -> IO (Maybe B.ByteString)
+coldReadNewest db c tid key bound = RO.withReadOptions mempty $ \ro -> I.withIter db ro $ \it -> do
+    I.iterSeek it (rowKey c tid key bound)
+    valid <- I.iterValid it
+    if valid then I.iterPrev it else I.iterLast it
+    I.iterEntry it >>= \case
+        Just (k, v) | rowKeyPrefix c tid key `B.isPrefixOf` k -> return (Just v)
+        _ -> return Nothing
+
+-- -------------------------------------------------------------------------- --
 -- Helpers
 
 mapAccumM :: Monad m => (s -> a -> m (s, b)) -> s -> [a] -> m (s, [b])
@@ -513,6 +688,11 @@ mapAccumM f = go []
 -- | Four bytes, big-endian.
 word32BE :: Word64 -> B.ByteString
 word32BE = BL.toStrict . BB.toLazyByteString . BB.word32BE . fromIntegral
+
+be64 :: B.ByteString -> Maybe Word64
+be64 b
+    | B.length b == 8 = Just $! B.foldl' (\a x -> a `shiftL` 8 .|. fromIntegral x) 0 b
+    | otherwise = Nothing
 
 be32 :: B.ByteString -> Maybe Word32
 be32 b

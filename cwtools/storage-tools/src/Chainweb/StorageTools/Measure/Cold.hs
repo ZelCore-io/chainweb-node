@@ -141,6 +141,7 @@ import qualified Database.SQLite3 as SQ
 
 import Chainweb.ChainId
 import Chainweb.Logger
+import Chainweb.Pact.Backend.Store.Cold (coldReadNewest)
 import Chainweb.Pact.Backend.Store.Cold.Key
 import Chainweb.Storage.Table.RocksDB
 import Chainweb.Storage.Table.RocksDB.Tuning
@@ -689,20 +690,6 @@ scanPrefix db prefix = R.withReadOptions mempty $ \ro -> I.withIter db ro $ \it 
             Just (k, v) | prefix `B.isPrefixOf` k -> I.iterNext it >> go ((k, v) : acc)
             _ -> return (reverse acc)
     go []
-
--- | The cold read of spec 4.3: seek to @R c t esc(key) bound@, step back one
--- entry (from the last entry if the seek ran past the end), and accept the
--- entry if its row key is the key. Returns the newest version with
--- @txid < bound@.
---
-coldReadNewest :: R.DB -> ChainId -> TableId -> B.ByteString -> Word64 -> IO (Maybe B.ByteString)
-coldReadNewest db c tid key bound = R.withReadOptions mempty $ \ro -> I.withIter db ro $ \it -> do
-    I.iterSeek it (rowKey c tid key bound)
-    valid <- I.iterValid it
-    if valid then I.iterPrev it else I.iterLast it
-    I.iterEntry it >>= \case
-        Just (k, v) | rowKeyPrefix c tid key `B.isPrefixOf` k -> return (Just v)
-        _ -> return Nothing
 
 -- | @measureColdReads sqlite coldDir n seed@ draws @n@ reads (table, key,
 -- bound) from the SQLite file and answers each from the cold store, which was
