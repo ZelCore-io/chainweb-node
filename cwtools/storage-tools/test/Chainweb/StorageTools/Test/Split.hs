@@ -1,6 +1,7 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE NumericUnderscores #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 -- |
 -- Module: Chainweb.StorageTools.Test.Split
@@ -20,16 +21,19 @@ module Chainweb.StorageTools.Test.Split
 ( tests
 ) where
 
+import Control.Exception (SomeException, try)
 import Control.Monad
 
 import Data.Aeson
 import qualified Data.Aeson.Key as K
 import qualified Data.Aeson.KeyMap as KM
 import qualified Data.ByteString as B
-import Data.List (find, nub)
+import Data.IORef
+import Data.List (find, isInfixOf, nub, partition)
 import qualified Data.Map.Strict as M
 import Data.Maybe (isJust)
 import Data.Word (Word64)
+import Network.HTTP.Types (methodGet)
 import qualified Data.Text as T
 
 import qualified Database.RocksDB.Base as R
@@ -53,11 +57,13 @@ import Chainweb.Pact.Backend.Store.Config
 import Chainweb.Pact.Backend.Store.Layout (coldDirName, splitDirName)
 import Chainweb.Pact.Backend.Store.Node
 import Chainweb.Pact.Service.BlockValidation (pactSyncToBlock)
+import Chainweb.Pact.Types (PactServiceConfig(..))
 import Chainweb.Pact.Service.PactInProcApi (withPactServiceDrain)
 import Chainweb.Payload.PayloadStore.RocksDB (newPayloadDb)
 import Chainweb.Storage.Table.RocksDB
 import Chainweb.StorageTools.Compare.InProcess
 import Chainweb.StorageTools.Compare.Report
+import Chainweb.StorageTools.Compare.Requests (DrawStats(..), GenSkip(..), generateRedrawing, skipNoTx)
 import Chainweb.StorageTools.Compare.Run (defaultRunOptions, runCompareClasses)
 import Chainweb.StorageTools.Compare.Sample
 import Chainweb.StorageTools.Compare.Types
@@ -247,6 +253,54 @@ tests = withResource buildTwins removeTwins $ \getTw -> testGroup "Split harness
         forM_ ts $ \t@(_, _, h) -> assertBool ("near a frontier: " <> show t) (nearFrontier (M.elems fs) h)
         assertBool "more than one class" (length (nub [ c | (c, _, _) <- ts ]) > 1)
         frontierTargets [] 50 (baseSpec 1000) @?= []
+
+    , testCase "--frontier-targets: poll and spv redraws stay within 5 heights of a frontier" $ do
+        tw <- getTw
+        fs <- M.elems <$> readFrontierHeights (_twSplit tw) fxChains
+        let spec = baseSpec 1000
+            n = 60
+            ts = frontierTargets fs n spec
+            redrawn (c, _, _) = c == ClsPoll || c == ClsSpv
+        assertBool "poll or spv targets among the draws" (any redrawn ts)
+        calls <- newIORef (0 :: Int)
+        -- the first three batches: no poll or spv target has a transaction
+        -- in its window, so each one is redrawn (three times over)
+        let gen xs = do
+                k <- atomicModifyIORef' calls (\i -> (i + 1, i))
+                let (dropped, kept) = partition (\t -> redrawn t && k < 3) xs
+                return
+                    ( [ Request c ch (Just h) methodGet "/x" Nothing Nothing | (c, ch, h) <- kept ]
+                    , [ GenSkip t skipNoTx "no transaction" | t <- dropped ]
+                    )
+        (rs, skips, stats) <- generateRedrawing gen (frontierRedrawTargets fs spec) ts
+        assertBool "redraws happened" (not (null skips))
+        forM_ [ClsPoll, ClsSpv] $ \c -> forM_ (M.lookup c stats) $ \d ->
+            assertBool (show (c, d)) (_drAttempts d > _drRequested d && _drShort d == 0)
+        length rs @?= n
+        forM_ rs $ \r -> assertBool ("near a frontier: " <> show (_reqClass r, _reqChain r, _reqTarget r)) $
+            maybe False (nearFrontier fs) (_reqTarget r)
+
+    , testCase "--pact-cold-block-cache reaches the in-process side's PactHistoryConfig" $ do
+        let spec = (splitSpec "unused") { _ipColdBlockCacheBytes = 12_345_678 }
+            ph = _pactHistory (inProcessPactConfigFor spec)
+        _phColdBlockCacheBytes ph @?= 12_345_678
+        _phStore ph @?= HistorySplit
+        _phFreezerEnabled ph @?= False
+        _phColdBlockCacheBytes (_pactHistory (inProcessPactConfigFor (e2eSpec "unused")))
+            @?= _phColdBlockCacheBytes defaultPactHistoryConfig
+
+    , testCase "split or shadow on a directory without a cold store: refused up front, directory unchanged" $ do
+        tw <- getTw
+        forM_ [HistorySplit, HistoryShadow] $ \m -> do
+            d <- copyTwin tw _twSqlite ("no-cold-" <> show m)
+            l0 <- listing d
+            r <- try (withInProcessSide quietLogger (e2eSpec d) { _ipPactHistory = m } $ \_ -> return ())
+            case r of
+                Left (e :: SomeException) ->
+                    assertBool ("a clear message: " <> show e) ("no cold store" `isInfixOf` show e)
+                Right () -> assertFailure (show m <> ": not refused")
+            l1 <- listing d
+            l1 @?= l0
 
     , testCase "latency fields present, ordered p50 <= p99 <= max" $ do
         tw <- getTw

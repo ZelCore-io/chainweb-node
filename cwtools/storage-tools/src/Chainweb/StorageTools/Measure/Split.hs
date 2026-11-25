@@ -85,6 +85,7 @@ import qualified Data.ByteString.Base16 as B16
 import qualified Data.ByteString.Builder as BB
 import qualified Data.ByteString.Char8 as B8
 import qualified Data.ByteString.Lazy as BL
+import Data.Containers.ListUtils (nubOrd)
 import Data.List (sort)
 import qualified Data.Map.Strict as M
 import Data.Maybe (catMaybes)
@@ -367,7 +368,8 @@ txlogDigest logger v dir cid mode below = do
     tableDigest store bound t = do
         later <- either (throwIO . userError . (("txlog-digest: txids of " <> T.unpack t <> ": ") <>) . show) return
             =<< _psTxIdsAfter store t (Pact4.TxId 0)
-        let txids = [ w | Pact4.TxId w <- Pact4.TxId 0 : sort later, maybe True (w <) bound ]
+        -- distinct and ascending: a txid listed twice would hash its rows twice
+        let txids = [ w | w <- nubOrd (sort (0 : [ x | Pact4.TxId x <- later ])), maybe True (w <) bound ]
         (ctx, nTx, nRows) <- foldM (\(ctx, nt, nr) w -> do
             rows <- either (throwIO . userError . (("txlog-digest: rows of " <> T.unpack t <> ": ") <>) . show) return
                 =<< _psRowsAtTxId store t (Pact4.TxId w)

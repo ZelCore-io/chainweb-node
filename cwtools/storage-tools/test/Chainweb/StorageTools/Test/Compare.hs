@@ -13,7 +13,7 @@ module Chainweb.StorageTools.Test.Compare
 ( tests
 ) where
 
-import Control.Concurrent (threadDelay)
+import Control.Concurrent (forkIO, threadDelay)
 import Control.Exception (toException)
 import Control.Monad (when)
 
@@ -36,7 +36,10 @@ import Network.Wai
     (Application, pathInfo, queryString, rawPathInfo, rawQueryString, responseLBS, responseRaw, strictRequestBody)
 import Network.Wai.Handler.Warp (testWithApplication)
 
+import System.Directory (removeFile)
 import System.Exit (ExitCode(..))
+import System.FilePath ((</>))
+import System.IO.Temp (withSystemTempDirectory)
 import System.LogLevel (LogLevel(..))
 
 import Test.Tasty
@@ -1181,6 +1184,34 @@ runTests = testGroup "runCompare"
             reportCount rep ClsPayload KindSame @?= 1
             n <- probeCount <$> seenPaths so
             n @?= 1
+
+    , testCase "test-side latency is the final HTTP attempt only: a retry backoff or a pause file wait adds nothing" $ do
+        let opts = defaultRunOptions { _roTransportAttempts = 3, _roRetryDelay = 700_000 }
+            latMax rep = _lsMax <$> reportLatency rep ClsPayload AboveFrontier
+            fast what rep = case latMax rep of
+                Just us -> assertBool (what <> ": " <> show us <> " us") (us < 350_000)
+                Nothing -> assertFailure (what <> ": no latency recorded")
+        -- the test side refuses once (503): the answer comes after a 700 ms backoff
+        (rep1, nt) <- withStubs 1_000 oracleConf testConf { _scPayloadStatuses = [503] } $ \o t _ st -> do
+            rep <- runCompareWith quietLogger opts cov o t [payloadReqFor payloadA]
+            (,) rep . length . filter ("/payload/" `T.isInfixOf`) <$> seenPaths st
+        nt @?= 2
+        reportCount rep1 ClsPayload KindSame @?= 1
+        fast "retried" rep1
+        -- the test side's limiter is paused for 700 ms
+        withSystemTempDirectory "latency-pause" $ \dir -> do
+            let pf = dir </> "PAUSE"
+            writeFile pf "pause"
+            lim <- newLimiter 1_000 (Just pf)
+            rep2 <- withStubs 1_000 oracleConf testConf $ \o t _ _ -> do
+                _ <- forkIO (threadDelay 700_000 >> removeFile pf)
+                t0 <- getMonotonicTime
+                rep <- runCompareWith quietLogger opts cov o t { _sideLimiter = lim } [payloadReqFor payloadA]
+                t1 <- getMonotonicTime
+                assertBool ("the request waited for the pause: " <> show (t1 - t0)) (t1 - t0 >= 0.7)
+                return rep
+            reportCount rep2 ClsPayload KindSame @?= 1
+            fast "paused" rep2
 
     , testCase "a refusal (429, 503) is sent again; a 500 is a final answer; a gateway 504 is final and no answer" $ do
         let opts = defaultRunOptions { _roTransportAttempts = 5, _roRetryDelay = 10_000 }

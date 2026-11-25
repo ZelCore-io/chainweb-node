@@ -25,6 +25,7 @@ module Chainweb.StorageTools.Compare.Sample
 , redrawTargets
 , withFrontierBoundaries
 , frontierTargets
+, frontierRedrawTargets
 , genesisCoverage
 ) where
 
@@ -215,6 +216,20 @@ frontierTargets fs n spec = go (mkStdGen (fromIntegral (_ssSeed spec) * 6_151 + 
                 (cls, near) = pools !! p
                 ((c, h), g2) = drawFrom near g1
             in (cls, c, h) : go g2 (k - 1)
+
+-- | The redraws of @cw-compare --frontier-targets@: like 'redrawTargets', an
+-- infinite list of targets of the class from a generator of its own, but
+-- drawn only from the windows within 'boundaryDistance' heights of a
+-- frontier, as 'frontierTargets' draws. Empty if the class has no covered
+-- height near a frontier.
+--
+frontierRedrawTargets :: [BlockHeight] -> SampleSpec -> RequestClass -> [(RequestClass, ChainId, BlockHeight)]
+frontierRedrawTargets fs spec cls =
+    case [ near | (c, _, near) <- classPools spec { _ssBoundaries = fs }, c == cls, not (null near) ] of
+        [] -> []
+        near : _ -> go near (mkStdGen (fromIntegral (_ssSeed spec) * 7_927 + 1_299_709 + fromEnum cls))
+  where
+    go near g = let ((c, h), g') = drawFrom near g in (cls, c, h) : go near g'
 
 -- | The redraws of a class, for a target that its generation had to drop (a
 -- poll or SPV target without a transaction in its window): an infinite list

@@ -53,6 +53,7 @@ module Chainweb.StorageTools.Compare.InProcess
 -- * Parts
 , resolveDbDir
 , inProcessPactConfig
+, inProcessPactConfigFor
 , inProcessCutDbParams
 , inProcessRate
 ) where
@@ -86,9 +87,9 @@ import Chainweb.Logger
 import Chainweb.Mempool.Consensus (mkMempoolConsensus)
 import Chainweb.Mempool.Mempool (MempoolBackend, noopMempool)
 import Chainweb.Pact.Backend.Store.Cold (ColdOpenMode(..))
-import Chainweb.Pact.Backend.Store.Layout (refuseNonSqliteLayout, splitDirName, sqliteDirName)
+import Chainweb.Pact.Backend.Store.Layout (coldDirName, refuseNonSqliteLayout, splitDirName, sqliteDirName)
 import Chainweb.Pact.Backend.Store.Node (PactStorage, sqliteOnlyStorage, withPactStorageMode)
-import Chainweb.Pact.Backend.Store.Config (PactHistoryConfig(..), PactHistoryStore(..))
+import Chainweb.Pact.Backend.Store.Config (PactHistoryConfig(..), PactHistoryStore(..), pactHistoryStoreToText)
 import Chainweb.Pact.Backend.Types (IntraBlockPersistence(..))
 import Chainweb.Pact.Backend.Utils (chainDbFileName)
 import Chainweb.Pact.RestAPI.Server (PactServerData(..))
@@ -137,7 +138,12 @@ data InProcessSpec = InProcessSpec
         -- ^ @--pact-history-store@ of the database. 'HistorySqlite' refuses
         -- a split or shadow layout; 'HistorySplit' and 'HistoryShadow' open
         -- it as a node does, with the cold store read-only, the node's cold
-        -- block cache size and no freezer
+        -- block cache size and no freezer. Both refuse a directory without
+        -- a cold store
+    , _ipColdBlockCacheBytes :: Int
+        -- ^ the block cache of the cold store in split and shadow mode
+        -- (@--pact-cold-block-cache@), by default the node's
+        -- '_phColdBlockCacheBytes'
     }
 
 -- | The settings of a node's Pact service that change @/local@ answers,
@@ -258,6 +264,19 @@ inProcessPactConfig v ls = PactServiceConfig
     conf = defaultChainwebConfiguration v
     maxGasLimit = fromIntegral <$> maxBlockGasLimit v maxBound maxBound
 
+-- | The Pact service configuration of the side: 'inProcessPactConfig' with
+-- the side's history store and cold block cache.
+--
+inProcessPactConfigFor :: InProcessSpec -> PactServiceConfig
+inProcessPactConfigFor spec = conf0
+    { _pactHistory = (_pactHistory conf0)
+        { _phStore = _ipPactHistory spec
+        , _phColdBlockCacheBytes = _ipColdBlockCacheBytes spec
+        }
+    }
+  where
+    conf0 = inProcessPactConfig (_ipVersion spec) (_ipLocal spec)
+
 -- | The 'CutDb' parameters of a node, read-only: the 'CutDb' writes nothing,
 -- not even to its temporary cut-hashes table.
 --
@@ -282,6 +301,15 @@ withInProcessSide logger0 spec act = do
     -- the way a node does.
     when (mode == HistorySqlite) $
         refuseNonSqliteLayout "cw-compare (in-process side)" dir
+    -- split and shadow need a cold store (a layout the freezer has written):
+    -- refuse before 'resolvePactLayout' creates or converts anything
+    when (mode /= HistorySqlite) $ do
+        let cold = dir </> coldDirName
+        hasCold <- doesFileExist (cold </> "CURRENT")
+        unless hasCold $ throwIO $ userError $
+            "in-process side: --pact-history-store " <> T.unpack (pactHistoryStoreToText mode)
+            <> " needs a split or shadow layout, but there is no cold store at " <> cold
+            <> " (the database is sqlite, or its split layout has not been frozen yet); use --pact-history-store sqlite"
     forM_ pactChains $ \cid -> do
         unless (HS.member cid (chainIds v)) $ throwIO $ userError $
             "in-process side: chain " <> T.unpack (toText cid) <> " is not a chain of " <> show (_versionName v)
@@ -332,8 +360,7 @@ withInProcessSide logger0 spec act = do
     v = _ipVersion spec
     mode = _ipPactHistory spec
     logger = addLabel ("component", "cw-compare-in-process") logger0
-    pactConf0 = inProcessPactConfig v (_ipLocal spec)
-    pactConf = pactConf0 { _pactHistory = (_pactHistory pactConf0) { _phStore = mode } }
+    pactConf = inProcessPactConfigFor spec
 
     -- split and shadow: the node's storage ('withPactStorageMode'), the cold
     -- store read-only with the node's block cache, no freezer

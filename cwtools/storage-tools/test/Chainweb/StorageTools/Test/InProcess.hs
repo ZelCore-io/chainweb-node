@@ -92,7 +92,7 @@ import Chainweb.Logger
 import Chainweb.Mempool.Consensus (mkMempoolConsensus)
 import Chainweb.Mempool.Mempool (InsertType(..), mempoolInsert)
 import Chainweb.Miner.Pact (Miner(..), MinerId(..), MinerKeys(..))
-import Chainweb.Pact.Backend.Store.Config (PactHistoryStore(..))
+import Chainweb.Pact.Backend.Store.Config (PactHistoryConfig(..), PactHistoryStore(..), defaultPactHistoryConfig)
 import Chainweb.Pact.Backend.Store.Layout (NonSqliteLayout(..), PactLayoutError(..))
 import Chainweb.Pact.Backend.Types (IntraBlockPersistence(..))
 import Chainweb.Test.Utils.Storage (NonSqliteFixture(..), makeNonSqliteFixtures)
@@ -445,6 +445,7 @@ specFor dir = InProcessSpec
     , _ipLocal = defaultLocalSettings
     , _ipPauseFile = Nothing
     , _ipPactHistory = HistorySqlite
+    , _ipColdBlockCacheBytes = _phColdBlockCacheBytes defaultPactHistoryConfig
     }
 
 -- | POSTs a body to a side and returns the status and the body.

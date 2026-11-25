@@ -650,9 +650,11 @@ latenciesOn rep cls side =
     , frontierSideOf rep cid h == side
     ]
 
--- | The targets of a class that the test side answered, below or at and
--- above the frontier. Requests without a target height count on neither
--- side.
+-- | The number of requests of a class that the test side answered (those
+-- with a recorded latency), below or at and above the frontier: not the
+-- number of targets drawn or sent. Requests without a target height count on
+-- neither side. These are @belowFrontier@ and @aboveFrontier@ in the JSON
+-- report.
 --
 reportFrontierCount :: Report -> RequestClass -> FrontierSide -> Int
 reportFrontierCount rep cls = length . latenciesOn rep cls
@@ -1032,6 +1034,7 @@ instance ToJSON Report where
             ]
         , "frontiers" .= object
             [ K.fromText (toText cid) .= h | (cid, h) <- M.toList (_repFrontiers rep) ]
+        , "frontierCounts" .= ("perClass belowFrontier and aboveFrontier count the requests the test side answered, by target height against the chain's frontier" :: T.Text)
         , "orderOnly" .= object
             [ "total" .= reportClassTotal rep KindOrderOnly
             , "txids" .= reportOrderOnlyTxids rep

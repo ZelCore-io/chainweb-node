@@ -3,6 +3,7 @@
 {-# LANGUAGE NumericUnderscores #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TupleSections #-}
 
 -- |
 -- Module: Chainweb.StorageTools.Compare.Run
@@ -304,7 +305,22 @@ sendRaw
     -> [Header]
     -> Maybe B.ByteString
     -> IO (Either T.Text (Int, B.ByteString))
-sendRaw env role method path hdrs body = go (1 :: Int)
+sendRaw env role method path hdrs body = fst <$> sendRawTimed env role method path hdrs body
+
+-- | 'sendRaw' and the time (µs) of the HTTP call whose response is the
+-- result: the last attempt only, from after its permit to its whole answer.
+-- The limiter's wait, a pause file and the backoff before a retry are not
+-- part of it. 'Nothing' if no attempt had a response.
+--
+sendRawTimed
+    :: Env
+    -> Role
+    -> Method
+    -> T.Text
+    -> [Header]
+    -> Maybe B.ByteString
+    -> IO (Either T.Text (Int, B.ByteString), Maybe Word64)
+sendRawTimed env role method path hdrs body = go (1 :: Int)
   where
     opts = _envOptions env
     side = sideOf env role
@@ -322,17 +338,20 @@ sendRaw env role method path hdrs body = go (1 :: Int)
                     , HTTP.requestBody = maybe (HTTP.requestBody req0) HTTP.RequestBodyBS body
                     , HTTP.responseTimeout = timeout
                     }
-            HTTP.httpLbs req (_envManager env)
+            t0 <- getMonotonicTimeNSec
+            resp <- HTTP.httpLbs req (_envManager env)
+            t1 <- getMonotonicTimeNSec
+            return (resp, (t1 - t0) `div` 1_000)
         let again = threadDelay (_roRetryDelay opts * 2 ^ (attempt - 1)) >> go (attempt + 1)
-            noAnswer why = return $ Left $
+            noAnswer why = return $ (, Nothing) $ Left $
                 "no answer from " <> _sideName side <> " for " <> T.pack url
                 <> " after " <> sshow attempt <> " attempt(s): " <> why
         case r of
-            Right resp
+            Right (resp, us)
                 | isRefusal s, attempt < _roTransportAttempts opts -> again
                 | isRefusal s -> noAnswer ("refused with status " <> sshow s)
                 | isGatewayFailure s -> noAnswer ("gateway status " <> sshow s)
-                | otherwise -> return $ Right (s, BL.toStrict (HTTP.responseBody resp))
+                | otherwise -> return (Right (s, BL.toStrict (HTTP.responseBody resp)), Just us)
               where
                 s = statusCode (HTTP.responseStatus resp)
             Left (e :: HTTP.HttpException)
@@ -348,11 +367,9 @@ toAnswer r (s, b) = Answer s b $ if isPinnedClass (_reqClass r) then answerPin b
 
 sendTo :: Env -> Role -> Request -> T.Text -> IO (Either T.Text Answer)
 sendTo env role r path = do
-    t0 <- getMonotonicTimeNSec
-    a <- fmap (toAnswer r) <$> sendRaw env role (_reqMethod r) path (requestHeaders r) (_reqBody r)
-    t1 <- getMonotonicTimeNSec
-    when (role == TestRole) $ _envOnTestAnswer env ((t1 - t0) `div` 1_000)
-    return a
+    (a, us) <- sendRawTimed env role (_reqMethod r) path (requestHeaders r) (_reqBody r)
+    when (role == TestRole) $ forM_ us (_envOnTestAnswer env)
+    return (toAnswer r <$> a)
 
 -- | Sending a request once to both sides.
 --
@@ -590,9 +607,10 @@ checkOrphan env r ph = case (_reqTarget r, apiPrefixOfPath (_reqPath r)) of
 -- Comparing
 
 -- | 'compareOne' and the test side's latency (µs) of the request whose
--- answer the verdict uses: the last one sent to the test side, from the
--- start of the call to the whole answer (the limiter's wait and transport
--- retries included). 'Nothing' if the request was not sent to the test side
+-- answer the verdict uses: the last one sent to the test side, its final
+-- HTTP attempt only ('sendRawTimed': the limiter's wait, a pause file and
+-- the backoff of transport retries are excluded). 'Nothing' if the request
+-- was not sent to the test side
 -- or it gave no answer.
 --
 compareTimed :: Env -> (Int, Request) -> IO (Outcome, Maybe Word64)

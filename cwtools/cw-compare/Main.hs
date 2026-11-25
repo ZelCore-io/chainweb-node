@@ -88,7 +88,7 @@ import System.LogLevel
 import Chainweb.BlockHeight
 import Chainweb.ChainId
 import Chainweb.Logger
-import Chainweb.Pact.Backend.Store.Config (PactHistoryStore(..), pactHistoryStoreReader, pactHistoryStoreToText)
+import Chainweb.Pact.Backend.Store.Config (PactHistoryConfig(..), PactHistoryStore(..), defaultPactHistoryConfig, pactHistoryStoreReader, pactHistoryStoreToText)
 import Chainweb.Storage.Table.RocksDB.Tuning (defaultTuning, payloadZstdTuning)
 import Chainweb.StorageTools.Compare.InProcess
 import Chainweb.StorageTools.Compare.PactSet
@@ -134,6 +134,7 @@ data DbSide = DbSide
     , _tdZstd :: !Bool
     , _tdLocal :: !LocalSettings
     , _tdPactHistory :: !PactHistoryStore
+    , _tdColdBlockCache :: !Int
     }
 
 data Source
@@ -205,6 +206,20 @@ testDbOptions = DbSide
         <> showDefaultWith (T.unpack . pactHistoryStoreToText)
         <> help "with --test-db: the Pact history store of the database. sqlite refuses a split or shadow layout; split and shadow open it as a node does, the cold store read-only with the node's block cache and no freezer, and add each chain's verified frontier height to the sampling boundaries"
         )
+    <*> option (eitherReader positiveBytes)
+        ( long "pact-cold-block-cache"
+        <> metavar "BYTES"
+        <> value (_phColdBlockCacheBytes defaultPactHistoryConfig)
+        <> showDefault
+        <> help "with --test-db and --pact-history-store split or shadow: the block cache of the cold store, in bytes"
+        )
+
+-- | A positive number of bytes.
+--
+positiveBytes :: String -> Either String Int
+positiveBytes s = case reads s of
+    [(n, "")] | n > 0 -> Right n
+    _ -> Left $ "expected a positive number of bytes: " <> s
 
 testSideOptions :: Parser TestSide
 testSideOptions = TestUrl <$> strOption
@@ -349,7 +364,7 @@ main = do
         settings = case _optTest o of
             TestUrl _ -> []
             TestDb td -> localSettingsText (_tdLocal td)
-                <> [("pactHistoryStore", pactHistoryStoreToText (_tdPactHistory td))]
+                <> [("pactHistoryStore", pactHistoryStoreToText (_tdPactHistory td)), ("pactColdBlockCacheBytes", T.pack (show (_tdColdBlockCache td)))]
         covered = M.keys (let Coverage m = coverage in m)
     -- the frontier heights: of --frontier-from, else of a split or shadow
     -- test database; read before the side opens (its freezer is off, so they
@@ -382,16 +397,18 @@ main = do
                     , _ssPactChains = pactChains
                     }
                     & withFrontierBoundaries (M.elems frontiers)
-            targets <- case _genCount g of
-                Count _ -> return (sampleTargets spec)
+            -- with --frontier-targets, the redraws of poll and spv targets
+            -- come from the windows near a frontier too
+            (targets, redraws) <- case _genCount g of
+                Count _ -> return (sampleTargets spec, redrawTargets spec)
                 FrontierTargets n -> do
                     when (M.null frontiers) $ die
                         "--frontier-targets: no frontier height (use --test-db with --pact-history-store split or shadow, or --frontier-from)"
-                    return (frontierTargets (M.elems frontiers) n spec)
+                    return (frontierTargets (M.elems frontiers) n spec, frontierRedrawTargets (M.elems frontiers) spec)
             logFunctionText logger Info $ "generating " <> T.pack (show (length targets)) <> " requests"
             progress <- newGenProgress (logFunctionText logger Info) (length targets)
             (rs, skips, draws) <- generateRequestsRedrawingP (Just progress) (GenOptions (_genSameSnapshot g)) api pset (_genSeed g)
-                (redrawTargets spec) targets
+                redraws targets
             forM_ skips $ \(GenSkip (cls, cid, h) k e) -> logFunctionText logger Warn $
                 "target skipped at generation (" <> requestClassText cls <> ", chain " <> toText cid
                 <> ", height " <> T.pack (show h) <> "): " <> k <> ": " <> e
@@ -467,4 +484,5 @@ inProcessSpec o td = InProcessSpec
         , _ipLocal = _tdLocal td
         , _ipPauseFile = _optPauseFile o
         , _ipPactHistory = _tdPactHistory td
+        , _ipColdBlockCacheBytes = _tdColdBlockCache td
         }
