@@ -33,10 +33,28 @@ module Chainweb.Test.Pact.Store.Characterization
     , tn5
     , tx
     , v4
+    , v5
     , withP4
     , withP5
+    -- * The store the script runs on
+    , ScriptStorage(..)
+    , withCpOn
+    , withP4In
+    , withP5In
+    , p5Header
+    , p5Read
+    , probe
+    , probe5
+    , ut4
+    , row4
+    -- * Goldens that only read, for the split and shadow stores
+    , pact4History
+    , missingTableErrors
+    , readsAtHeights
+    , lookupTxs
     ) where
 
+import Control.Concurrent.MVar (newMVar, withMVar)
 import Control.Exception (evaluate)
 import Control.Exception.Safe
 import Control.Lens
@@ -61,6 +79,8 @@ import qualified Data.Vector as V
 import Data.Word
 import qualified Streaming.Prelude as Stream
 import System.LogLevel
+import System.FilePath ((</>))
+import System.IO.Temp (withSystemTempDirectory)
 import Test.Tasty (TestTree, testGroup)
 
 import Database.SQLite3.Direct (Utf8(..))
@@ -92,6 +112,8 @@ import Chainweb.BlockHeader.Internal
 import Chainweb.BlockHeight
 import Chainweb.Logger
 import Chainweb.Pact.Backend.Types
+import Chainweb.Pact.Backend.Store.Config
+import Chainweb.Pact.Backend.Store.Node
 import Chainweb.Pact.Backend.Store.Types (PactStore(..))
 import Chainweb.Pact.Backend.Utils
 import qualified Chainweb.Pact.PactService.Checkpointer.Internal as Checkpointer
@@ -113,12 +135,12 @@ tests :: TestTree
 tests = testGroup "Chainweb.Test.Pact.Store.Characterization"
     [ golden "pact-store-pact4-commit" $ render <$> pact4Commit
     , golden "pact-store-pact5-commit" $ render <$> pact5Commit
-    , golden "pact-store-pact4-history" $ render <$> pact4History
-    , golden "pact-store-missing-table-errors" $ render <$> missingTableErrors
-    , golden "pact-store-reads" $ render <$> readsAtHeights
+    , golden "pact-store-pact4-history" $ render <$> pact4History ScriptSqlite
+    , golden "pact-store-missing-table-errors" $ render <$> missingTableErrors ScriptSqlite
+    , golden "pact-store-reads" $ render <$> readsAtHeights ScriptSqlite
     , golden "pact-store-rewind" $ render <$> rewind
     , golden "pact-store-pact5-rewind" $ render <$> pact5Rewind
-    , golden "pact-store-lookup-txs" $ render <$> lookupTxs
+    , golden "pact-store-lookup-txs" $ render <$> lookupTxs ScriptSqlite
     ]
   where
     render = BL.fromStrict . T.encodeUtf8 . T.unlines
@@ -139,8 +161,8 @@ pact5Commit = withP5 $ \cp sql -> do
 
 -- | @_txids@, @_getTxLog@ and @_keys@ at the tip and rewound. Pact42 (sorted
 -- keys) is on from height 5 in 'v4'.
-pact4History :: IO [Text]
-pact4History = withP4 $ \cp _ -> do
+pact4History :: ScriptStorage -> IO [Text]
+pact4History s = withP4In s $ \cp _ -> do
     let (early, late) = splitAt 3 (zip p4Headers scenario)
     extend cp Nothing (uncurry p4Block <$> early)
     tipOff <- p4Read cp (p4Header 2) historyProbe
@@ -177,9 +199,9 @@ pact4History = withP4 $ \cp _ -> do
 -- never exists, of an existing table under a different case (@T2@) and of a
 -- missing key in an existing table, at the tip and rewound, in Pact 4 and
 -- Pact 5.
-missingTableErrors :: IO [Text]
-missingTableErrors = do
-    p4 <- withP4 $ \cp _ -> do
+missingTableErrors :: ScriptStorage -> IO [Text]
+missingTableErrors s = do
+    p4 <- withP4In s $ \cp _ -> do
         extend cp Nothing (zipWith p4Block p4Headers scenario)
         tip <- p4Read cp (p4Header 6) $ \env -> concatMapM (p4Probe env)
             [("nope", "a"), ("t2", "x"), ("T2", "x"), ("t1", "nokey")]
@@ -193,7 +215,7 @@ missingTableErrors = do
             , section "Pact 4 rewound, block height 2 (t2 is created at 2)" r1
             , section "Pact 4 rewound, block height 3" r2
             ]
-    p5 <- withP5 $ \cp _ -> do
+    p5 <- withP5In s $ \cp _ -> do
         extend cp Nothing (zipWith p5Block p5Headers scenario)
         tip <- p5Read cp (p5Header 6) $ \pdb -> concatMapM (p5Probe pdb)
             [("nope", "a"), ("t2", "x"), ("T2", "x"), ("t1", "nokey")]
@@ -278,13 +300,13 @@ rewindScript with blocks hdr = do
 -- * 5: limit 12, which is the txid of @B@, so @B@ is not visible;
 -- * 2: limit 7, which is the txid of @zz@ and @ks2@, so they are not visible;
 -- * 1: limit 4, below the creation of @t2@.
-readsAtHeights :: IO [Text]
-readsAtHeights = do
-    p4 <- withP4 $ \cp _ -> do
+readsAtHeights :: ScriptStorage -> IO [Text]
+readsAtHeights s = do
+    p4 <- withP4In s $ \cp _ -> do
         extend cp Nothing (zipWith p4Block p4Headers scenario)
         forM readParents $ \(p, lbl) ->
             section ("Pact 4 " <> lbl) <$> p4Read cp (p4Header p) readProbe4
-    p5 <- withP5 $ \cp _ -> do
+    p5 <- withP5In s $ \cp _ -> do
         extend cp Nothing (zipWith p5Block p5Headers scenario)
         forM readParents $ \(p, lbl) ->
             section ("Pact 5 " <> lbl) <$> p5Read cp (p5Header p) readProbe5
@@ -317,8 +339,8 @@ readsAtHeights = do
 
 -- | '_psDoLookupSuccessful' (3.2.1's 'doLookupSuccessful') for found, unknown
 -- and at-or-above-height hashes.
-lookupTxs :: IO [Text]
-lookupTxs = withP4 $ \cp _ -> do
+lookupTxs :: ScriptStorage -> IO [Text]
+lookupTxs s = withP4In s $ \cp _ -> do
     extend cp Nothing (zipWith p4Block p4Headers scenario)
     let hashes = ["tx-0-0", "tx-1-1", "tx-2-0", "tx-3-1", "tx-6-0", "unknown"]
     fmap concat $ forM [0, 2, 3, 7] $ \h -> do
@@ -369,6 +391,12 @@ withP4 k = withTempSQLiteConnection chainwebPragmas $ \sql -> do
         defaultModuleCacheLimit sql PersistIntraBlockWrites quietLogger v4 cid
     k cp sql
 
+-- | 'withP4' on the given store. The callback gets the primary connection
+-- (see '_cstSql').
+withP4In :: ScriptStorage -> (Checkpointer GenericLogger -> SQLiteEnv -> IO a) -> IO a
+withP4In ScriptSqlite k = withP4 k
+withP4In s k = withCpOn s PersistIntraBlockWrites v4 $ \cp cst -> k cp (_cstSql cst)
+
 ut4 :: Text -> P4.Domain P4.RowKey P4.RowData
 ut4 = P4.UserTables . P4.TableName
 
@@ -416,6 +444,63 @@ withP5 k = withTempSQLiteConnection chainwebPragmas $ \sql -> do
     cp <- Checkpointer.initCheckpointerResources
         defaultModuleCacheLimit sql DoNotPersistIntraBlockWrites quietLogger v5 cid
     k cp sql
+
+-- | 'withP5' on the given store.
+withP5In :: ScriptStorage -> (Checkpointer GenericLogger -> SQLiteEnv -> IO a) -> IO a
+withP5In ScriptSqlite k = withP5 k
+withP5In s k = withCpOn s DoNotPersistIntraBlockWrites v5 $ \cp cst -> k cp (_cstSql cst)
+
+-- -------------------------------------------------------------------------- --
+-- The store the script runs on
+
+-- | Where a script's checkpointer keeps the Pact history.
+data ScriptStorage
+    = ScriptSqlite
+        -- ^ a temporary SQLite file, as the goldens were recorded
+    | ScriptSplit !BlockHeight
+        -- ^ a split store in a temporary directory, at this freeze depth
+    | ScriptShadow !BlockHeight !GenericLogger
+        -- ^ a shadow store at this freeze depth, logging to this logger
+
+-- | A checkpointer on a chain storage of the given kind. In split and
+-- shadow, freeze steps are one height, the freezer thread never starts, and
+-- the freezer is drained after every write batch of the checkpointer (one
+-- 'Checkpointer.restoreAndSave' or 'Checkpointer.rewindTo'), so the frontier
+-- is as far up as the freeze depth allows whenever the script reads.
+withCpOn
+    :: ScriptStorage
+    -> IntraBlockPersistence
+    -> ChainwebVersion
+    -> (Checkpointer GenericLogger -> ChainStorage -> IO a)
+    -> IO a
+withCpOn ScriptSqlite p v k = withTempSQLiteConnection chainwebPragmas $ \sql -> do
+    cst <- sqliteChainStorage sql
+    cp <- Checkpointer.initCheckpointerResourcesWith
+        defaultModuleCacheLimit sql (_cstStore cst) p quietLogger v cid
+    k cp cst
+withCpOn s p v k = withSystemTempDirectory "pact-script" $ \tmp ->
+    withPactStorage quietLogger v cfg (tmp </> "0") False $ \st ->
+        withChainStorage logger st cid False $ \cst -> do
+            lock <- newMVar ()
+            withChainFreezer cst (\io -> withMVar lock (const io)) (return False) (return Nothing) $ \_neverStarted -> do
+                cp0 <- Checkpointer.initCheckpointerResourcesWith
+                    defaultModuleCacheLimit (_cstSql cst) (_cstStore cst) p quietLogger v cid
+                let store = cpStore cp0
+                    drained :: IO b -> IO b
+                    drained act = do
+                        r <- _psWithBatch store act
+                        _ <- drainChainFreezer cst
+                        return r
+                k cp0 { cpStore = store { _psWithBatch = drained } } cst
+  where
+    (mode, depth, logger) = case s of
+        ScriptSplit d -> (HistorySplit, d, quietLogger)
+        ScriptShadow d l -> (HistoryShadow, d, l)
+    cfg = defaultPactHistoryConfig
+        { _phStore = mode
+        , _phFreezeDepth = depth
+        , _phFreezeStepHeights = 1
+        }
 
 tn5 :: Text -> TableName
 tn5 t = TableName t (ModuleName "m" Nothing)

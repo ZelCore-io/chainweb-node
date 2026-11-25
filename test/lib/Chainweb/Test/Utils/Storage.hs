@@ -60,6 +60,7 @@ module Chainweb.Test.Utils.Storage
 , withTestPactStorage
 , testSplitStorage
 , acquireTestChainStorage
+, acquireSplitChainStorageFor
 , testChainStorageResource
 , withTestChainStorage
 , testStorageLogger
@@ -188,6 +189,12 @@ testPactHistoryConfigFor = foldl apply defaultPactHistoryConfig
 withTestPactStorage :: ChainwebVersion -> FilePath -> (PactStorage -> IO a) -> IO a
 withTestPactStorage v dir k = do
     cfg0 <- testPactHistoryConfig
+    withTestPactStorageFor cfg0 v dir k
+
+-- | 'withTestPactStorage' with the given configuration in place of that of
+-- @CHAINWEB_TEST_STORAGE@.
+withTestPactStorageFor :: PactHistoryConfig -> ChainwebVersion -> FilePath -> (PactStorage -> IO a) -> IO a
+withTestPactStorageFor cfg0 v dir k =
     case _phStore cfg0 of
         HistorySqlite -> sqliteOnlyStorage dir >>= k
         _ -> withPactStorage (genericLogger Error (\_ -> return ())) v
@@ -219,13 +226,27 @@ acquireTestChainStorage v cid openSqlite closeSqlite = testSplitStorage >>= \cas
 
 acquireSplitChainStorage :: ChainwebVersion -> ChainId -> IO (ChainStorage, IO ())
 acquireSplitChainStorage v cid = do
+    cfg <- testPactHistoryConfig
+    acquireSplitChainStorageFor cfg (return ()) v cid
+
+-- | The split or shadow storage of 'acquireTestChainStorage' with the given
+-- configuration. @onClosed@ runs once the chain's storage is closed. The
+-- release action closes the storage and removes the directory also when
+-- 'checkShadowNotBroken' fails, and then rethrows that failure.
+acquireSplitChainStorageFor
+    :: PactHistoryConfig
+    -> IO ()
+    -> ChainwebVersion
+    -> ChainId
+    -> IO (ChainStorage, IO ())
+acquireSplitChainStorageFor cfg onClosed v cid = do
     tmp <- getCanonicalTemporaryDirectory
     dir <- createTempDirectory tmp "pact-storage"
     logs <- newIORef []
-    (st, release) <- acquireCps (\k -> withTestPactStorage v (dir </> "0") $ \ps ->
-            withChainStorage (testStorageLogger logs) ps cid False k)
+    (st, release) <- acquireCps (\k -> (withTestPactStorageFor cfg v (dir </> "0") $ \ps ->
+            withChainStorage (testStorageLogger logs) ps cid False k) >> onClosed)
         `onException` removeDirectoryRecursive dir
-    return (st, (checkShadowNotBroken logs st >> release) `finally` removeDirectoryRecursive dir)
+    return (st, (checkShadowNotBroken logs st `finally` release) `finally` removeDirectoryRecursive dir)
 
 -- | 'acquireTestChainStorage' as a resource. In sqlite mode the storage is
 -- on the given SQLite resource, as before.
