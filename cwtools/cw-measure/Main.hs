@@ -1,3 +1,4 @@
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 
 -- |
@@ -24,6 +25,7 @@ import Options.Applicative
 import System.Exit (exitFailure)
 import System.IO (stderr)
 import System.LogLevel (LogLevel(..))
+import Text.Printf (printf)
 
 import Chainweb.ChainId
 import Chainweb.Logger (genericLogger)
@@ -37,7 +39,7 @@ import Chainweb.Version.Registry (findKnownVersion)
 data Command
     = PayloadSize ChainwebVersion FilePath FilePath
     | PayloadRead FilePath RocksDbTuning Int Word64
-    | Cold ColdBuildSpec Int Word64 (Maybe FilePath)
+    | Cold ColdBuildSpec ColdTuning Int Word64 Int (Maybe FilePath)
     | Project ProjectArgs
 
 data ProjectArgs = ProjectArgs
@@ -73,6 +75,33 @@ tuningReader = eitherReader $ \s -> case s of
     "cold" -> Right coldStoreTuning
     _ -> Left $ "unknown tuning: " <> s <> " (default, zstd or cold)"
 
+nonNegative :: ReadM Int
+nonNegative = eitherReader $ \s -> case reads s of
+    [(n, "")] | n >= 0 -> Right n
+    _ -> Left $ "expected a non-negative integer: " <> s
+
+boolReader :: ReadM Bool
+boolReader = eitherReader $ \case
+    "true" -> Right True
+    "false" -> Right False
+    s -> Left $ "expected true or false: " <> s
+
+-- | The RocksDB options of a cold run; the defaults are M0's.
+coldTuningOptions :: Parser ColdTuning
+coldTuningOptions = ColdTuning
+    <$> option nonNegative (long "bloom-bits" <> metavar "N" <> value (_ctBloomBits d) <> showDefault <> help "bloom filter bits per key; 0 writes no filter")
+    <*> option (eitherReader pos) (long "block-size" <> metavar "BYTES" <> value (_ctBlockSize d) <> showDefault)
+    <*> optional (option nonNegative (long "bottommost-zstd-level" <> metavar "N" <> help "zstd level of the bottommost level; default: off, the level of the other levels"))
+    <*> option boolReader (long "dynamic-level-bytes" <> metavar "true|false" <> value (_ctDynamicLevelBytes d) <> showDefault <> help "level_compaction_dynamic_level_bytes")
+    <*> option boolReader (long "cache-index-and-filter" <> metavar "true|false" <> value (_ctCacheIndexAndFilter d) <> showDefault <> help "index and filter blocks in the block cache, level 0 pinned")
+    <*> option positive (long "cold-cache-bytes" <> metavar "N" <> value (_ctColdCacheBytes d) <> showDefault <> help "block cache of the cold passes (direct reads). With --cache-index-and-filter true the index and filter blocks compete for it; the node's cache is 1 GiB, so read cold figures of those runs with the size in mind")
+  where
+    d = defaultColdTuning
+    pos s = case reads s of
+        [(n, "")] | n > 0 -> Right n
+        _ -> Left $ "expected a positive integer: " <> s
+    positive = eitherReader pos
+
 commands :: Parser Command
 commands = hsubparser $ mconcat
     [ cmd "payload-size" "size of each table on disk, under the default and the zstd tuning"
@@ -95,9 +124,11 @@ commands = hsubparser $ mconcat
                 <*> optional (some (strOption (long "table" <> metavar "NAME" <> help "copy only this table (repeatable; TransactionIndex included); default: all")))
                 <*> strOption (long "out" <> metavar "DIR" <> help "the cold store; must not exist")
                 <*> option auto (long "batch-bytes" <> metavar "N" <> value defaultBatchBytes <> showDefault))
+            <*> coldTuningOptions
             <*> option auto (long "samples" <> metavar "N" <> value 1000 <> showDefault <> help "cold reads, checked against SQLite")
             <*> option auto (long "seed" <> metavar "SEED" <> value 1 <> showDefault)
-            <*> optional (strOption (long "json" <> metavar "FILE" <> help "write {sizes, latency} as JSON, the input of project"))
+            <*> option nonNegative (long "txid-reads" <> metavar "N" <> value 0 <> showDefault <> help "time N by-txid reads on sampled user-table txids (the T get, the I gets and the exact R gets), warm and after the direct-I/O reopen, each checked against SQLite's WHERE txid = ? rows")
+            <*> optional (strOption (long "json" <> metavar "FILE" <> help "write {sizes, latency, tuning, buildSeconds, txidReadLatency} as JSON; project reads sizes and latency"))
     , cmdF "project" "project the cold-store measurements over all 20 chains: the R or S verdict"
         projectFooter
         $ fmap Project $ ProjectArgs
@@ -116,7 +147,9 @@ commands = hsubparser $ mconcat
     coldFooter = unwords
         [ "Exits non-zero if any cold read differs from SQLite."
         , "Memory: Task 17 runs it as cw-measure +RTS -M5g -N4 -RTS cold ..."
-        , "--json writes {\"sizes\": ColdSizes, \"latency\": ColdLatency}."
+        , "--json writes {\"sizes\": ColdSizes, \"latency\": ColdLatency, \"tuning\": the settings used,"
+        , "\"buildSeconds\", and with --txid-reads \"txidReadLatency\": {reads, coldReads, rows, mismatches,"
+        , "warmP50, warmP99, coldP50, coldP99} in microseconds}."
         , "ColdSizes: {chain, sqliteFileBytes, totalSst, hotKeptBytes, hotAnchorBytes,"
         , "keyspaceSst: {I, K, N, R, T, X}, tables: {NAME: {versions, distinctKeys,"
         , "keyBytes, valueBytes, sstBytes, sqliteBytes}}}."
@@ -140,17 +173,19 @@ main = do
     case c of
         PayloadSize v db work -> T.putStr . renderPayloadSizes =<< measurePayloadSizes v db work
         PayloadRead db tuning n seed -> T.putStr . renderLatencies =<< measurePayloadReads db tuning n seed
-        Cold spec n seed json -> do
+        Cold spec tuning n seed txidReads json -> do
             let logger = genericLogger Info (T.hPutStrLn stderr)
-            sizes <- buildColdFromSqlite logger spec
-            T.putStr (renderColdSizes sizes)
-            latency <- measureColdReads (_cbSqlite spec) (_cbOut spec) n seed
-            T.putStr (renderColdLatency latency)
-            forM_ json $ \f -> BL.writeFile f $ encode $ object
-                [ "sizes" .= sizes, "latency" .= latency ]
+            run <- runColdMeasure logger tuning spec n seed txidReads
+            T.putStrLn (renderColdTuning tuning)
+            T.putStr (renderColdSizes (_crSizes run))
+            T.putStrLn $ "build: " <> T.pack (printf "%.1f s" (_crBuildSeconds run))
+            T.putStr (renderColdLatency (_crLatency run))
+            forM_ (_crTxid run) $ T.putStr . renderTxidLatency
+            forM_ json $ \f -> BL.writeFile f (encode run)
             -- a mismatch means the cold store or the measurement is wrong
-            when (_clMismatches latency > 0) $ do
-                T.hPutStrLn stderr $ "error: " <> T.pack (show (_clMismatches latency))
+            let bad = _clMismatches (_crLatency run) + maybe 0 _tlMismatches (_crTxid run)
+            when (bad > 0) $ do
+                T.hPutStrLn stderr $ "error: " <> T.pack (show bad)
                     <> " cold reads differ from SQLite"
                 exitFailure
         Project pa -> do
