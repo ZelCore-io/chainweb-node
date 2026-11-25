@@ -61,6 +61,7 @@ module Chainweb.StorageTools.Measure.Cold
 , buildColdFromSqliteWith
 , ColdTuning(..)
 , defaultColdTuning
+, defaultColdCacheBytes
 , coldMeasureTuning
 , keptTables
 , transactionIndexTable
@@ -196,8 +197,17 @@ data ColdTuning = ColdTuning
         -- ^ @level_compaction_dynamic_level_bytes@
     , _ctCacheIndexAndFilter :: !Bool
         -- ^ index and filter blocks in the block cache, level 0 pinned
+    , _ctColdCacheBytes :: !Int
+        -- ^ block cache of the cold passes (direct reads); 'defaultColdCacheBytes'
+        -- keeps M0's. With 'cacheIndexAndFilter' the index and filter blocks
+        -- compete for it, which they do not in the node's 1 GiB cache.
     }
     deriving (Show, Eq, Generic)
+
+-- | 8 MiB, the block cache of M0's cold pass.
+--
+defaultColdCacheBytes :: Int
+defaultColdCacheBytes = 8 * 1024 * 1024
 
 -- | M0's settings: bloom 10, 32 KB blocks, and the three options added by
 -- Task 21 off. 'coldStoreTuning' itself has the two boolean options on, so
@@ -210,6 +220,7 @@ defaultColdTuning = ColdTuning
     , _ctBottommostZstdLevel = Nothing
     , _ctDynamicLevelBytes = False
     , _ctCacheIndexAndFilter = False
+    , _ctColdCacheBytes = defaultColdCacheBytes
     }
 
 -- | 'coldStoreTuning' with the options of a run.
@@ -237,6 +248,7 @@ instance ToJSON ColdTuning where
         , "bottommostZstdLevel" .= _ctBottommostZstdLevel t
         , "dynamicLevelBytes" .= _ctDynamicLevelBytes t
         , "cacheIndexAndFilter" .= _ctCacheIndexAndFilter t
+        , "coldCacheBytes" .= _ctColdCacheBytes t
         ]
       where
         rt = coldMeasureTuning t
@@ -826,12 +838,17 @@ pctUs p xs =
 -- The expected answer is SQLite's @SELECT rowdata ... WHERE rowkey = ? AND
 -- txid < ? ORDER BY txid DESC LIMIT 1@. The warm pass opens the store with
 -- 'coldStoreTuning', reads every sample once untimed and once timed. The cold
--- pass opens it afresh with direct reads (no OS page cache) and an 8 MiB block
--- cache and reads each distinct (table, key) once, with the bound of its first
--- sample, so that no cold read repeats an earlier one. It can still hit what
--- an earlier read loaded: different keys can share a data block, and each
--- file's index and filter blocks are loaded once and stay in memory. The cold
--- figures are therefore a lower bound for a read that finds nothing in memory.
+-- pass opens it afresh with direct reads (no OS page cache) and a block cache
+-- of '_ctColdCacheBytes' (8 MiB by default) and reads each distinct (table,
+-- key) once, with the bound of its first sample, so that no cold read repeats
+-- an earlier one. It can still hit what an earlier read loaded: different keys
+-- can share a data block. Without '_ctCacheIndexAndFilter' each file's index
+-- and filter blocks are loaded once into the table reader and stay in memory;
+-- with it they live in the block cache and compete with the data blocks, so a
+-- small cold cache makes the cold figures higher than a node's 1 GiB cache
+-- would, which holds them all. Read cold figures together with the cache size
+-- (recorded in the JSON). The cold figures are otherwise a lower bound for a
+-- read that finds nothing in memory.
 -- Every answer is compared with SQLite's.
 --
 measureColdReads :: FilePath -> FilePath -> Int -> Word64 -> IO ColdLatency
@@ -860,7 +877,7 @@ measureColdReadsWith tuning sqlitePath coldDir n seed = do
         return (length (filter id bad0) + length (filter fst rs), snd <$> rs)
     let coldTuning = warmTuning
             { _tuningDirectReads = True
-            , _tuningBlockCacheBytes = Just (8 * 1024 * 1024)
+            , _tuningBlockCacheBytes = Just (_ctColdCacheBytes tuning)
             }
     (badCold, cold) <- withReadOnlyRocksDbTuned coldDir modernDefaultOptions coldTuning $ \db -> do
         rs <- mapM (timed (_rocksDbHandle db)) coldSamples
@@ -955,6 +972,8 @@ data TxidLatency = TxidLatency
     , _tlWarmP99 :: !Double
     , _tlColdP50 :: !Double
     , _tlColdP99 :: !Double
+    , _tlColdCacheBytes :: !Int
+        -- ^ block cache of the cold pass
     }
     deriving (Show, Eq, Generic)
 
@@ -977,7 +996,8 @@ coldReadTxid db c tid txid = R.get db mempty (txidKey c tid txid) >>= \case
 -- @SELECT rowkey, rowdata ... WHERE txid = ? ORDER BY rowid@.
 --
 -- The passes are those of 'measureColdReadsWith': warm (every sample once
--- untimed, once timed) and cold (direct reads, an 8 MiB block cache, each
+-- untimed, once timed) and cold (direct reads, a block cache of
+-- '_ctColdCacheBytes', each
 -- distinct (table, txid) once).
 --
 measureTxidReads :: ColdTuning -> FilePath -> FilePath -> Int -> Word64 -> IO TxidLatency
@@ -1001,7 +1021,7 @@ measureTxidReads tuning sqlitePath coldDir n seed = do
         return (length (filter id bad0) + length (filter fst rs), snd <$> rs)
     let coldTuning = warmTuning
             { _tuningDirectReads = True
-            , _tuningBlockCacheBytes = Just (8 * 1024 * 1024)
+            , _tuningBlockCacheBytes = Just (_ctColdCacheBytes tuning)
             }
     (badCold, cold) <- withReadOnlyRocksDbTuned coldDir modernDefaultOptions coldTuning $ \db -> do
         rs <- mapM (timed (_rocksDbHandle db)) coldSamples
@@ -1017,6 +1037,7 @@ measureTxidReads tuning sqlitePath coldDir n seed = do
         , _tlWarmP99 = pctUs 0.99 warmS
         , _tlColdP50 = pctUs 0.50 coldS
         , _tlColdP99 = pctUs 0.99 coldS
+        , _tlColdCacheBytes = _ctColdCacheBytes tuning
         }
   where
     warmTuning = coldMeasureTuning tuning
@@ -1084,6 +1105,7 @@ instance ToJSON ColdRun where
         , "latency" .= _crLatency r
         , "tuning" .= _crTuning r
         , "buildSeconds" .= _crBuildSeconds r
+        , "coldCacheBytes" .= _ctColdCacheBytes (_crTuning r)
         ] <> [ "txidReadLatency" .= l | Just l <- [_crTxid r] ]
 
 -- | Builds the store, then measures @n@ point reads and @txidReads@ by-txid
@@ -1417,16 +1439,16 @@ renderColdLatency l = T.unlines
     ]
 
 renderColdTuning :: ColdTuning -> Text
-renderColdTuning t = T.pack $ printf "tuning: zstd 3 (64 KB dictionary), block %d bytes, bloom %d bits, bottommost zstd %s, dynamic level bytes %s, cache index and filter %s"
+renderColdTuning t = T.pack $ printf "tuning: zstd 3 (64 KB dictionary), block %d bytes, bloom %d bits, bottommost zstd %s, dynamic level bytes %s, cache index and filter %s, cold cache %d bytes"
     (_ctBlockSize t) (_ctBloomBits t)
     (maybe "off" show (_ctBottommostZstdLevel t))
-    (show (_ctDynamicLevelBytes t)) (show (_ctCacheIndexAndFilter t))
+    (show (_ctDynamicLevelBytes t)) (show (_ctCacheIndexAndFilter t)) (_ctColdCacheBytes t)
 
 renderTxidLatency :: TxidLatency -> Text
 renderTxidLatency l = T.unlines
     [ "by-txid reads: " <> sshowT (_tlReads l) <> " (" <> sshowT (_tlRows l) <> " rows), mismatches: " <> sshowT (_tlMismatches l)
     , T.pack $ printf "warm: p50 %.1f us, p99 %.1f us" (_tlWarmP50 l) (_tlWarmP99 l)
-    , T.pack $ printf "cold (%d distinct txids): p50 %.1f us, p99 %.1f us" (_tlColdReads l) (_tlColdP50 l) (_tlColdP99 l)
+    , T.pack $ printf "cold (%d distinct txids, %d byte block cache): p50 %.1f us, p99 %.1f us" (_tlColdReads l) (_tlColdCacheBytes l) (_tlColdP50 l) (_tlColdP99 l)
     ]
 
 renderProjection :: Projection -> Text

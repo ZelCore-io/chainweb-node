@@ -449,13 +449,14 @@ tests = withResource acquire release $ \getFx -> testGroup "Cold measure"
             , "bottommostZstdLevel" .= Null
             , "dynamicLevelBytes" .= False
             , "cacheIndexAndFilter" .= False
+            , "coldCacheBytes" .= (8388608 :: Int)
             ])
         assertBool "buildSeconds" $ case KM.lookup "buildSeconds" j of
             Just (Number n) -> n >= 0
             _ -> False
         -- no by-txid reads asked for
         KM.lookup "txidReadLatency" j @?= Nothing
-        -- the tuning is the one of the fixture's own build
+        -- two builds with the default tuning give the same size in every keyspace
         _csKeyspaceSst (_crSizes run) @?= _csKeyspaceSst (_fxSizes fx)
 
     , testCase "--bloom-bits 0 --bottommost-zstd-level 9 --block-size 65536: recorded in the JSON; the 1,000-read check still passes" $ do
@@ -472,7 +473,8 @@ tests = withResource acquire release $ \getFx -> testGroup "Cold measure"
                 KM.lookup "bottommostZstdLevel" t @?= Just (Number 9)
                 KM.lookup "blockSize" t @?= Just (Number 65536)
             v -> assertFailure (show v)
-        -- the files carry the settings: 64 KB blocks, level 9 on the bottom level
+        -- the files carry the bottom-level setting (level 9); block size and
+        -- filter are only checked in the JSON, which comes from the same options
         info <- sstCompressionInfo (_cbOut (spec fx "cold-flags"))
         assertBool ("level 9: " <> show info) $
             not (M.null info) && all (\(_, o) -> "level=9;" `B.isInfixOf` o) (M.elems info)
@@ -486,6 +488,28 @@ tests = withResource acquire release $ \getFx -> testGroup "Cold measure"
                 KM.lookup "dynamicLevelBytes" t @?= Just (Bool True)
                 KM.lookup "cacheIndexAndFilter" t @?= Just (Bool True)
             v -> assertFailure (show v)
+
+    , testCase "--cold-cache-bytes reaches the cold passes and the JSON, beside the cold figures" $ do
+        fx <- getFx
+        let tuning = defaultColdTuning
+                { _ctCacheIndexAndFilter = True, _ctColdCacheBytes = 1048576 }
+        run <- runColdMeasure quietLogger tuning (spec fx "cold-cache") 100 2 20
+        _clMismatches (_crLatency run) @?= 0
+        let j = runJson run
+        KM.lookup "coldCacheBytes" j @?= Just (Number 1048576)
+        case KM.lookup "tuning" j of
+            Just (Object t) -> KM.lookup "coldCacheBytes" t @?= Just (Number 1048576)
+            v -> assertFailure (show v)
+        case KM.lookup "txidReadLatency" j of
+            Just (Object o) -> KM.lookup "coldCacheBytes" o @?= Just (Number 1048576)
+            v -> assertFailure (show v)
+        -- the default is M0's 8 MiB
+        defaultRun <- runColdMeasure quietLogger defaultColdTuning (spec fx "cold-cache-default") 10 2 0
+        KM.lookup "coldCacheBytes" (runJson defaultRun) @?= Just (Number 8388608)
+        -- the by-txid cold pass records the cache it was opened with (the option
+        -- is set in the one place that opens the cold passes; this does not
+        -- measure the cache's effect)
+        _tlColdCacheBytes <$> _crTxid run @?= Just 1048576
 
     , testCase "--txid-reads 200: every by-txid answer equals SQLite's rows in rowid order; four latency fields present" $ do
         fx <- getFx

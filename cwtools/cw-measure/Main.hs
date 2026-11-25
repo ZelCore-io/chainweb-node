@@ -94,11 +94,13 @@ coldTuningOptions = ColdTuning
     <*> optional (option nonNegative (long "bottommost-zstd-level" <> metavar "N" <> help "zstd level of the bottommost level; default: off, the level of the other levels"))
     <*> option boolReader (long "dynamic-level-bytes" <> metavar "true|false" <> value (_ctDynamicLevelBytes d) <> showDefault <> help "level_compaction_dynamic_level_bytes")
     <*> option boolReader (long "cache-index-and-filter" <> metavar "true|false" <> value (_ctCacheIndexAndFilter d) <> showDefault <> help "index and filter blocks in the block cache, level 0 pinned")
+    <*> option positive (long "cold-cache-bytes" <> metavar "N" <> value (_ctColdCacheBytes d) <> showDefault <> help "block cache of the cold passes (direct reads). With --cache-index-and-filter true the index and filter blocks compete for it; the node's cache is 1 GiB, so read cold figures of those runs with the size in mind")
   where
     d = defaultColdTuning
     pos s = case reads s of
         [(n, "")] | n > 0 -> Right n
         _ -> Left $ "expected a positive integer: " <> s
+    positive = eitherReader pos
 
 commands :: Parser Command
 commands = hsubparser $ mconcat
