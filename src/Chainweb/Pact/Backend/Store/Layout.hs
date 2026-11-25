@@ -102,13 +102,19 @@ splitMarkerFileName = "PACT-SPLIT-FORMAT.json"
 -- | The format marker in @sqlite-split@. It records where the first trim of
 -- the node happened.
 --
+-- Shadow mode creates @sqlite-split@ with its marker at the first start,
+-- before anything is trimmed: that marker has no first trim (@null@ in the
+-- JSON), and the first trim of the node fills it in ('ensureSplitDir';
+-- parked pointer M2).
+--
 data SplitMarker = SplitMarker
     { _smFormat :: !Text
         -- ^ always 'splitMarkerFormat'
     , _smVersion :: !Int
         -- ^ 'splitMarkerVersion'
-    , _smFirstTrimChain :: !ChainId
-    , _smFirstTrimHeight :: !BlockHeight
+    , _smFirstTrimChain :: !(Maybe ChainId)
+        -- ^ 'Nothing': created by shadow mode, nothing trimmed yet
+    , _smFirstTrimHeight :: !(Maybe BlockHeight)
     , _smCreated :: !Text
         -- ^ ISO 8601
     } deriving (Show, Eq, Generic)
@@ -153,26 +159,35 @@ readSplitMarker dir = do
                         $ "format " <> T.pack (show (_smFormat m)) <> " version " <> T.pack (show (_smVersion m))
                 | otherwise -> return (Just m)
 
--- | Writes the marker durably: a temporary file, @fsync@, rename, @fsync@ of
--- the directory.
+-- | Writes the marker of a first trim durably: a temporary file, @fsync@,
+-- rename, @fsync@ of the directory.
 --
 writeSplitMarker :: FilePath -> ChainId -> BlockHeight -> IO SplitMarker
-writeSplitMarker dir cid h = do
+writeSplitMarker dir cid h = writeMarker dir (Just (cid, h))
+
+-- | Writes a marker durably, with or without a first trim.
+--
+writeMarker :: FilePath -> Maybe (ChainId, BlockHeight) -> IO SplitMarker
+writeMarker dir firstTrim = do
     now <- getCurrentTime
     let m = SplitMarker
             { _smFormat = splitMarkerFormat
             , _smVersion = splitMarkerVersion
-            , _smFirstTrimChain = cid
-            , _smFirstTrimHeight = h
+            , _smFirstTrimChain = fst <$> firstTrim
+            , _smFirstTrimHeight = snd <$> firstTrim
             , _smCreated = T.pack (iso8601Show now)
             }
-        f = dir </> splitMarkerFileName
+    writeMarkerValue dir m
+    return m
+
+writeMarkerValue :: FilePath -> SplitMarker -> IO ()
+writeMarkerValue dir m = do
+    let f = dir </> splitMarkerFileName
         tmp = f <.> "tmp"
     BL.writeFile tmp (encode m)
     syncPath tmp
     renameFile tmp f
     syncPath dir
-    return m
 
 -- | @fsync@ of a file or a directory.
 --
@@ -264,6 +279,9 @@ data PactLayout = PactLayout
     , _plColdDir :: !(Maybe FilePath)
         -- ^ split, shadow: @<root>/pactCold@
     , _plRenameLock :: !(MVar ())
+    , _plFirstTrimPending :: !(IORef Bool)
+        -- ^ the marker of @sqlite-split@ has no first trim yet, which only
+        -- shadow mode writes (M2)
     }
 
 -- | The directory of the SQLite files the node runs on.
@@ -324,6 +342,12 @@ resolvePactLayout logger mode reset root = do
     lock <- newMVar ()
     let layout dir legacy cold = do
             ref <- newIORef dir
+            -- a marker written by shadow mode, with no first trim yet; also
+            -- when a later start in split mode opens it
+            pending <- if takeFileName dir == splitDirName
+                then maybe False ((== Nothing) . _smFirstTrimChain) <$> readSplitMarker dir
+                else return False
+            pendingRef <- newIORef pending
             return $ PactLayout
                 { _plRoot = root
                 , _plMode = mode
@@ -331,6 +355,7 @@ resolvePactLayout logger mode reset root = do
                 , _plLegacyDir = legacy
                 , _plColdDir = cold
                 , _plRenameLock = lock
+                , _plFirstTrimPending = pendingRef
                 }
     case mode of
         HistorySqlite -> do
@@ -369,9 +394,16 @@ resolvePactLayout logger mode reset root = do
                 throwIO $ ShadowNeedsLegacy sqliteDir
             | otherwise -> do
                 createDirectoryIfMissing True sqliteDir
+                -- M1: sqlite-split appears by a rename, with its marker in
+                -- it, so a crash never leaves it without one. A temporary
+                -- directory left by a crash holds nothing else and is
+                -- replaced.
                 unless (_dsSplit st) $ do
-                    createDirectory splitDir
-                    void $ writeSplitMarker splitDir (unsafeChainId 0) 0
+                    tmpExists <- doesDirectoryExist splitTmpDir
+                    when tmpExists $ removeDirectoryRecursive splitTmpDir
+                    createDirectory splitTmpDir
+                    void $ writeMarker splitTmpDir Nothing
+                    renameDirectory splitTmpDir splitDir
                     syncPath root
                     logg Info $ "Created the split side " <> T.pack splitDir <> " for shadow mode."
                 unless (_dsCold st) $ do
@@ -381,6 +413,7 @@ resolvePactLayout logger mode reset root = do
   where
     sqliteDir = root </> sqliteDirName
     splitDir = root </> splitDirName
+    splitTmpDir = splitDir <.> "tmp"
     coldDir = root </> coldDirName
     logg = logFunctionText logger
 
@@ -398,6 +431,8 @@ ensureSplitDir logger l cid h = do
     when (_plMode l == HistorySqlite) $
         ioError $ userError "ensureSplitDir: called with --pact-history-store sqlite"
     cur <- currentSqliteDir l
+    pending <- readIORef (_plFirstTrimPending l)
+    when pending $ recordShadowFirstTrim logger l cid h
     unless (takeFileName cur == splitDirName) $
         modifyMVar_ (_plRenameLock l) $ \() -> do
             dir <- currentSqliteDir l
@@ -411,3 +446,23 @@ ensureSplitDir logger l cid h = do
                     <> ", height " <> T.pack (show h) <> "): renamed " <> T.pack dir
                     <> " to " <> T.pack new <> " with format marker created "
                     <> _smCreated m
+
+-- | Fills in the first trim of a marker that shadow mode wrote without one
+-- (M2). Under the rename lock; later calls return at once.
+--
+recordShadowFirstTrim :: Logger l => l -> PactLayout -> ChainId -> BlockHeight -> IO ()
+recordShadowFirstTrim logger l cid h = modifyMVar_ (_plRenameLock l) $ \() -> do
+    pending <- readIORef (_plFirstTrimPending l)
+    when pending $ do
+        dir <- currentSqliteDir l
+        readSplitMarker dir >>= \case
+            Just m | _smFirstTrimChain m == Nothing -> do
+                writeMarkerValue dir m
+                    { _smFirstTrimChain = Just cid
+                    , _smFirstTrimHeight = Just h
+                    }
+                logFunctionText logger Info $ "First trim (chain " <> chainIdToText cid
+                    <> ", height " <> T.pack (show h) <> ") recorded in the format marker of "
+                    <> T.pack dir <> "."
+            _ -> return ()
+        writeIORef (_plFirstTrimPending l) False

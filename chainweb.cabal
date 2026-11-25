@@ -319,6 +319,7 @@ library
         , Chainweb.Pact.Backend.Store.Cold
         , Chainweb.Pact.Backend.Store.Cold.Key
         , Chainweb.Pact.Backend.Store.Freezer
+        , Chainweb.Pact.Backend.Store.Shadow
         , Chainweb.Pact.Backend.Store.Split
         , Chainweb.Pact.Backend.InMemDb
         , Chainweb.Pact.Backend.Store.SQLite
@@ -687,6 +688,7 @@ test-suite chainweb-tests
         Chainweb.Test.Pact.Store.ColdRead
         Chainweb.Test.Pact.Store.Freezer
         Chainweb.Test.Pact.Store.Schedule
+        Chainweb.Test.Pact.Store.Shadow
         Chainweb.Test.Pact.Store.Split
         Chainweb.Test.Payload.Store
         Chainweb.Test.ResponseSizeLimiter

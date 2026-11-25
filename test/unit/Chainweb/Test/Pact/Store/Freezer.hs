@@ -883,6 +883,6 @@ splitMarkerTest = withFixture $ \root twin -> do
     readIORef seen >>= (@?= Just (True, False, True))
     readSplitMarker (root </> splitDirName) >>= \case
         Just m -> do
-            _smFirstTrimChain m @?= cid
-            _smFirstTrimHeight m @?= 2
+            _smFirstTrimChain m @?= Just cid
+            _smFirstTrimHeight m @?= Just 2
         Nothing -> assertFailure "no marker"

@@ -54,6 +54,10 @@ tests = testGroup "Pact layout"
         twoPathsTest
     , testCase "reset with split or shadow is refused; the message names the mode"
         resetTest
+    , testCase "shadow start: sqlite-split appears only with its marker; a leftover temporary directory from a crash is replaced (M1)"
+        shadowAtomicStartTest
+    , testCase "shadow marker: no trim recorded at start; the first trim records its chain and height, later trims and restarts keep it (M2)"
+        shadowMarkerTest
     ]
 
 -- -------------------------------------------------------------------------- --
@@ -212,8 +216,8 @@ ensureSplitDirTest = withRoot $ \r -> withLogger $ \logger _ -> do
     m <- eitherDecodeFileStrict (markerIn (splitDir r)) >>= either fail return
     _smFormat m @?= "chainweb-pact-split"
     _smVersion m @?= 1
-    _smFirstTrimChain m @?= unsafeChainId 3
-    _smFirstTrimHeight m @?= 1234
+    _smFirstTrimChain m @?= Just (unsafeChainId 3)
+    _smFirstTrimHeight m @?= Just 1234
     doesFileExist (markerIn (splitDir r) <.> "tmp") >>= assertBool "temporary marker left" . not
 
     -- the second call changes nothing, even with another chain
@@ -229,15 +233,15 @@ ensureSplitDirTest = withRoot $ \r -> withLogger $ \logger _ -> do
     try (resolvePactLayout logger HistorySqlite False r)
         >>= either ((@?= TrimmedDirInSqliteMode (splitDir r))) (const $ assertFailure "sqlite mode opened sqlite-split")
 
-    -- shadow mode: the split side exists from the start, so the call is a no-op
+    -- shadow mode: the split side exists from the start, so nothing is
+    -- renamed (the marker is covered by "shadow marker")
     withRoot $ \r2 -> do
         mkDataDir (sqliteDir r2)
         ls <- resolvePactLayout logger HistoryShadow False r2
-        before <- eitherDecodeFileStrict @SplitMarker (markerIn (splitDir r2)) >>= either fail return
         ensureSplitDir logger ls cid0 7
-        afterM <- eitherDecodeFileStrict (markerIn (splitDir r2)) >>= either fail return
-        afterM @?= before
+        currentSqliteDir ls >>= (@?= splitDir r2)
         doesDirectoryExist (sqliteDir r2) >>= assertBool "shadow lost the legacy dir"
+        readFile (sqliteDir r2 </> "pact-v1-chain-0.sqlite") >>= (@?= sqliteDirName)
 
     -- sqlite mode never trims
     withRoot $ \r3 -> do
@@ -382,3 +386,60 @@ resetTest = withLogger $ \logger _ -> do
     forM_ [HistorySplit, HistoryShadow] $ \mode ->
         assertBool "backup message" $ pactHistoryStoreToText mode
             `T.isInfixOf` pactLayoutErrorMessage (BackupRefused mode)
+
+-- -------------------------------------------------------------------------- --
+-- Shadow mode: M1 and M2 (Task 19-20 review)
+
+readMarkerFile :: FilePath -> IO SplitMarker
+readMarkerFile d = eitherDecodeFileStrict (markerIn d) >>= either fail return
+
+-- | M1: the split side is built under a temporary name, marker included, and
+-- renamed into place, so @sqlite-split@ never exists without its marker. A
+-- crash before the rename leaves only the temporary directory, which the
+-- next start replaces.
+shadowAtomicStartTest :: IO ()
+shadowAtomicStartTest = withLogger $ \logger _ -> do
+    let tmpOf r = splitDir r <.> "tmp"
+    -- a fresh start
+    withRoot $ \r -> do
+        mkDataDir (sqliteDir r)
+        l <- resolvePactLayout logger HistoryShadow False r
+        currentSqliteDir l >>= (@?= splitDir r)
+        void $ readMarkerFile (splitDir r)
+        doesDirectoryExist (tmpOf r) >>= assertBool "temporary directory left" . not
+    -- the crash states of the creation: an empty temporary directory, and one
+    -- with its marker written
+    forM_ [False, True] $ \withMarker -> withRoot $ \r -> do
+        mkDataDir (sqliteDir r)
+        createDirectory (tmpOf r)
+        when withMarker $ mkMarker (tmpOf r)
+        l <- resolvePactLayout logger HistoryShadow False r
+        currentSqliteDir l >>= (@?= splitDir r)
+        m <- readMarkerFile (splitDir r)
+        _smFirstTrimChain m @?= Nothing
+        doesDirectoryExist (tmpOf r) >>= assertBool "temporary directory left" . not
+        -- and the next start opens it as it is
+        l2 <- resolvePactLayout logger HistoryShadow False r
+        currentSqliteDir l2 >>= (@?= splitDir r)
+        readMarkerFile (splitDir r) >>= (@?= m)
+
+-- | M2: the marker that shadow mode writes at start claims no trim; the first
+-- trim of the node records where it happened, as in split mode.
+shadowMarkerTest :: IO ()
+shadowMarkerTest = withLogger $ \logger _ -> withRoot $ \r -> do
+    mkDataDir (sqliteDir r)
+    l <- resolvePactLayout logger HistoryShadow False r
+    m0 <- readMarkerFile (splitDir r)
+    _smFirstTrimChain m0 @?= Nothing
+    _smFirstTrimHeight m0 @?= Nothing
+    ensureSplitDir logger l (unsafeChainId 4) 77
+    m1 <- readMarkerFile (splitDir r)
+    _smFirstTrimChain m1 @?= Just (unsafeChainId 4)
+    _smFirstTrimHeight m1 @?= Just 77
+    doesFileExist (markerIn (splitDir r) <.> "tmp") >>= assertBool "temporary marker left" . not
+    ensureSplitDir logger l (unsafeChainId 5) 99
+    readMarkerFile (splitDir r) >>= (@?= m1)
+    -- a restart keeps the recorded trim
+    l2 <- resolvePactLayout logger HistoryShadow False r
+    ensureSplitDir logger l2 (unsafeChainId 6) 123
+    readMarkerFile (splitDir r) >>= (@?= m1)
