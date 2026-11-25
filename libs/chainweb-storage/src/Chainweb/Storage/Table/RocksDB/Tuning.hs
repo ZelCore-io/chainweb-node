@@ -228,6 +228,12 @@ payloadBlockCacheBytes = 268435456
 -- database, so there is nothing to reshape). The bottommost level keeps the
 -- compression of the other levels.
 --
+-- These are option set B of the storage redesign's cold option run, which
+-- its ruling adopted. The run rejected zstd level 9 on the bottommost level,
+-- 64 KB blocks and dropping the bloom filter, so all three stay off. The
+-- node overrides the block cache size with @--pact-cold-block-cache@
+-- (default 1 GiB).
+--
 coldStoreTuning :: RocksDbTuning
 coldStoreTuning = payloadZstdTuning
     { _tuningBloomBitsPerKey = Just 10
