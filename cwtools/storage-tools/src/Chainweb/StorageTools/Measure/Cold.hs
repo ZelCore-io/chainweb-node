@@ -156,6 +156,7 @@ import Chainweb.ChainId
 import Chainweb.Logger
 import Chainweb.Pact.Backend.Store.Cold (coldReadNewest)
 import Chainweb.Pact.Backend.Store.Cold.Key
+import Chainweb.Pact.Backend.Store.Layout (refuseNonSqliteLayout)
 import Chainweb.Storage.Table.RocksDB
 import Chainweb.Storage.Table.RocksDB.Tuning
 
@@ -620,8 +621,13 @@ copyTransactionIndex w c sq =
 -- -------------------------------------------------------------------------- --
 -- SQLite
 
+-- | Opens a legacy Pact SQLite file read-only. A file of a split or shadow
+-- layout is refused first ('refuseNonSqliteLayout'): on a trimmed file the
+-- sizes and samples would be wrong without any sign of it.
 withSqliteReadOnly :: FilePath -> (SQ.Database -> IO a) -> IO a
-withSqliteReadOnly path = bracket open SQ.close
+withSqliteReadOnly path k = do
+    refuseNonSqliteLayout "cw-measure cold" path
+    bracket open SQ.close k
   where
     open = do
         db <- SQ.open2 (T.pack path) [SQ.SQLOpenReadOnly] SQ.SQLVFSDefault

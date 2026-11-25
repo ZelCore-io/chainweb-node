@@ -13,7 +13,7 @@
 module Chainweb.StorageTools.Test.Cold (tests) where
 
 import Control.Lens ((&), (.~), view)
-import Control.Exception (finally)
+import Control.Exception (finally, try)
 import Control.Monad
 
 import Data.Aeson (Value(..), decode, encode, object, (.=))
@@ -60,6 +60,7 @@ import Chainweb.ChainId
 import Chainweb.Logger
 import Chainweb.MerkleLogHash (merkleLogHash)
 import Chainweb.Pact.Backend.Store.Cold.Key
+import Chainweb.Pact.Backend.Store.Layout (PactLayoutError(..))
 import Chainweb.Pact.Backend.Types (IntraBlockPersistence(..))
 import Chainweb.Pact.Backend.Utils (chainwebPragmas, closeSQLiteConnection, openSQLiteConnection)
 import qualified Chainweb.Pact.PactService.Checkpointer.Internal as Checkpointer
@@ -69,6 +70,7 @@ import Chainweb.Storage.Table.RocksDB
 import Chainweb.Storage.Table.RocksDB.Tuning
 import Chainweb.StorageTools.Measure.Cold
 import Chainweb.Test.TestVersions (slowForkingCpmTestVersion)
+import Chainweb.Test.Utils.Storage (NonSqliteFixture(..), makeNonSqliteFixtures)
 import Chainweb.Test.Utils (petersen)
 import Chainweb.Version
 
@@ -435,6 +437,24 @@ tests = withResource acquire release $ \getFx -> testGroup "Cold measure"
             _clColdReads l > 0 && _clColdReads l <= distinct
         -- cw-measure project reads what cw-measure cold writes
         decode (encode l) @?= Just l
+
+    , testCase "cw-measure cold refuses a file of a split or shadow layout before it opens it" $ do
+        tmp <- getCanonicalTemporaryDirectory
+        base <- createTempDirectory tmp "measure-cold-guard"
+        fxs <- makeNonSqliteFixtures base
+        forM_ fxs $ \nfx -> do
+            let out = base </> (_nsfName nfx <> "-cold")
+                sp = ColdBuildSpec
+                    { _cbSqlite = _nsfFile nfx, _cbChain = cid, _cbTables = Nothing
+                    , _cbOut = out, _cbBatchBytes = 4096 }
+            try (buildColdFromSqlite quietLogger sp) >>= \case
+                Left (SqliteOnlyTool tool p _) -> do
+                    tool @?= "cw-measure cold"
+                    p @?= _nsfFile nfx
+                Left e -> assertFailure $ _nsfName nfx <> ": another error: " <> show e
+                Right _ -> assertFailure $ _nsfName nfx <> ": not refused"
+            doesDirectoryExist out >>= assertBool (_nsfName nfx <> ": no cold store created") . not
+        removeDirectoryRecursive base
 
     , testCase "defaults: the tuning object equals M0's (z3, 32 KB, bloom 10, the three new options off)" $ do
         fx <- getFx
