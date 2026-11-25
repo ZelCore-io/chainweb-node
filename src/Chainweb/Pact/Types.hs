@@ -232,6 +232,7 @@ import Chainweb.Mempool.Mempool (TransactionHash, BlockFill, MempoolPreBlockChec
 import Chainweb.Miner.Pact
 import Chainweb.Logger
 import Chainweb.Pact.Backend.DbCache
+import Chainweb.Pact.Backend.Store.Config (PactHistoryConfig, defaultPactHistoryConfig)
 import Chainweb.Pact.Backend.Types
 
 import Chainweb.Payload.PayloadStore
@@ -566,6 +567,9 @@ data PactServiceConfig = PactServiceConfig
     -- ^ *Only affects Pact5*
     --   Maximum allowed execution time for a single transaction.
     --   If 'Nothing', it's a function of the BlockGasLimit.
+  , _pactHistory :: !PactHistoryConfig
+    -- ^ The Pact history store and its freezer (P3). No code path reads it
+    --   yet.
   } deriving (Eq,Show)
 
 
@@ -585,6 +589,7 @@ testPactServiceConfig = PactServiceConfig
       , _pactEnableLocalTimeout = False
       , _pactPersistIntraBlockWrites = DoNotPersistIntraBlockWrites
       , _pactTxTimeLimit = Nothing
+      , _pactHistory = defaultPactHistoryConfig
       }
 
 -- | This default value is only relevant for testing. In a chainweb-node the @GasLimit@

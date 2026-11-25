@@ -74,6 +74,7 @@ module Chainweb.Chainweb.Configuration
 , configFullHistoricPactState
 , configStoreMerkleTrees
 , configPayloadCompression
+, configPactHistory
 , configBackup
 , configServiceApi
 , configOnlySyncPact
@@ -118,6 +119,7 @@ import System.Directory
 
 import Chainweb.BlockHeight
 import Chainweb.Difficulty
+import Chainweb.Pact.Backend.Store.Config
 import Chainweb.HostAddress
 import qualified Chainweb.Mempool.Mempool as Mempool
 import Chainweb.Mempool.P2pConfig
@@ -469,6 +471,9 @@ data ChainwebConfiguration = ChainwebConfiguration
         -- proofs rebuild the trees from the payloads.
     , _configPayloadCompression :: !PayloadCompression
         -- ^ compression of the RocksDB instance; it applies to new files only
+    , _configPactHistory :: !PactHistoryConfig
+        -- ^ the Pact history store and its freezer (P3); the default is the
+        -- SQLite store of the @storage/3.2.1@ head
     , _configBackup :: !BackupConfig
     , _configServiceApi :: !ServiceApiConfig
     , _configReadOnlyReplay :: !Bool
@@ -496,6 +501,9 @@ validateChainwebConfiguration c = do
     unless (c ^. chainwebVersion . versionDefaults . disablePeerValidation) $
         validateP2pConfiguration (_configP2p c)
     validateChainwebVersion (_configChainwebVersion c)
+    validatePactHistoryConfig (_configPactHistory c)
+    either throwError return $ validatePactHistoryVersion
+        (_configChainwebVersion c) (_phStore (_configPactHistory c))
 
 validateChainwebVersion :: ConfigValidation ChainwebVersion []
 validateChainwebVersion v = do
@@ -555,6 +563,7 @@ defaultChainwebConfiguration v = ChainwebConfiguration
     , _configFullHistoricPactState = True
     , _configStoreMerkleTrees = True
     , _configPayloadCompression = PayloadSnappy
+    , _configPactHistory = defaultPactHistoryConfig
     , _configServiceApi = defaultServiceApiConfig
     , _configOnlySyncPact = False
     , _configReadOnlyReplay = False
@@ -584,6 +593,7 @@ instance ToJSON ChainwebConfiguration where
         , "fullHistoricPactState" .= _configFullHistoricPactState o
         , "storeMerkleTrees" .= _configStoreMerkleTrees o
         , "payloadCompression" .= _configPayloadCompression o
+        , "pactHistory" .= _configPactHistory o
         , "serviceApi" .= _configServiceApi o
         , "onlySyncPact" .= _configOnlySyncPact o
         , "readOnlyReplay" .= _configReadOnlyReplay o
@@ -617,6 +627,7 @@ instance FromJSON (ChainwebConfiguration -> ChainwebConfiguration) where
         <*< configFullHistoricPactState ..: "fullHistoricPactState" % o
         <*< configStoreMerkleTrees ..: "storeMerkleTrees" % o
         <*< configPayloadCompression ..: "payloadCompression" % o
+        <*< configPactHistory %.: "pactHistory" % o
         <*< configServiceApi %.: "serviceApi" % o
         <*< configOnlySyncPact ..: "onlySyncPact" % o
         <*< configReadOnlyReplay ..: "readOnlyReplay" % o
@@ -671,6 +682,7 @@ pChainwebConfiguration = id
         % long "payload-compression"
         <> metavar "snappy|zstd-dict"
         <> help "Compression of the RocksDB instance: snappy, or zstd-dict for zstd with a dictionary per file. It applies to files written from then on; files of either kind stay readable."
+    <*< configPactHistory %:: pPactHistoryConfig
     <*< configCuts %:: pCutConfig
     <*< configServiceApi %:: pServiceApiConfig
     <*< configMining %:: pMiningConfig

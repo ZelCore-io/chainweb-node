@@ -1,0 +1,99 @@
+{
+  "allowReadsInLocal": false,
+  "backup": {
+    "api": {
+      "configuration": {
+      },
+      "enabled": false
+    },
+    "directory": null
+  },
+  "chainwebVersion": "mainnet01",
+  "cuts": {
+    "fastForwardBlockHeightLimit": null,
+    "fetchTimeout": 3000000,
+    "initialBlockHeightLimit": null,
+    "pruneChainDatabase": "none"
+  },
+  "enableLocalTimeout": false,
+  "fullHistoricPactState": true,
+  "gasLimitOfBlock": 150000,
+  "headerStream": false,
+  "logGas": false,
+  "mempoolP2p": {
+    "configuration": {
+      "maxSessionCount": 6,
+      "pollInterval": 30,
+      "sessionTimeout": 300
+    },
+    "enabled": true
+  },
+  "minGasPrice": 1.0e-08,
+  "mining": {
+    "coordination": {
+      "enabled": false,
+      "limit": 1200,
+      "miners": [
+
+      ],
+      "payloadRefreshDelay": 15000000,
+      "targetForkOverride": false,
+      "updateStreamLimit": 2000,
+      "updateStreamTimeout": 240
+    },
+    "nodeMining": {
+      "enabled": false,
+      "miner": {
+        "account": "",
+        "predicate": "keys-all",
+        "public-keys": [
+
+        ]
+      }
+    }
+  },
+  "moduleCacheLimit": 62914560,
+  "onlySyncPact": false,
+  "p2p": {
+    "bootstrapReachability": 0.5,
+    "disableCertVerification": false,
+    "ignoreBootstrapNodes": false,
+    "maxPeerCount": 50,
+    "maxSessionCount": 10,
+    "peer": {
+      "certificateChain": null,
+      "certificateChainFile": null,
+      "hostaddress": {
+        "hostname": "0.0.0.0",
+        "port": 1789
+      },
+      "interface": "*",
+      "key": null,
+      "keyFile": null
+    },
+    "peers": [
+
+    ],
+    "private": false,
+    "sessionTimeout": 240
+  },
+  "pactQueueSize": 2000,
+  "payloadCompression": "snappy",
+  "preInsertCheckTimeout": 1000000,
+  "readOnlyReplay": false,
+  "reintroTxs": true,
+  "reorgLimit": 480,
+  "serviceApi": {
+    "interface": "*",
+    "payloadBatchLimit": 1000,
+    "port": 1848,
+    "validateSpec": false
+  },
+  "storeMerkleTrees": true,
+  "syncPactChains": null,
+  "throttling": {
+    "global": 50.0,
+    "mempool": 20.0,
+    "putPeer": 11
+  }
+}

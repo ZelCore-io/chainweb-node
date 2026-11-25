@@ -76,6 +76,7 @@ import Chainweb.CutDB
 import Chainweb.Logger
 import Chainweb.Mempool.Consensus (mkMempoolConsensus)
 import Chainweb.Mempool.Mempool (MempoolBackend, noopMempool)
+import Chainweb.Pact.Backend.Store.Config (PactHistoryConfig(..))
 import Chainweb.Pact.Backend.Types (IntraBlockPersistence(..))
 import Chainweb.Pact.Backend.Utils (chainDbFileName)
 import Chainweb.Pact.RestAPI.Server (PactServerData(..))
@@ -234,6 +235,7 @@ inProcessPactConfig v ls = PactServiceConfig
         then PersistIntraBlockWrites
         else DoNotPersistIntraBlockWrites
     , _pactTxTimeLimit = Nothing
+    , _pactHistory = (_configPactHistory conf) { _phFreezerEnabled = False }
     }
   where
     conf = defaultChainwebConfiguration v
