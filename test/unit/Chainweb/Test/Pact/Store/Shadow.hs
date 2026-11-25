@@ -22,12 +22,15 @@ import Control.Exception
 import Control.Lens ((&), (.~))
 import Control.Monad
 
+import Crypto.Hash (SHA256(..), hashWith)
+
 import Data.Aeson (Value(..), decodeStrict)
 import qualified Data.Aeson.Key as K
 import qualified Data.Aeson.KeyMap as KM
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Base16 as B16
 import qualified Data.ByteString.Short as SB
+import qualified Data.HashMap.Strict as HM
 import Data.IORef
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -67,6 +70,7 @@ import Chainweb.Test.Pact.Store.Freezer
     )
 import Chainweb.Test.TestVersions (slowForkingCpmTestVersion)
 import Chainweb.Test.Utils (petersen)
+import Chainweb.Utils (T2(..))
 import Chainweb.Version (ChainwebVersion)
 
 type TxId = Pact4.TxId
@@ -80,6 +84,12 @@ tests = testGroup "Shadow store"
     , testCase "legacy exceptions are rethrown; equal exceptions are no difference" exceptionTest
     , testCase "split savepoint failure: one difference, broken, the legacy batch commits" savepointTest
     , testCase "backup is refused" backupTest
+    , testCase "a lazy bottom in a split result: legacy answer returned, one difference" lazySplitTest
+    , testCase "a split exception whose text throws: legacy answer returned, one difference" unrenderableTest
+    , testCase "action exception wins over a failing split rollback; split broken" nestExceptionTest
+    , testCase "1000 identical differences: 100 full records, one note, one summary" rateLimitTest
+    , testCase "renderShadowValue: 512 bytes of hex, ..., SHA-256 of the whole value" renderTest
+    , testCase "normaliseSysRange sorts within a txid only" normaliseTest
     ]
 
 -- -------------------------------------------------------------------------- --
@@ -93,6 +103,8 @@ data Shadow = Shadow
     , _shTwin :: SQLiteEnv
     , _shSplitCalls :: IORef Int
         -- ^ calls of the split store's reads and writes
+    , _shTime :: IORef Double
+        -- ^ the virtual clock of the rate limit
     }
 
 -- | The drained fixture with a shadow store over the twin (legacy) and the
@@ -107,6 +119,8 @@ withShadowWith f k = withFixture $ \root twin -> withPlainNode root $ \n -> do
     logs <- newIORef []
     diffs <- newIORef 0
     broken <- newIORef False
+    time <- newIORef 0
+    logState <- newShadowLogState
     let sp = splitPactStore SplitEnv
             { _seChain = cid
             , _seHot = sqlitePactStore (_nPact n)
@@ -120,6 +134,8 @@ withShadowWith f k = withFixture $ \root twin -> withPlainNode root $ \n -> do
             , _shLogger = genericLogger Info (\t -> modifyIORef' logs (t :))
             , _shDifferences = diffs
             , _shBroken = broken
+            , _shClock = readIORef time
+            , _shLogState = logState
             }
     k Shadow
         { _shStore = shadowPactStore env
@@ -128,6 +144,7 @@ withShadowWith f k = withFixture $ \root twin -> withPlainNode root $ \n -> do
         , _shNode = n
         , _shTwin = twin
         , _shSplitCalls = calls
+        , _shTime = time
         }
 
 withShadow :: (Shadow -> IO a) -> IO a
@@ -358,3 +375,137 @@ backupTest = withShadow $ \s -> withSystemTempDirectory "shadow-backup" $ \tmp -
     try (_psBackupTo (_shStore s) (tmp </> "backup.sqlite")) >>= \case
         Left e -> e @?= BackupRefused HistoryShadow
         Right () -> assertFailure "expected BackupRefused"
+
+-- | A split read whose result holds a bottom in a lazy field.
+lazySplitTest :: Assertion
+lazySplitTest = withShadowWith lazy $ \s -> do
+    want <- _psReadNewest (sqlitePactStore (_shTwin s)) "coin_table" "alice" Nothing
+    got <- _psReadNewest (_shStore s) "coin_table" "alice" Nothing
+    got @?= want
+    want2 <- _psGetLatestBlock (sqlitePactStore (_shTwin s))
+    got2 <- _psGetLatestBlock (_shStore s)
+    got2 @?= want2
+    differences s >>= (@?= 2)
+    isBroken s >>= (@?= False)
+    ds <- records "ShadowDifference" s
+    length ds @?= 2
+    forM_ ds $ \d -> case field "split" d of
+        Just (String t) -> assertBool (T.unpack t) (hex "exception: lazy split value" `T.isPrefixOf` t)
+        other -> assertFailure (show other)
+  where
+    lazy p = p
+        { _psReadNewest = \_ _ _ -> return (Right (Just (error "lazy split value")))
+        , _psGetLatestBlock = return (Just (error "lazy split value"))
+        }
+
+-- | A split exception whose message throws when it is rendered, on a read
+-- and on a write.
+unrenderableTest :: Assertion
+unrenderableTest = withShadowWith bad $ \s -> do
+    want <- _psGetLatestBlock (sqlitePactStore (_shTwin s))
+    got <- _psGetLatestBlock (_shStore s)
+    got @?= want
+    differences s >>= (@?= 1)
+    isBroken s >>= (@?= False)
+    [d] <- records "ShadowDifference" s
+    field "op" d @?= Just (String "getLatestBlock")
+    field "split" d @?= Just (String "<unrenderable>")
+    -- a write: one more difference, and broken
+    _psWithBatch (_shStore s) (_psCommitBlock (_shStore s) (block 13)) >>= (@?= Right ())
+    differences s >>= (@?= 2)
+    isBroken s >>= (@?= True)
+    _psGetLatestBlock (sqlitePactStore (_shTwin s)) >>= (@?= Just (13, mkHash 13 0))
+  where
+    bad p = p
+        { _psGetLatestBlock = throwIO (ErrorCall (error "unrenderable message"))
+        , _psCommitBlock = \_ -> throwIO (ErrorCall (error "unrenderable message"))
+        }
+
+data ActionFailed = ActionFailed
+    deriving (Eq, Show)
+
+instance Exception ActionFailed
+
+nestExceptionTest :: Assertion
+nestExceptionTest = do
+    -- a working split rollback: the action's exception, nothing broken
+    withShadow $ \s -> do
+        try (_psWithBatch (_shStore s) (throwIO ActionFailed :: IO ())) >>= (@?= Left ActionFailed)
+        isBroken s >>= (@?= False)
+        differences s >>= (@?= 0)
+    -- the split rollback fails after the action threw
+    withShadowWith failRollback $ \s -> do
+        let sh = _shStore s
+        r <- try (_psWithBatch sh (_psCommitBlock sh (block 13) >> throwIO ActionFailed :: IO ()))
+        r @?= Left ActionFailed
+        isBroken s >>= (@?= True)
+        differences s >>= (@?= 1)
+        length <$> records "ShadowBroken" s >>= (@?= 1)
+        [d] <- records "ShadowDifference" s
+        field "op" d @?= Just (String "withBatch")
+        -- legacy rolled back
+        _psGetLatestBlock (sqlitePactStore (_shTwin s)) >>= (@?= Just (fromIntegral tipHeight, mkHash tipHeight 0))
+  where
+    failRollback p = p
+        { _psWithBatch = \act -> _psWithBatch p act
+            `onException` throwIO (userError "split rollback failed")
+        }
+
+rateLimitTest :: Assertion
+rateLimitTest = withShadowWith differ $ \s -> do
+    let sh = _shStore s
+    -- the hash list of doLookupSuccessful is bounded like a value
+    let hs = [SB.toShort (B.replicate 32 (fromIntegral i)) | i <- [0 .. 99 :: Int]]
+    void $ _psDoLookupSuccessful sh 1 (V.fromList hs)
+    [d0] <- records "ShadowDifference" s
+    field "args" d0 @?= Just (Array (V.fromList
+        [String "1", String (renderShadowValue (B.concat (SB.fromShort <$> hs)))]))
+
+    want <- _psGetLatestBlock (sqlitePactStore (_shTwin s))
+    replicateM_ 999 $ _psGetLatestBlock sh >>= (@?= want)
+    modifyIORef' (_shTime s) (+ 600)
+    _psGetLatestBlock sh >>= (@?= want)
+
+    differences s >>= (@?= 1001)
+    ds <- filter ((== Just (String "getLatestBlock")) . field "op") <$> records "ShadowDifference" s
+    length ds @?= fromIntegral shadowFullDifferences
+    ns <- records "ShadowDifferencesSuppressed" s
+    length ns @?= 1
+    [summary] <- records "ShadowDifferenceSummary" s
+    field "op" summary @?= Just (String "getLatestBlock")
+    field "suppressed" summary @?= Just (Number 900)
+    field "suppressedTotal" summary @?= Just (Number 900)
+    -- no summary again before 10 minutes
+    replicateM_ 10 $ _psGetLatestBlock sh
+    length <$> records "ShadowDifferenceSummary" s >>= (@?= 1)
+  where
+    differ p = p
+        { _psGetLatestBlock = return Nothing
+        , _psDoLookupSuccessful = \_ _ -> return (HM.singleton "x" (T2 0 (mkHash 0 0)))
+        }
+
+renderTest :: Assertion
+renderTest = do
+    let b = B.replicate 600 0x61
+        r = renderShadowValue b
+    r @?= T.replicate 512 "61" <> "..." <> " sha256:"
+        <> "ba35c170729417f1499e0886e7e12fcdb4ab00ad411110ae1e888c766d4ed70d"
+    T.length (T.takeWhile (/= '.') r) @?= 1024
+    -- at most 512 bytes: no truncation mark
+    renderShadowValue (B.take 512 b) @?= T.replicate 512 "61" <> " sha256:"
+        <> T.pack (show (hashWith SHA256 (B.take 512 b)))
+
+normaliseTest :: Assertion
+normaliseTest = do
+    let row x k = (x, k, "d") :: (TxId, B.ByteString, B.ByteString)
+        norm = normaliseSysRange "SYS:KeySets" :: Either () [(TxId, B.ByteString, B.ByteString)] -> Either () [(TxId, B.ByteString, B.ByteString)]
+        good = [row 5 "a", row 5 "b", row 3 "c"]
+    -- rows of one txid in another order: the same
+    norm (Right [row 5 "b", row 5 "a", row 3 "c"]) @?= Right good
+    -- txids out of order: still different
+    let swapped = [row 3 "c", row 5 "a", row 5 "b"]
+    norm (Right swapped) @?= Right swapped
+    assertBool "txid order normalised away" (norm (Right swapped) /= norm (Right good))
+    -- user tables are not normalised
+    normaliseSysRange "coin_table" (Right [row 5 "b", row 5 "a"] :: Either () [(TxId, B.ByteString, B.ByteString)])
+        @?= Right [row 5 "b", row 5 "a"]

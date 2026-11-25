@@ -5,6 +5,8 @@
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE TemplateHaskell #-}
 
+{-# OPTIONS_GHC -Wno-orphans #-}
+
 -- |
 -- Module: Chainweb.Pact.Backend.Store.Types
 -- License: See LICENSE file
@@ -33,7 +35,7 @@ module Chainweb.Pact.Backend.Store.Types
     , _NoHistory
     ) where
 
-import Control.DeepSeq (NFData)
+import Control.DeepSeq (NFData(..), rwhnf)
 import Control.Lens (makePrisms)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Short as SB
@@ -110,7 +112,8 @@ data CommitStatement
     -- ^ the batched @TransactionIndex@ insert
     | CommitBlockHistory
     -- ^ the @BlockHistory@ row
-    deriving stock (Eq, Show)
+    deriving stock (Eq, Generic, Show)
+    deriving anyclass NFData
 
 -- | The SQLite call that failed.
 data CommitPhase
@@ -122,7 +125,8 @@ data CommitPhase
     | CommitReset
     | CommitStep
     | CommitFinalize
-    deriving stock (Eq, Show)
+    deriving stock (Eq, Generic, Show)
+    deriving anyclass NFData
 
 -- | A failed block commit: which statement, which call, and SQLite's error.
 -- Callers turn this into their own 3.2.1 error text.
@@ -131,7 +135,16 @@ data CommitError = CommitError
     , _cePhase :: !CommitPhase
     , _ceError :: !SQ3.Error
     }
-    deriving stock (Eq, Show)
+    deriving stock (Eq, Generic, Show)
+    deriving anyclass NFData
+
+-- | Orphans: direct-sqlite has no 'NFData' instances, and shadow mode forces
+-- results. SQLite's result codes are an enumeration: WHNF is normal form.
+instance NFData SQ3.Error where
+    rnf = rwhnf
+
+instance NFData SQ3.Utf8 where
+    rnf (SQ3.Utf8 b) = rnf b
 
 -- | The storage operations of the Pact checkpointer.
 --
