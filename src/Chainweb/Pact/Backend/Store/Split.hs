@@ -1,4 +1,5 @@
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE OverloadedStrings #-}
 
 -- |
@@ -14,8 +15,15 @@
 --   missing table fails exactly as the legacy store fails, and the cold store
 --   is never asked about it.
 -- * @F@ is the end txid of the verified frontier ('_ccVerified'), read once
---   per operation, before the hot statement. @F = 0@ (nothing frozen) never
---   asks the cold store.
+--   per operation, __after__ the hot statement. @F = 0@ (nothing frozen)
+--   never asks the cold store.
+-- * Why after: @lookupHistorical@ and @getBlockHistory@ read without
+--   @cpModuleCacheVar@, so a trim chunk can commit while they run. The trim
+--   deletes only rows below a frontier that is already published. A hot
+--   statement that missed rows because of a trim therefore sees an @F@ that
+--   covers them, and the cold store holds every version below @F@. Combined
+--   answers take hot rows at or above @F@ and cold rows below it, so a
+--   frontier that moved during the read neither duplicates nor drops a row.
 -- * Tables that 'frozenTable' rejects are answered by SQLite alone. The cold
 --   store is only asked about a table in its published catalog.
 -- * Below @F@ the hot store keeps the newest version of each key (anchors),
@@ -225,15 +233,15 @@ keyRead
     -> IO (Either SQ3.Error (Maybe a))
     -> (TxId -> IO (Maybe a))
     -> IO (Either SQ3.Error (Maybe a))
-keyRead env t mb hotRead coldRead = do
-    f <- verifiedTxId env
-    hotRead >>= \case
-        Left e -> return (Left e)
-        Right (Just v) -> do
-            when (isPacts t) $
-                bump env $ \c -> c { _scSysPactsHotHits = _scSysPactsHotHits c + 1 }
-            return (Right (Just v))
-        Right Nothing -> case keyReadBound t f mb of
+keyRead env t mb hotRead coldRead = hotRead >>= \case
+    Left e -> return (Left e)
+    Right (Just v) -> do
+        when (isPacts t) $
+            bump env $ \c -> c { _scSysPactsHotHits = _scSysPactsHotHits c + 1 }
+        return (Right (Just v))
+    Right Nothing -> do
+        f <- verifiedTxId env
+        case keyReadBound t f mb of
             Nothing -> return (Right Nothing)
             Just b
                 | isPacts t -> Right <$> coldPacts env t (coldRead b)
@@ -262,11 +270,9 @@ readHistorical env t k b = keyRead env t (Just b)
 -- | Both legacy @keys@ statements return ascending byte order (the @UNIQUE@
 -- autoindex, pinned by "legacy query plans"), which is the cold order.
 distinctKeys :: SplitEnv -> KeysQuery -> Text -> IO (Either SQ3.Error [ByteString])
-distinctKeys env q t = do
-    f <- verifiedTxId env
-    _psDistinctKeys (_seHot env) q t >>= \case
-        Left e -> return (Left e)
-        Right hot
+distinctKeys env q t = _psDistinctKeys (_seHot env) q t >>= \case
+    Left e -> return (Left e)
+    Right hot -> verifiedTxId env >>= \f -> if
             | f == 0 || not (frozenTable t) -> return (Right hot)
             | isPacts t -> do
                 let b = maybe f (min f) bound
@@ -284,11 +290,9 @@ distinctKeys env q t = do
 -- index, pinned by "legacy query plans"); the split answer is sorted the
 -- same way.
 txIdsAfter :: SplitEnv -> Text -> TxId -> IO (Either SQ3.Error [TxId])
-txIdsAfter env t x = do
-    f <- verifiedTxId env
-    _psTxIdsAfter (_seHot env) t x >>= \case
-        Left e -> return (Left e)
-        Right hot
+txIdsAfter env t x = _psTxIdsAfter (_seHot env) t x >>= \case
+    Left e -> return (Left e)
+    Right hot -> verifiedTxId env >>= \f -> if
             | f == 0 || not (frozenTable t) || isSys t -> return (Right hot)
             | txIdWord x + 1 < txIdWord f -> do
                 cs <- cold env t [] (_ccTxIdsBetween (_seCold env) t x f)
@@ -296,11 +300,9 @@ txIdsAfter env t x = do
             | otherwise -> return (Right hot)
 
 rowsAtTxId :: SplitEnv -> Text -> TxId -> IO (Either SQ3.Error [(ByteString, ByteString)])
-rowsAtTxId env t x = do
-    f <- verifiedTxId env
-    _psRowsAtTxId (_seHot env) t x >>= \case
-        Left e -> return (Left e)
-        Right hot
+rowsAtTxId env t x = _psRowsAtTxId (_seHot env) t x >>= \case
+    Left e -> return (Left e)
+    Right hot -> verifiedTxId env >>= \f -> if
             | f == 0 || not (frozenTable t) || isSys t -> return (Right hot)
             | x < f -> Right . maybe [] id <$> cold env t Nothing (_ccRowsAtTxId (_seCold env) t x)
             | otherwise -> return (Right hot)
@@ -314,11 +316,9 @@ rowsAtTxId env t x = do
 -- reached from tests alone. The cold read of a @SYS:*@ table scans the whole
 -- table's @R@ range (parked pointer M2); this is bounded by that caller.
 rowsInTxIdRange :: SplitEnv -> Text -> TxId -> TxId -> IO (Either SQ3.Error [(TxId, ByteString, ByteString)])
-rowsInTxIdRange env t from to = do
-    f <- verifiedTxId env
-    _psRowsInTxIdRange (_seHot env) t from to >>= \case
-        Left e -> return (Left e)
-        Right hot
+rowsInTxIdRange env t from to = _psRowsInTxIdRange (_seHot env) t from to >>= \case
+    Left e -> return (Left e)
+    Right hot -> verifiedTxId env >>= \f -> if
             | f == 0 || not (frozenTable t) -> return (Right hot)
             | otherwise -> do
                 let hot' = [ r | r@(x, _, _) <- hot, x >= f ]

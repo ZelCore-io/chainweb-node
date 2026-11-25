@@ -68,6 +68,7 @@ tests = testGroup "Split store"
     , testCase "rewind below the written frontier, also after a crash between write and publish: RewindBelowFrontier, SQLite unchanged" rewindBelowTest
     , testCase "SYS:Pacts: a continuation read whose row is only in cold returns its bytes; counters move" sysPactsTest
     , testCase "a publish between the split's frontier read and the cold read: no duplicate rows, order as legacy" straddleTest
+    , testCase "a freezer step and its trim between the hot statement and the frontier read: every read op equals the legacy twin" trimRaceTest
     , testCase "backup is refused" backupTest
     ]
 
@@ -351,6 +352,83 @@ straddleTest = withSplit $ \s0 -> do
         length rs @?= length lg
     n <- coldReads s
     assertBool "the cold store was read" (n > 0)
+
+data StepAt = StepBeforeHot | StepAfterHot
+    deriving Show
+
+-- | Reads outside @cpModuleCacheVar@ (@lookupHistorical@, @getBlockHistory@)
+-- interleave with the trim. Each probe runs on a fresh fixture frozen to
+-- end txid 30 (height 2). A whole freezer step (write, verify, publish and
+-- the trim of that step, to end txid 60) then runs inside the probe's hot
+-- statement wrapper: just before the statement, or just after it and so
+-- before the split store's routing decision. The trim deletes rows in
+-- @[30, 60)@ which the probes ask about. Every probe must equal the twin.
+trimRaceTest :: Assertion
+trimRaceTest = do
+    bad <- fmap concat $ forM [(w, p) | w <- [StepBeforeHot, StepAfterHot], p <- probes] $ \(when', (what0, op)) -> withFixture $ \root twin -> withPlainNode root $ \n -> do
+        let what = show when' <> ": " <> what0
+            first = frontierAt 2
+            next = frontierAt 5
+            expectFroze w o = case o of
+                Froze f' -> assertEqual (what <> ": step end txid") (_frEndTxId w) (_frEndTxId f')
+                _ -> assertFailure (what <> ": expected a step to " <> show w)
+        freezeOnce (_nEnv n) >>= expectFroze first
+        armed <- newIORef True
+        let fire = do
+                a <- atomicModifyIORef' armed (\x -> (False, x))
+                when a $ freezeOnce (_nEnv n) >>= expectFroze next
+            thenStep act = case when' of
+                StepBeforeHot -> fire *> act
+                StepAfterHot -> act <* fire
+            hot = sqlitePactStore (_nPact n)
+            hot' = hot
+                { _psReadNewest = \t k mb -> thenStep (_psReadNewest hot t k mb)
+                , _psReadPrev = \t k b -> thenStep (_psReadPrev hot t k b)
+                , _psReadHistorical = \t k b -> thenStep (_psReadHistorical hot t k b)
+                , _psDistinctKeys = \q t -> thenStep (_psDistinctKeys hot q t)
+                , _psTxIdsAfter = \t x -> thenStep (_psTxIdsAfter hot t x)
+                , _psRowsAtTxId = \t x -> thenStep (_psRowsAtTxId hot t x)
+                , _psRowsInTxIdRange = \t a b -> thenStep (_psRowsInTxIdRange hot t a b)
+                }
+        ref <- newIORef emptySplitCounters
+        let sp = splitPactStore SplitEnv
+                { _seChain = cid
+                , _seHot = hot'
+                , _seCold = _nCold n
+                , _seCounters = ref
+                }
+        got <- op sp
+        want <- op (sqlitePactStore twin)
+        readIORef armed >>= assertBool (what <> ": the step ran inside the hot statement") . not
+        _ccVerified (_nCold n) >>= assertEqual (what <> ": verified frontier") (Just (_frEndTxId next)) . fmap _frEndTxId
+        -- the trim did delete rows of the window from the hot store
+        _psRowsAtTxId hot "coin_table" 43 >>= assertEqual (what <> ": alice@43 trimmed") (Right [])
+        return [ what <> "\n  expected: " <> want <> "\n   but got: " <> got | got /= want ]
+    assertBool (unlines bad) (null bad)
+  where
+    coin = "coin_table"
+    pacts = "SYS:Pacts"
+    sh :: Show a => IO a -> IO String
+    sh = fmap show
+    probes :: [(String, PactStore -> IO String)]
+    probes =
+        -- bob is written at 21 and 41: the step trims 21, keeps the anchor 41
+        [ ("readHistorical bob 35", \p -> sh (_psReadHistorical p coin "bob" 35))
+        , ("readNewest bob 35", \p -> sh (_psReadNewest p coin "bob" (Just 35)))
+        , ("readPrev bob 35", \p -> sh (_psReadPrev p coin "bob" 35))
+        -- p2 starts at 24 and continues at 34: nothing of it stays hot
+        , ("readNewest SYS:Pacts p2", \p -> sh (_psReadNewest p pacts "p2" Nothing))
+        , ("readNewest SYS:Pacts p3 45", \p -> sh (_psReadNewest p pacts "p3" (Just 45)))
+        , ("keys SYS:Pacts as stored", \p -> sh (_psDistinctKeys p (KeysAsStored Nothing) pacts))
+        , ("keys SYS:Pacts by key 45", \p -> sh (_psDistinctKeys p (KeysOrderedByKey 45) pacts))
+        , ("keys coin_table by key 35", \p -> sh (_psDistinctKeys p (KeysOrderedByKey 35) coin))
+        , ("txIdsAfter coin_table 35", \p -> sh (_psTxIdsAfter p coin 35))
+        , ("txIdsAfter coin_table 0", \p -> sh (_psTxIdsAfter p coin 0))
+        , ("rowsAtTxId coin_table 43", \p -> sh (_psRowsAtTxId p coin 43))
+        , ("rowsInTxIdRange coin_table 0 131", \p -> sh (_psRowsInTxIdRange p coin 0 131))
+        , ("rowsInTxIdRange coin_table 35 55", \p -> sh (_psRowsInTxIdRange p coin 35 55))
+        , ("rowsInTxIdRange SYS:Pacts 0 131", \p -> sh (normaliseSysRange pacts <$> _psRowsInTxIdRange p pacts 0 131))
+        ]
 
 backupTest :: Assertion
 backupTest = withSplit $ \s -> withSystemTempDirectory "split-backup" $ \tmp ->
