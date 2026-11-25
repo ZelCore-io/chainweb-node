@@ -32,6 +32,7 @@ module Chainweb.Pact.Backend.Store.Cold
 , foldTableName
 , isSysTable
 , frozenTable
+, keepsNoAnchors
 
   -- * Store
 , ColdStore
@@ -106,8 +107,10 @@ data Frontier = Frontier
 
 -- | The @M c@ value of a chain.
 --
--- '_cmTrimFrom' is the end txid of the verified frontier before the last
--- publish, so a restart re-trims only the last step.
+-- '_cmTrimFrom' is the trim position: SQLite is trimmed for the verified
+-- frontier below it. A publish sets it to the end txid of the old verified
+-- frontier; the trim moves it forward as chunks complete, up to the verified
+-- end txid. A trim cut short, by a crash or an exception, resumes there.
 --
 data ColdMeta = ColdMeta
     { _cmWritten :: !(Maybe Frontier)
@@ -191,6 +194,15 @@ isSysTable = T.isPrefixOf "SYS:"
 --
 frozenTable :: Text -> Bool
 frozenTable name = name /= "SYS:Modules" && name /= "SYS:ModuleSources"
+
+-- | Whether the trim keeps no anchor of a table: @SYS:Pacts@ loses every row
+-- below the frontier, and a miss on it is answered from cold (spec 4.3, 6.2).
+-- Every other frozen table keeps the newest row below the frontier of each
+-- key. The name is compared as stored, like 'frozenTable' and 'isSysTable':
+-- @VersionedTableMutation@ stores it as @SYS:Pacts@.
+--
+keepsNoAnchors :: Text -> Bool
+keepsNoAnchors name = name == "SYS:Pacts"
 
 -- -------------------------------------------------------------------------- --
 -- Store
@@ -313,6 +325,9 @@ data ColdChain = ColdChain
         -- (synced); then the in-memory frontier moves and the new catalog
         -- entries become visible to readers. Does nothing when verified equals
         -- written.
+    , _ccTrimProgress :: !(Pact4.TxId -> IO ())
+        -- ^ the trim has completed below this txid: '_cmTrimFrom' moves
+        -- forward to it, at most to the verified end txid (synced)
     , _ccTableId :: !(Text -> IO (Maybe TableId))
         -- ^ the published catalog, looked up with the folded name
     , _ccReadNewest :: !(Text -> B.ByteString -> Pact4.TxId -> IO (Maybe (B.ByteString, B.ByteString)))
@@ -445,6 +460,18 @@ openColdChainHooked writer midPublish cs c = do
                     midPublish
                     atomicWriteIORef metaRef m'
                     return ws { _wsMeta = m', _wsUnpublished = [] }
+        , _ccTrimProgress = \x -> do
+            checkWritable
+            modifyMVar_ writerVar $ \ws -> do
+                let m = _wsMeta ws
+                    x' = min x (frontierTxId (_cmVerified m))
+                if x' <= _cmTrimFrom m
+                then return ws
+                else do
+                    let m' = m { _cmTrimFrom = x' }
+                    writer db [R.Put (metaKey c) (encodeColdMeta m')]
+                    atomicWriteIORef metaRef m'
+                    return ws { _wsMeta = m' }
         , _ccTableId = \name -> HM.lookup (foldTableName name) <$> readIORef catalogRef
         , _ccReadNewest = readNewest readers
         , _ccDistinctKeys = distinctKeys readers

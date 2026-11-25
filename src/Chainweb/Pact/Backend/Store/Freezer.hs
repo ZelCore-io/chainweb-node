@@ -16,8 +16,8 @@
 -- Crash safety (spec 6.3): a row leaves SQLite only after a synced, verified
 -- copy exists in the cold store. 'freezeOnce' first finishes what a previous
 -- run left: a written but unverified step is verified again and published,
--- and the trim of the last published step runs again (deletes are
--- idempotent). A verification failure or a changed block hash at the
+-- and a trim cut short resumes at its stored position ('_cmTrimFrom'; deletes
+-- are idempotent). A verification failure or a changed block hash at the
 -- frontier halts the chain's freezer: SQLite is not trimmed and the node
 -- keeps running on SQLite.
 --
@@ -30,6 +30,8 @@ module Chainweb.Pact.Backend.Store.Freezer
 , noHooks
 , FreezerStats(..)
 , emptyFreezerStats
+, TrimWindow(..)
+, defaultTrimWindow
 
   -- * Steps
 , StepPlan(..)
@@ -55,6 +57,7 @@ import Data.IORef
 import qualified Data.Set as S
 import Data.Text (Text)
 import qualified Data.Text as T
+import Data.Word (Word64)
 
 import GHC.Clock (getMonotonicTime)
 
@@ -103,10 +106,9 @@ data FreezerStats = FreezerStats
     , _fsRowsFrozen :: !Int
     , _fsRowsTrimmed :: !Int
     , _fsTrimChunks :: !Int
-    , _fsChunkLimit :: !Int
-        -- ^ the current trim chunk size, adapted to the 20 ms target
-    , _fsStartTrimDone :: !Bool
-        -- ^ whether the trim of the last published step ran after the start
+    , _fsTrimWindow :: !(Maybe Word64)
+        -- ^ the current trim window in txids, adapted to the 20 ms target;
+        -- 'Nothing' before the first chunk ('_twStart')
     , _fsHaltedHash :: !(Maybe Frontier)
         -- ^ the trim found another block hash at this frontier; the freezer
         -- of the chain is halted
@@ -114,7 +116,23 @@ data FreezerStats = FreezerStats
     deriving (Eq, Show)
 
 emptyFreezerStats :: FreezerStats
-emptyFreezerStats = FreezerStats 0 0 0 0 1000 False Nothing
+emptyFreezerStats = FreezerStats 0 0 0 0 Nothing Nothing
+
+-- | The trim window: each trim chunk covers the txids @[lo, lo + w)@ of the
+-- step, and @w@ adapts to the 20 ms target (spec 6.2 step 5): halved when a
+-- chunk takes over 20 ms, doubled under 5 ms, within '_twMin' and '_twMax'.
+-- A chunk's cost follows the rows of its window. Tests fix the window with
+-- equal bounds.
+--
+data TrimWindow = TrimWindow
+    { _twStart :: !Word64
+    , _twMin :: !Word64
+    , _twMax :: !Word64
+    }
+    deriving (Eq, Show)
+
+defaultTrimWindow :: TrimWindow
+defaultTrimWindow = TrimWindow 1000 1 1048576
 
 data FreezerEnv = FreezerEnv
     { _feChain :: !ChainId
@@ -125,6 +143,7 @@ data FreezerEnv = FreezerEnv
         -- ^ runs on the Pact connection, under @cpModuleCacheVar@
     , _feBeforeTrimChunk :: !(IO ())
         -- ^ runs before every trim chunk (Task 25's gate)
+    , _feTrimWindow :: !TrimWindow
     , _feLogger :: !GenericLogger
     , _feHooks :: !FreezerHooks
     , _feStats :: !(IORef FreezerStats)
@@ -297,14 +316,20 @@ data TrimOutcome = Trimmed !Int | TrimHashMismatch
 -- | Trims SQLite below the frontier @F@ (spec 6.2 step 5) for the rows
 -- written in @[from, F)@: for the tables mutated in those blocks, every row
 -- below @F@ that is not the newest below @F@ of its key ('KeepAnchors'), and
--- every row below @F@ of @SYS:Pacts@ ('DropAll').
+-- every row below @F@ of @SYS:Pacts@ ('DropAll', 'keepsNoAnchors').
 --
--- 'ensureSplitDir' runs first. Each chunk runs '_feBeforeTrimChunk', then,
--- on the Pact connection in the savepoint @trim@, checks that @BlockHistory@
--- still has the frontier's hash at its height ('TrimHashMismatch' and nothing
--- deleted otherwise) and deletes at most the current chunk size. The chunk
--- size adapts to the 20 ms target: halved above 20 ms, doubled below 5 ms,
--- within 16 and 65,536.
+-- 'ensureSplitDir' runs first. The trim walks @[from, F)@ in ascending
+-- windows of txids ('TrimWindow'); one chunk is one window over every table.
+-- Each chunk runs '_feBeforeTrimChunk', then, on the Pact connection in the
+-- savepoint @trim@, checks that @BlockHistory@ still has the frontier's hash
+-- at its height ('TrimHashMismatch' and nothing deleted otherwise) and runs
+-- the window's statements. Then '_ccTrimProgress' stores the window's end,
+-- so a trim cut short resumes there.
+--
+-- The windows ascend and a chunk is atomic, so the trim deletes
+-- oldest-first: after every chunk, a key's rows in SQLite are a newest-suffix
+-- of its legacy rows, and a SQLite hit is the legacy answer (spec 4.3, 6.3).
+-- Rowids of the rows that stay do not change; there is no @VACUUM@.
 --
 trimStep :: FreezerEnv -> Frontier -> TxId -> IO TrimOutcome
 trimStep env f from = do
@@ -313,11 +338,14 @@ trimStep env f from = do
         prev <- sqliteBlockAtOrBelow db (_frHeight f) from
         sqliteMutatedTablesBetween db prev (_frHeight f)
     let work = distinctOn foldTableName
-            [ (t, if foldTableName t == "sys:pacts" then DropAll else KeepAnchors)
+            [ (t, if keepsNoAnchors t then DropAll else KeepAnchors)
             | t <- tables, frozenTable t
             ]
-    go work 0
+    go work from 0
   where
+    fe = _frEndTxId f
+    tw = _feTrimWindow env
+
     distinctOn g = go' S.empty
       where
         go' _ [] = []
@@ -325,34 +353,34 @@ trimStep env f from = do
             | S.member (g t) seen = go' seen xs
             | otherwise = x : go' (S.insert (g t) seen) xs
 
-    go [] !total = return (Trimmed total)
-    go ((t, rule) : rest) !total = do
-        _feBeforeTrimChunk env
-        limit <- _fsChunkLimit <$> readIORef (_feStats env)
-        r <- _feWithPactDb env $ \db -> do
-            t0 <- getMonotonicTime
-            r <- sqliteWithTrimSavepoint db $ sqliteBlockHashAt db (_frHeight f) >>= \case
-                Just h | h == _frHash f -> Just <$> sqliteTrimChunk db t rule from (_frEndTxId f) limit
-                _ -> return Nothing
-            t1 <- getMonotonicTime
-            return ((, t1 - t0) <$> r)
-        case r of
-            Nothing -> return TrimHashMismatch
-            Just (n, dt) -> do
-                let limit'
-                        | dt > 0.020 = max 16 (limit `div` 2)
-                        | dt < 0.005 = min 65536 (limit * 2)
-                        | otherwise = limit
-                modifyIORef' (_feStats env) $ \s -> s
-                    { _fsChunkLimit = limit'
-                    , _fsRowsTrimmed = _fsRowsTrimmed s + n
-                    , _fsTrimChunks = _fsTrimChunks s + 1
-                    }
-                _fhAfterTrimChunk (_feHooks env)
-                -- fewer than the limit: the table is done
-                if n < limit
-                then go rest (total + n)
-                else go ((t, rule) : rest) (total + n)
+    go work lo !total
+        | lo >= fe = return (Trimmed total)
+        | otherwise = do
+            _feBeforeTrimChunk env
+            w <- maybe (_twStart tw) id . _fsTrimWindow <$> readIORef (_feStats env)
+            let hi = min fe (lo + Pact4.TxId w)
+            r <- _feWithPactDb env $ \db -> do
+                t0 <- getMonotonicTime
+                r <- sqliteWithTrimSavepoint db $ sqliteBlockHashAt db (_frHeight f) >>= \case
+                    Just h | h == _frHash f -> Just . sum <$>
+                        forM work (\(t, rule) -> sqliteTrimChunk db t rule lo hi fe)
+                    _ -> return Nothing
+                t1 <- getMonotonicTime
+                return ((, t1 - t0) <$> r)
+            case r of
+                Nothing -> return TrimHashMismatch
+                Just (n, dt) -> do
+                    let w'  | dt > 0.020 = max (_twMin tw) (w `div` 2)
+                            | dt < 0.005 = min (_twMax tw) (w * 2)
+                            | otherwise = max (_twMin tw) (min (_twMax tw) w)
+                    modifyIORef' (_feStats env) $ \s -> s
+                        { _fsTrimWindow = Just w'
+                        , _fsRowsTrimmed = _fsRowsTrimmed s + n
+                        , _fsTrimChunks = _fsTrimChunks s + 1
+                        }
+                    _ccTrimProgress (_feCold env) hi
+                    _fhAfterTrimChunk (_feHooks env)
+                    go work hi (total + n)
 
 -- -------------------------------------------------------------------------- --
 -- One step
@@ -373,8 +401,9 @@ data StepOutcome
 --
 -- 1. if the written frontier is ahead of the verified one, re-read that range
 --    on a fresh read connection, verify it, publish it and trim it;
--- 2. on the first call after a start, trim @[trimFrom, F)@ once, which
---    finishes a trim that a crash cut short;
+-- 2. if the trim of the verified frontier is not complete (its stored
+--    position '_cmTrimFrom' is below @F@), resume it there: this finishes a
+--    trim that a crash, or an exception in this process, cut short;
 -- 3. otherwise plan, read, write, verify, publish and trim one step.
 --
 -- A write failure (an exception of the cold store) propagates; nothing is
@@ -388,19 +417,16 @@ freezeOnce env = do
         Just f -> return (HaltedHash f)
         Nothing
             | _cmWritten meta /= _cmVerified meta -> recover meta
-            | not (_fsStartTrimDone st) -> case _cmVerified meta of
-                Just f | _cmTrimFrom meta < _frEndTxId f -> do
-                    logg env Info $ "finishing the trim of the last step below " <> T.pack (show f)
-                    trimAndReport f (_cmTrimFrom meta) Nothing >>= \case
-                        o@(HaltedHash _) -> return o
-                        _ -> markStartTrim >> step
-                _ -> markStartTrim >> step
+            | Just f <- _cmVerified meta, _cmTrimFrom meta < _frEndTxId f -> do
+                logg env Info $ "resuming the trim below " <> T.pack (show f)
+                    <> " at txid " <> T.pack (show (_cmTrimFrom meta))
+                trimAndReport f (_cmTrimFrom meta) Nothing >>= \case
+                    o@(HaltedHash _) -> return o
+                    _ -> step
             | otherwise -> step
   where
     cold = _feCold env
     hooks = _feHooks env
-
-    markStartTrim = modifyIORef' (_feStats env) $ \s -> s { _fsStartTrimDone = True }
 
     -- (1) a written but unverified step: verify it again and publish it
     recover meta = case _cmWritten meta of
@@ -429,11 +455,7 @@ freezeOnce env = do
                     _fhAfterVerify hooks
                     _ccPublish cold
                     _fhAfterPublish hooks
-                    o <- trimAndReport w (frontierTxId v) (Just s)
-                    case o of
-                        Froze _ -> markStartTrim
-                        _ -> return ()
-                    return o
+                    trimAndReport w (frontierTxId v) (Just s)
 
     -- (3) a new step
     step = do

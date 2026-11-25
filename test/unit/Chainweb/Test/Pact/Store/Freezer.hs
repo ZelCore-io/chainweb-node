@@ -25,9 +25,10 @@ import qualified Data.ByteString.Char8 as B8
 import Data.Bits (shiftL, (.|.))
 import Data.Int (Int64)
 import Data.IORef
-import Data.List (sort)
+import Data.List (sort, sortOn)
 import qualified Data.Map.Strict as M
 import Data.Maybe (isJust, isNothing)
+import qualified Data.Set as S
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
@@ -168,7 +169,18 @@ withNode
         -- ^ before each trim chunk
     -> (Node -> IO a)
     -> IO a
-withNode root cfg writer mkHooks gate k = do
+withNode = withNodeW defaultTrimWindow
+
+withNodeW
+    :: TrimWindow
+    -> FilePath
+    -> PactHistoryConfig
+    -> (RocksDb -> [R.BatchOp] -> IO ())
+    -> (Node -> FreezerHooks)
+    -> (Node -> IO ())
+    -> (Node -> IO a)
+    -> IO a
+withNodeW tw root cfg writer mkHooks gate k = do
     layout <- resolvePactLayout quietLogger HistorySplit False root
     dir <- currentSqliteDir layout
     withSQLiteConnection (dir </> chainDbFileName cid) chainwebPragmas $ \db -> do
@@ -184,11 +196,20 @@ withNode root cfg writer mkHooks gate k = do
                     , _feConfig = cfg
                     , _feWithPactDb = \act -> withMVar lock act
                     , _feBeforeTrimChunk = gate node
+                    , _feTrimWindow = tw
                     , _feLogger = quietLogger
                     , _feHooks = mkHooks node
                     , _feStats = stats
                     }
             k node
+
+-- | A node whose trim chunks are one txid wide, so that each table's trim of
+-- a step spans many chunks.
+withSmallChunkNode :: FilePath -> (Node -> FreezerHooks) -> (Node -> IO a) -> IO a
+withSmallChunkNode root hooks = withNodeW (TrimWindow 1 1 1) root testConfig writeBatchSync hooks (const (return ()))
+
+withSmallChunkNodeGate :: FilePath -> (Node -> IO ()) -> (Node -> IO a) -> IO a
+withSmallChunkNodeGate root = withNodeW (TrimWindow 1 1 1) root testConfig writeBatchSync (const noHooks)
 
 withPlainNode :: FilePath -> (Node -> IO a) -> IO a
 withPlainNode root = withNode root testConfig writeBatchSync (const noHooks) (const (return ()))
@@ -296,7 +317,11 @@ tests = testGroup "Freezer step"
     , testCase "after trim: VersionedTableCreation, VersionedTableMutation, BlockHistory, TransactionIndex and sqlite_master unchanged" afterTrimBookkeepingTest
     , testCase "after trim: every surviving row keeps its rowid; rowsAtTxId at and above F equals the twin's, order included" afterTrimOrderTest
     , testCase "crash after read, write, verify, publish and each trim chunk: resume reaches the no-crash state" crashResumeTest
-    , testCase "at every crash point each row is in SQLite or in cold at or below the written frontier" crashInvariantTest
+    , testCase "at every crash point SQLite holds a newest-suffix of each key and every missing row is in cold below the verified frontier" crashInvariantTest
+    , testCase "after every trim chunk (both trim rules): SQLite holds a newest-suffix of each key, so a SQLite hit is the legacy answer" perChunkStateTest
+    , testCase "an exception mid-trim in a running process: the next call resumes the trim from the stored position" trimExceptionTest
+    , testCase "a restart after a finished trim runs no trim chunk" noRetrimTest
+    , testCase "a large step trims in ascending txid windows: one chunk per window, none re-walks an earlier one" largeStepWindowTest
     , testCase "corrupt R value between write and verify: HaltedVerify, verified frontier and SQLite unchanged" corruptTest
     , testCase "verify view: a step that creates a new table verifies; a corrupted value in that table fails verify" newTableVerifyTest
     , testCase "cold write failure: freezeOnce throws, frontiers and SQLite unchanged, SQLite still answers" writeFailureTest
@@ -407,8 +432,13 @@ baseline :: IO (Int, ([(Text, [[Text]])], [[Text]], [(B.ByteString, B.ByteString
 baseline = withFixture $ \root _ -> do
     ref <- newIORef 0
     let (hooks, gate) = countingHooks ref 0
-    void $ withNode root testConfig writeBatchSync hooks gate $ runToEnd . _nEnv
+    void $ withCrashNode root hooks gate $ runToEnd . _nEnv
     (,) <$> readIORef ref <*> snapshot root
+
+-- | Trim windows of 4 txids: each step's trim (30 txids) is 8 chunks, so the
+-- crash points include the middle of every trim.
+withCrashNode :: FilePath -> (Node -> FreezerHooks) -> (Node -> IO ()) -> (Node -> IO a) -> IO a
+withCrashNode root = withNodeW (TrimWindow 4 4 4) root testConfig writeBatchSync
 
 -- | Crashes at each hook call in turn; runs the check after the crash, then
 -- resumes with a fresh start and compares with the no-crash state.
@@ -419,7 +449,7 @@ crashEach check = do
     forM_ [1 .. n] $ \k -> withFixture $ \root twin -> do
         calls <- newIORef 0
         let (hooks, gate) = countingHooks calls k
-        r <- try $ withNode root testConfig writeBatchSync hooks gate $ runToEnd . _nEnv
+        r <- try $ withCrashNode root hooks gate $ runToEnd . _nEnv
         case r of
             Left (Crash i) -> i @?= k
             Right o -> assertFailure $ "crash point " <> show k <> " was not reached: " <> show o
@@ -444,19 +474,163 @@ crashInvariantTest = crashEach $ \k root twin -> do
             meta <- coldRawGet cs (metaKey cid) >>= \case
                 Nothing -> return emptyColdMeta
                 Just b -> either fail return (decodeColdMeta b)
-            let we = w64 (frontierTxId (_cmWritten meta))
-            forM_ dataTables $ \t -> do
-                hot <- M.fromList . fmap (\r@(i, _, _, _) -> (i, r)) <$> rowsOf db t
-                tid <- coldTableId cs t
-                rows <- rowsOf twin t
-                forM_ rows $ \r@(i, key, x, d) -> do
-                    inCold <- case tid of
-                        Just t' | x < we ->
-                            (== Just d) <$> coldRawGet cs (rowKey cid t' key x)
-                        _ -> return False
-                    unless (M.lookup i hot == Just r || inCold) $ assertFailure $
-                        "crash " <> show k <> ": row " <> show r <> " of " <> T.unpack t
-                            <> " is neither in SQLite nor in cold below the written frontier"
+            checkTrimState ("crash " <> show k) db twin cs (_cmVerified meta)
+
+-- | The state reads need at any moment of a trim (spec 4.3, 6.3), checked
+-- against the untouched twin:
+--
+-- * per key of every frozen table, SQLite's rows are a newest-suffix of the
+--   twin's (same rowids and bytes): the trim deletes oldest-first, so a SQLite
+--   hit at any bound, the tip included, is the legacy answer, and a key with
+--   no SQLite row left is wholly below F;
+-- * every row missing from SQLite is in cold, with the same bytes, below the
+--   VERIFIED frontier;
+-- * the tables the freezer does not move equal the twin's.
+--
+checkTrimState :: String -> SQLiteEnv -> SQLiteEnv -> ColdStore -> Maybe Frontier -> IO ()
+checkTrimState msg db twin cs verified = do
+    let ve = w64 (frontierTxId verified)
+    forM_ frozenNames $ \t -> do
+        hot <- rowsOf db t
+        tw <- rowsOf twin t
+        tid <- coldTableId cs t
+        let byKey rs = M.map (sortOn (\(_, _, x, _) -> x)) $
+                M.fromListWith (flip (++)) [ (k, [r]) | r@(_, k, _, _) <- rs ]
+            hk = byKey hot
+            tk = byKey tw
+            ctx = msg <> ": " <> T.unpack t
+        assertBool (ctx <> ": SQLite has no key the twin lacks") (M.keysSet hk `S.isSubsetOf` M.keysSet tk)
+        forM_ (M.toList tk) $ \(k, trs) -> do
+            let hrs = M.findWithDefault [] k hk
+                (gone, kept) = splitAt (length trs - length hrs) trs
+            assertEqual (ctx <> ", key " <> show k <> ": SQLite's rows are a newest-suffix of the twin's") kept hrs
+            unless (null hrs) $
+                assertEqual (ctx <> ", key " <> show k <> ": SQLite's newest row is the legacy tip answer") (last trs) (last hrs)
+            forM_ gone $ \r@(_, _, x, d) -> do
+                inCold <- case tid of
+                    Just t' | x < ve -> (== Just d) <$> coldRawGet cs (rowKey cid t' k x)
+                    _ -> return False
+                unless inCold $ assertFailure $ ctx <> ": row " <> show r
+                    <> " is neither in SQLite nor in cold below the verified frontier"
+    forM_ (filter (not . frozenTable) dataTables) $ \t -> do
+        a <- rowsOf db t
+        b <- rowsOf twin t
+        assertEqual (msg <> ": " <> T.unpack t <> " is not trimmed") b a
+
+-- | Small trim chunks, so that each table's trim of a step spans many of
+-- them; after every chunk the state satisfies 'checkTrimState'. The fixture
+-- has keys with several versions per step in a 'KeepAnchors' table
+-- (@coin_table@, @Late_Table@) and pacts with a start and a continuation in
+-- the 'DropAll' table @SYS:Pacts@.
+perChunkStateTest :: Assertion
+perChunkStateTest = withFixture $ \root twin -> do
+    chunks <- newIORef (0 :: Int)
+    let hooks n = noHooks
+            { _fhAfterTrimChunk = do
+                i <- atomicModifyIORef' chunks (\i -> (i + 1, i + 1))
+                v <- _ccVerified (_nCold n)
+                checkTrimState ("after trim chunk " <> show i) (_nPact n) twin (_nStore n) v
+            }
+    withSmallChunkNode root hooks $ \n -> do
+        outcomes <- runToEnd (_nEnv n)
+        outcomes @?= (Froze . frontierAt <$> [2, 5, 8]) ++ [NothingToDo]
+        forM_ dataTables $ \t -> do
+            expected <- expectedAfterTrim twin finalFrontier t
+            rowsOf (_nPact n) t >>= assertEqual (T.unpack t) expected
+    c <- readIORef chunks
+    assertBool ("the trims spanned many chunks: " <> show c) (c > 30)
+
+-- | An exception in the middle of the last step's trim, in a running
+-- process (Task 25 retries in the same process): the next 'freezeOnce'
+-- finishes that trim from the stored position before it does anything else.
+trimExceptionTest :: Assertion
+trimExceptionTest = withFixture $ \root twin -> do
+    thrown <- newIORef False
+    calls <- newIORef (0 :: Int)
+    let gate n = do
+            v <- _ccVerified (_nCold n)
+            when (v == Just finalFrontier) $ do
+                i <- atomicModifyIORef' calls (\i -> (i + 1, i + 1))
+                t <- readIORef thrown
+                when (i == 2 && not t) $ writeIORef thrown True >> throwIO (Crash i)
+    withSmallChunkNodeGate root gate $ \n -> do
+        r <- try (runToEnd (_nEnv n))
+        case r of
+            Left (Crash _) -> return ()
+            Right o -> assertFailure $ "expected the trim to throw, got " <> show o
+        trimFrom <- _cmTrimFrom <$> _ccMeta (_nCold n)
+        assertBool ("the stored trim position moved inside the step: " <> show trimFrom)
+            (trimFrom > _frEndTxId (frontierAt 5) && trimFrom < _frEndTxId finalFrontier)
+        -- the same process calls again
+        freezeOnce (_nEnv n) >>= (@?= NothingToDo)
+        forM_ dataTables $ \t -> do
+            expected <- expectedAfterTrim twin finalFrontier t
+            rowsOf (_nPact n) t >>= assertEqual (T.unpack t) expected
+        (_cmTrimFrom <$> _ccMeta (_nCold n)) >>= (@?= _frEndTxId finalFrontier)
+
+-- | The stored trim position reaches F when a trim finishes, so a restart
+-- does not trim the last step again.
+noRetrimTest :: Assertion
+noRetrimTest = withFixture $ \root _ -> do
+    withPlainNode root $ void . runToEnd . _nEnv
+    calls <- newIORef (0 :: Int)
+    withNode root testConfig writeBatchSync (const noHooks) (const (modifyIORef' calls (+ 1))) $ \n -> do
+        freezeOnce (_nEnv n) >>= (@?= NothingToDo)
+        _fsTrimChunks <$> readIORef (_feStats (_nEnv n)) >>= (@?= 0)
+    readIORef calls >>= (@?= 0)
+
+-- | A step of 6,000 txids over 500 keys written every 500 txids and one hot
+-- key written at every txid, trimmed with a fixed window of 100 txids: 60
+-- chunks, each deleting exactly its window's superseded rows, and the stored
+-- trim position moves one window per chunk. A chunk's work is its window, so
+-- the count of chunks is rows / window, whatever the number of keys.
+largeStepWindowTest :: Assertion
+largeStepWindowTest = withSystemTempDirectory "freezer-large" $ \tmp -> do
+    let root = tmp </> "0"
+        perBlock = 2000 :: Int
+        tbl' = "big_table"
+        big h = BlockCommit
+            { _bcHeight = fromIntegral h
+            , _bcHash = mkHash h 0
+            , _bcEndTxId = fromIntegral ((h + 1) * perBlock)
+            , _bcNewTables = [ tbl' | h == 0 ]
+            , _bcRows =
+                [ (tbl', concat
+                    [ [ ("k" <> B8.pack (show (i `mod` 500)), fromIntegral i, "{}")
+                      , ("hot", fromIntegral i, "{}")
+                      ]
+                    | i <- [h * perBlock .. (h + 1) * perBlock - 1]
+                    ])
+                ]
+            , _bcTxHashes = [ "txhash-" <> B8.pack (show h) ]
+            }
+        cfg = testConfig { _phFreezeDepth = 1, _phFreezeStepHeights = 3 }
+    createDirectoryIfMissing True (root </> sqliteDirName)
+    withSQLiteConnection (root </> sqliteDirName </> chainDbFileName cid) chainwebPragmas $ \db -> do
+        _psInitSchema (sqlitePactStore db)
+        commitAll db (big <$> [0 .. 4])
+    chunks <- newIORef []
+    let hooks n = noHooks
+            { _fhAfterTrimChunk = do
+                pos <- _cmTrimFrom <$> _ccMeta (_nCold n)
+                rows <- _fsRowsTrimmed <$> readIORef (_feStats (_nEnv n))
+                modifyIORef' chunks ((pos, rows) :)
+            }
+    withNodeW (TrimWindow 100 100 100) root cfg writeBatchSync hooks (const (return ())) $ \n -> do
+        outcomes <- runToEnd (_nEnv n)
+        outcomes @?= [Froze (Frontier 2 (mkHash 2 0) 6000), NothingToDo]
+        cs <- reverse <$> readIORef chunks
+        _fsTrimChunks <$> readIORef (_feStats (_nEnv n)) >>= (@?= 60)
+        -- the stored position moves one window per chunk
+        fst <$> cs @?= [ fromIntegral (100 * i) | i <- [1 .. 60 :: Int] ]
+        -- each chunk deletes its window's superseded rows, nothing more: the
+        -- k-keys' newest rows below F are at 5500..5999, the hot key's at 5999
+        let deleted = zipWith (-) (snd <$> cs) (0 : (snd <$> cs))
+        deleted @?= replicate 55 200 ++ replicate 4 100 ++ [99]
+        rs <- rowsOf (_nPact n) tbl'
+        length [ () | (_, _, x, _) <- rs, x < 6000 ] @?= 501
+        -- heights 3 and 4 (txids 6000 to 9999) stay whole
+        length rs @?= 8000 + 501
 
 -- -------------------------------------------------------------------------- --
 -- Halts
@@ -656,13 +830,14 @@ explainTest = withFixture $ \root _ -> withPlainNode root $ \n -> do
         , "LIST SUBQUERY 1"
         , "SEARCH n USING INDEX coin_table_ix (txid>? AND txid<?)"
         , "SEARCH o USING COVERING INDEX sqlite_autoindex_coin_table_1 (rowkey=? AND txid<?)"
-        , "USE TEMP B-TREE FOR DISTINCT"
+        , "SEARCH coin_table USING INTEGER PRIMARY KEY (rowid=?)"
+        , "LIST SUBQUERY 2"
+        , "SEARCH o USING INDEX coin_table_ix (txid>? AND txid<?)"
+        , "CORRELATED SCALAR SUBQUERY 1"
+        , "SEARCH n USING COVERING INDEX sqlite_autoindex_coin_table_1 (rowkey=? AND txid>? AND txid<?)"
         ]
-    drop' @?=
-        [ "SEARCH SYS:Pacts USING INTEGER PRIMARY KEY (rowid=?)"
-        , "LIST SUBQUERY 1"
-        , "SEARCH SYS:Pacts USING COVERING INDEX SYS:Pacts_ix (txid<?)"
-        ]
+    -- one window, atomic: every SYS:Pacts row below the window's end
+    drop' @?= [ "SEARCH SYS:Pacts USING INDEX SYS:Pacts_ix (txid<?)" ]
 
 splitMarkerTest :: Assertion
 splitMarkerTest = withFixture $ \root twin -> do

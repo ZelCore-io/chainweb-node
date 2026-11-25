@@ -889,46 +889,65 @@ sqliteKeyRowCount db t k from to = freezerQry db
 data TrimRule
     = KeepAnchors
     -- ^ delete a row with @txid < F@ when a newer row of the same key with
-    -- @txid < F@ exists
+    -- @txid < F@ exists, oldest-first
     | DropAll
-    -- ^ @SYS:Pacts@: delete every row with @txid < F@
+    -- ^ @SYS:Pacts@: delete every row with @txid < F@, oldest-first
     deriving (Eq, Show)
 
--- | The trim statement of a table and its parameters: step start, @F@ and
--- the limit. Both delete through @rowid IN (SELECT ... LIMIT ?)@ because
--- this SQLite may lack @DELETE ... LIMIT@. 'KeepAnchors' walks the rows @n@
--- of the step (@[start, F)@, the txid index) and, for each, the older rows
--- @o@ of its key (the @(rowkey, txid)@ index); @CROSS JOIN@ fixes that
--- loop order.
-trimStatement :: Text -> TrimRule -> TxId -> TxId -> Int -> (SQ3.Utf8, [Pact4.SType])
-trimStatement t rule start f limit = case rule of
+-- | The trim statements of one chunk: the window @[lo, hi)@ of txids of the
+-- step, with @hi <= F@. The freezer walks a step's windows in ascending
+-- order, and a chunk runs its statements in one savepoint, so the trim
+-- deletes oldest-first: after each chunk a key's rows left in SQLite are a
+-- newest-suffix of its legacy rows, and a SQLite hit at any bound, the tip
+-- included, is the legacy answer (spec 4.3, 6.3). Deleting newest-first
+-- would leave an older version without its newer one between chunks.
+--
+-- A window's statements look only at the window's rows, so each chunk costs
+-- what its window holds and no chunk re-walks an earlier window.
+--
+-- * 'KeepAnchors': (a) the rows of a key written in the window that are
+--   older than the window (the anchor of an earlier step, and anything an
+--   earlier trim left); (b) the window's rows of which a newer row of the
+--   same key below @F@ exists. The newest row below @F@ of every key stays.
+-- * 'DropAll' (@SYS:Pacts@): every row below @hi@. Rows below @lo@ are gone
+--   already when the windows run in order, so this walks the window only.
+--
+trimStatements :: Text -> TrimRule -> TxId -> TxId -> TxId -> [(SQ3.Utf8, [Pact4.SType])]
+trimStatements t rule lo hi f = case rule of
     KeepAnchors ->
-        ( "DELETE FROM " <> tn <> " WHERE rowid IN (SELECT DISTINCT o.rowid FROM "
-            <> tn <> " AS n CROSS JOIN " <> tn <> " AS o"
-            <> " WHERE n.txid >= ? AND n.txid < ? AND o.rowkey = n.rowkey AND o.txid < n.txid LIMIT ?)"
-        , [txIdParam start, txIdParam f, Pact4.SInt (fromIntegral limit)]
-        )
+        [ ( "DELETE FROM " <> tn <> " WHERE rowid IN (SELECT o.rowid FROM "
+                <> tn <> " AS n CROSS JOIN " <> tn <> " AS o"
+                <> " WHERE n.txid >= ? AND n.txid < ? AND o.rowkey = n.rowkey AND o.txid < ?)"
+          , [txIdParam lo, txIdParam hi, txIdParam lo]
+          )
+        , ( "DELETE FROM " <> tn <> " WHERE rowid IN (SELECT o.rowid FROM " <> tn <> " AS o"
+                <> " WHERE o.txid >= ? AND o.txid < ? AND EXISTS (SELECT 1 FROM " <> tn <> " AS n"
+                <> " WHERE n.rowkey = o.rowkey AND n.txid > o.txid AND n.txid < ?))"
+          , [txIdParam lo, txIdParam hi, txIdParam f]
+          )
+        ]
     DropAll ->
-        ( "DELETE FROM " <> tn <> " WHERE rowid IN (SELECT rowid FROM " <> tn <> " WHERE txid < ? LIMIT ?)"
-        , [txIdParam f, Pact4.SInt (fromIntegral limit)]
-        )
+        [ ( "DELETE FROM " <> tn <> " WHERE txid < ?"
+          , [txIdParam hi]
+          )
+        ]
   where
     tn = tbl (toUtf8 t)
 
--- | Deletes at most @limit@ rows of one trim chunk; returns the number of
--- rows deleted.
-sqliteTrimChunk :: SQLiteEnv -> Text -> TrimRule -> TxId -> TxId -> Int -> IO Int
-sqliteTrimChunk db t rule start f limit = do
-    let (q, ps) = trimStatement t rule start f limit
-    throwOnDbError $ bracket (prepStmt db q) (ExceptT . SQ3.finalize) $ \stmt -> do
-        bindParams stmt ps
-        void $ ExceptT (SQ3.step stmt)
-    SQ3.changes db
+-- | Deletes the rows of one trim chunk, the window @[lo, hi)@ below @F@ (see
+-- 'trimStatements'); returns the number of rows deleted.
+sqliteTrimChunk :: SQLiteEnv -> Text -> TrimRule -> TxId -> TxId -> TxId -> IO Int
+sqliteTrimChunk db t rule lo hi f =
+    fmap sum $ forM (trimStatements t rule lo hi f) $ \(q, ps) -> do
+        throwOnDbError $ bracket (prepStmt db q) (ExceptT . SQ3.finalize) $ \stmt -> do
+            bindParams stmt ps
+            void $ ExceptT (SQ3.step stmt)
+        SQ3.changes db
 
--- | @EXPLAIN QUERY PLAN@ of a trim statement: the @detail@ column, in order.
+-- | @EXPLAIN QUERY PLAN@ of a trim chunk's statements: the @detail@ column,
+-- in order, statement after statement.
 sqliteExplainTrim :: SQLiteEnv -> Text -> TrimRule -> IO [Text]
-sqliteExplainTrim db t rule = do
-    let (q, ps) = trimStatement t rule 1 2 3
+sqliteExplainTrim db t rule = fmap concat $ forM (trimStatements t rule 1 2 3) $ \(q, ps) -> do
     rows <- freezerQry db ("EXPLAIN QUERY PLAN " <> q) ps [Pact4.RInt, Pact4.RInt, Pact4.RInt, Pact4.RText]
     forM rows $ \case
         [_, _, _, Pact4.SText (Utf8 d)] -> return (T.decodeUtf8 d)
