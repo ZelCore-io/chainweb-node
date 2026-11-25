@@ -16,7 +16,8 @@ import Control.Lens ((&), (.~), view)
 import Control.Exception (finally)
 import Control.Monad
 
-import Data.Aeson (decode, encode)
+import Data.Aeson (Value(..), decode, encode, object, (.=))
+import qualified Data.Aeson.KeyMap as KM
 
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as B8
@@ -228,6 +229,18 @@ withCold :: Fixture -> (R.DB -> IO a) -> IO a
 withCold fx k = withReadOnlyRocksDbTuned (_fxCold fx) modernDefaultOptions coldStoreTuning
     (k . _rocksDbHandle)
 
+-- | A build of the fixture's SQLite file into a fresh directory of the fixture.
+--
+spec :: Fixture -> FilePath -> ColdBuildSpec
+spec fx name = ColdBuildSpec
+    { _cbSqlite = _fxSqlite fx, _cbChain = cid, _cbTables = Nothing
+    , _cbOut = _fxDir fx </> name, _cbBatchBytes = 4096 }
+
+runJson :: ColdRun -> KM.KeyMap Value
+runJson r = case decode (encode r) of
+    Just (Object o) -> o
+    v -> error (show v)
+
 -- | The @N@ entries: table name and id.
 --
 catalog :: R.DB -> IO [(Text, TableId)]
@@ -422,6 +435,84 @@ tests = withResource acquire release $ \getFx -> testGroup "Cold measure"
             _clColdReads l > 0 && _clColdReads l <= distinct
         -- cw-measure project reads what cw-measure cold writes
         decode (encode l) @?= Just l
+
+    , testCase "defaults: the tuning object equals M0's (z3, 32 KB, bloom 10, the three new options off)" $ do
+        fx <- getFx
+        run <- runColdMeasure quietLogger defaultColdTuning (spec fx "cold-defaults") 50 3 0
+        let j = runJson run
+        KM.lookup "tuning" j @?= Just (object
+            [ "zstdLevel" .= (3 :: Int)
+            , "zstdDictBytes" .= (65536 :: Int)
+            , "blockSize" .= (32768 :: Int)
+            , "bloomBitsPerKey" .= (10 :: Int)
+            , "blockCacheBytes" .= (1073741824 :: Int)
+            , "bottommostZstdLevel" .= Null
+            , "dynamicLevelBytes" .= False
+            , "cacheIndexAndFilter" .= False
+            ])
+        assertBool "buildSeconds" $ case KM.lookup "buildSeconds" j of
+            Just (Number n) -> n >= 0
+            _ -> False
+        -- no by-txid reads asked for
+        KM.lookup "txidReadLatency" j @?= Nothing
+        -- the tuning is the one of the fixture's own build
+        _csKeyspaceSst (_crSizes run) @?= _csKeyspaceSst (_fxSizes fx)
+
+    , testCase "--bloom-bits 0 --bottommost-zstd-level 9 --block-size 65536: recorded in the JSON; the 1,000-read check still passes" $ do
+        fx <- getFx
+        let tuning = defaultColdTuning
+                { _ctBloomBits = 0, _ctBottommostZstdLevel = Just 9, _ctBlockSize = 65536 }
+        run <- runColdMeasure quietLogger tuning (spec fx "cold-flags") 1000 7 0
+        _clReads (_crLatency run) @?= 1000
+        _clMismatches (_crLatency run) @?= 0
+        let j = runJson run
+        case KM.lookup "tuning" j of
+            Just (Object t) -> do
+                KM.lookup "bloomBitsPerKey" t @?= Just (Number 0)
+                KM.lookup "bottommostZstdLevel" t @?= Just (Number 9)
+                KM.lookup "blockSize" t @?= Just (Number 65536)
+            v -> assertFailure (show v)
+        -- the files carry the settings: 64 KB blocks, level 9 on the bottom level
+        info <- sstCompressionInfo (_cbOut (spec fx "cold-flags"))
+        assertBool ("level 9: " <> show info) $
+            not (M.null info) && all (\(_, o) -> "level=9;" `B.isInfixOf` o) (M.elems info)
+        -- the other two options reach the files without changing any answer
+        run2 <- runColdMeasure quietLogger
+            defaultColdTuning { _ctDynamicLevelBytes = True, _ctCacheIndexAndFilter = True }
+            (spec fx "cold-flags2") 300 5 0
+        _clMismatches (_crLatency run2) @?= 0
+        case KM.lookup "tuning" (runJson run2) of
+            Just (Object t) -> do
+                KM.lookup "dynamicLevelBytes" t @?= Just (Bool True)
+                KM.lookup "cacheIndexAndFilter" t @?= Just (Bool True)
+            v -> assertFailure (show v)
+
+    , testCase "--txid-reads 200: every by-txid answer equals SQLite's rows in rowid order; four latency fields present" $ do
+        fx <- getFx
+        -- every user txid, exhaustively
+        withCold fx $ \db -> withSqlite (_fxSqlite fx) $ \sq -> do
+            cat <- catalog db
+            n <- fmap sum $ forM (filter (isUser . fst) cat) $ \(name, tid) -> do
+                txids <- queryAll sq ("SELECT DISTINCT txid FROM [" <> name <> "] ORDER BY txid") []
+                forM_ [ t | [SQ.SQLInteger t] <- txids ] $ \txid -> do
+                    expected <- queryAll sq ("SELECT CAST(rowkey AS BLOB), rowdata FROM [" <> name
+                        <> "] WHERE txid = ? ORDER BY rowid") [SQ.SQLInteger txid]
+                    got <- coldReadTxid db cid tid (fromIntegral txid)
+                    got @?= [ (bytesOf k, Just (bytesOf v)) | [k, v] <- expected ]
+                return (length txids)
+            assertBool "txids" (n > 0)
+        run <- runColdMeasure quietLogger defaultColdTuning (spec fx "cold-txid") 10 1 200
+        l <- maybe (assertFailure "no by-txid latency" >> undefined) return (_crTxid run)
+        _tlReads l @?= 200
+        _tlMismatches l @?= 0
+        assertBool "rows" (_tlRows l >= 200)
+        assertBool "cold reads" (_tlColdReads l > 0 && _tlColdReads l <= 200)
+        case KM.lookup "txidReadLatency" (runJson run) of
+            Just (Object o) -> forM_ ["warmP50", "warmP99", "coldP50", "coldP99"] $ \f ->
+                assertBool (T.unpack (T.pack (show f))) $ case KM.lookup f o of
+                    Just (Number x) -> x > 0
+                    _ -> False
+            v -> assertFailure (show v)
 
     , testCase "ColdLatency JSON round-trips with the documented field names" $ do
         let l = ColdLatency 1000 18 600 0 12.5 40.25 900 4000.5 4800

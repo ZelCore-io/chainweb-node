@@ -58,6 +58,10 @@ module Chainweb.StorageTools.Measure.Cold
 , TableSizes(..)
 , ColdSizes(..)
 , buildColdFromSqlite
+, buildColdFromSqliteWith
+, ColdTuning(..)
+, defaultColdTuning
+, coldMeasureTuning
 , keptTables
 , transactionIndexTable
 , coldKeyspaces
@@ -75,7 +79,13 @@ module Chainweb.StorageTools.Measure.Cold
 -- * Cold reads
 , ColdLatency(..)
 , measureColdReads
+, measureColdReadsWith
 , coldReadNewest
+, TxidLatency(..)
+, coldReadTxid
+, measureTxidReads
+, ColdRun(..)
+, runColdMeasure
 , scanPrefix
 
 -- * Projection
@@ -97,6 +107,8 @@ module Chainweb.StorageTools.Measure.Cold
 -- * Rendering
 , renderColdSizes
 , renderColdLatency
+, renderColdTuning
+, renderTxidLatency
 , renderProjection
 ) where
 
@@ -168,6 +180,69 @@ data ColdBuildSpec = ColdBuildSpec
 --
 defaultBatchBytes :: Int
 defaultBatchBytes = 64 * 1024 * 1024
+
+-- | The RocksDB options a measurement run varies (Task 21a). Everything else
+-- is that of M0's run: zstd level 3 with a 64 KB dictionary and a 1 GiB block
+-- cache.
+--
+data ColdTuning = ColdTuning
+    { _ctBloomBits :: !Int
+        -- ^ bloom filter bits per key; 0 writes no filter
+    , _ctBlockSize :: !Int
+        -- ^ block size in bytes
+    , _ctBottommostZstdLevel :: !(Maybe Int)
+        -- ^ zstd level of the bottommost level; 'Nothing' keeps level 3
+    , _ctDynamicLevelBytes :: !Bool
+        -- ^ @level_compaction_dynamic_level_bytes@
+    , _ctCacheIndexAndFilter :: !Bool
+        -- ^ index and filter blocks in the block cache, level 0 pinned
+    }
+    deriving (Show, Eq, Generic)
+
+-- | M0's settings: bloom 10, 32 KB blocks, and the three options added by
+-- Task 21 off. 'coldStoreTuning' itself has the two boolean options on, so
+-- the default command would not reproduce M0's run if it used it as it is.
+--
+defaultColdTuning :: ColdTuning
+defaultColdTuning = ColdTuning
+    { _ctBloomBits = 10
+    , _ctBlockSize = 32768
+    , _ctBottommostZstdLevel = Nothing
+    , _ctDynamicLevelBytes = False
+    , _ctCacheIndexAndFilter = False
+    }
+
+-- | 'coldStoreTuning' with the options of a run.
+--
+coldMeasureTuning :: ColdTuning -> RocksDbTuning
+coldMeasureTuning t = coldStoreTuning
+    { _tuningBlockSize = Just (_ctBlockSize t)
+    , _tuningBloomBitsPerKey = if _ctBloomBits t > 0
+        then Just (fromIntegral (_ctBloomBits t))
+        else Nothing
+    , _tuningBottommostZstdLevel = _ctBottommostZstdLevel t
+    , _tuningDynamicLevelBytes = _ctDynamicLevelBytes t
+    , _tuningCacheIndexAndFilter = _ctCacheIndexAndFilter t
+    }
+
+-- | The settings of a run, as the JSON object @tuning@ records them.
+--
+instance ToJSON ColdTuning where
+    toJSON t = object
+        [ "zstdLevel" .= zl
+        , "zstdDictBytes" .= zd
+        , "blockSize" .= _ctBlockSize t
+        , "bloomBitsPerKey" .= _ctBloomBits t
+        , "blockCacheBytes" .= fromMaybe 0 (_tuningBlockCacheBytes rt)
+        , "bottommostZstdLevel" .= _ctBottommostZstdLevel t
+        , "dynamicLevelBytes" .= _ctDynamicLevelBytes t
+        , "cacheIndexAndFilter" .= _ctCacheIndexAndFilter t
+        ]
+      where
+        rt = coldMeasureTuning t
+        (zl, zd) = case _tuningCompression rt of
+            Zstd l d _ -> (l, d)
+            KeepBindingCompression -> (0, 0)
 
 -- | Sizes of one table.
 --
@@ -269,7 +344,12 @@ encodeHeight h
 -- tuning. Fails if an SST file is then not zstd with the 64 KB dictionary.
 --
 buildColdFromSqlite :: Logger l => l -> ColdBuildSpec -> IO ColdSizes
-buildColdFromSqlite logger spec = withSqliteReadOnly (_cbSqlite spec) $ \sq -> do
+buildColdFromSqlite = buildColdFromSqliteWith defaultColdTuning
+
+-- | 'buildColdFromSqlite' with the options of a run.
+--
+buildColdFromSqliteWith :: Logger l => ColdTuning -> l -> ColdBuildSpec -> IO ColdSizes
+buildColdFromSqliteWith tuning logger spec = withSqliteReadOnly (_cbSqlite spec) $ \sq -> do
     allTables <- versionedTables sq
     hasTxIndex <- tableExists sq transactionIndexTable
     let available = allTables <> [ transactionIndexTable | hasTxIndex ]
@@ -285,7 +365,7 @@ buildColdFromSqlite logger spec = withSqliteReadOnly (_cbSqlite spec) $ \sq -> d
     fileBytes <- fromIntegral <$> getFileSize (_cbSqlite spec)
     exists <- doesPathExist (_cbOut spec)
     when exists $ ioError $ userError $ "output exists: " <> _cbOut spec
-    sizes <- withRocksDbTuned (_cbOut spec) modernDefaultOptions coldStoreTuning $ \db -> do
+    sizes <- withRocksDbTuned (_cbOut spec) modernDefaultOptions (coldMeasureTuning tuning) $ \db -> do
         w <- newWriter (_rocksDbHandle db) (_cbBatchBytes spec)
         copied <- forM (zip [0 ..] tables) $ \(i, name) -> do
             let tid = TableId i
@@ -704,6 +784,36 @@ coldReadNewest db c tid key bound = R.withReadOptions mempty $ \ro -> I.withIter
         Just (k, v) | rowKeyPrefix c tid key `B.isPrefixOf` k -> return (Just v)
         _ -> return Nothing
 
+-- | The chain and the tables (name and id) of a cold store of one chain.
+--
+readColdCatalog :: R.DB -> IO (ChainId, [(Text, TableId)])
+readColdCatalog db = do
+    entries <- scanPrefix db "N"
+    let parsed =
+            [ (B.index k 1, (T.decodeUtf8 (B.drop 2 k), v))
+            | (k, v) <- entries
+            , B.length k >= 2
+            ]
+    case S.toList (S.fromList (fst <$> parsed)) of
+        [cb] -> case [ c | c <- unsafeChainId <$> [0 .. 255], chainByte c == cb ] of
+            (c : _) -> do
+                tids <- forM (snd <$> parsed) $ \(name, v) -> case B.unpack v of
+                    [a, b, x, y] -> return (name, TableId (be32 a b x y))
+                    _ -> ioError $ userError $ "invalid table id of " <> T.unpack name
+                return (c, tids)
+            [] -> ioError $ userError $ "unknown chain byte " <> show cb
+        bs -> ioError $ userError $ "expected the tables of one chain, got chain bytes " <> show bs
+  where
+    be32 a b x y = foldl (\acc w -> acc * 256 + fromIntegral w) 0 [a, b, x, y]
+
+-- | Nearest-rank percentile of sorted nanosecond timings, in microseconds.
+--
+pctUs :: Double -> [Word64] -> Double
+pctUs _ [] = 0
+pctUs p xs =
+    let cnt = length xs
+    in fromIntegral (xs !! max 0 (min (cnt - 1) (ceiling (p * fromIntegral cnt) - 1))) / 1000
+
 -- | @measureColdReads sqlite coldDir n seed@ draws @n@ reads (table, key,
 -- bound) from the SQLite file and answers each from the cold store, which was
 -- built from that file by 'buildColdFromSqlite'.
@@ -725,9 +835,14 @@ coldReadNewest db c tid key bound = R.withReadOptions mempty $ \ro -> I.withIter
 -- Every answer is compared with SQLite's.
 --
 measureColdReads :: FilePath -> FilePath -> Int -> Word64 -> IO ColdLatency
-measureColdReads sqlitePath coldDir n seed = do
-    (c, tids) <- withReadOnlyRocksDbTuned coldDir modernDefaultOptions coldStoreTuning $ \db ->
-        readCatalog (_rocksDbHandle db)
+measureColdReads = measureColdReadsWith defaultColdTuning
+
+-- | 'measureColdReads' with the options the store was built with.
+--
+measureColdReadsWith :: ColdTuning -> FilePath -> FilePath -> Int -> Word64 -> IO ColdLatency
+measureColdReadsWith tuning sqlitePath coldDir n seed = do
+    (c, tids) <- withReadOnlyRocksDbTuned coldDir modernDefaultOptions warmTuning $ \db ->
+        readColdCatalog (_rocksDbHandle db)
     samples <- withSqliteReadOnly sqlitePath $ \sq -> drawReads sq tids
     let coldSamples = nubOrdOn (\(tid, k, _, _) -> (tid, k)) samples
         check db (tid, k, bound, expected) = do
@@ -739,11 +854,11 @@ measureColdReads sqlitePath coldDir n seed = do
             bad <- check db r
             t1 <- getMonotonicTimeNSec
             return (bad, t1 - t0)
-    (badWarm, warm) <- withReadOnlyRocksDbTuned coldDir modernDefaultOptions coldStoreTuning $ \db -> do
+    (badWarm, warm) <- withReadOnlyRocksDbTuned coldDir modernDefaultOptions warmTuning $ \db -> do
         bad0 <- mapM (check (_rocksDbHandle db)) samples
         rs <- mapM (timed (_rocksDbHandle db)) samples
         return (length (filter id bad0) + length (filter fst rs), snd <$> rs)
-    let coldTuning = coldStoreTuning
+    let coldTuning = warmTuning
             { _tuningDirectReads = True
             , _tuningBlockCacheBytes = Just (8 * 1024 * 1024)
             }
@@ -764,33 +879,7 @@ measureColdReads sqlitePath coldDir n seed = do
         , _clColdMaxUs = pctUs 1 coldS
         }
   where
-    -- nearest rank
-    pctUs :: Double -> [Word64] -> Double
-    pctUs _ [] = 0
-    pctUs p xs =
-        let cnt = length xs
-        in fromIntegral (xs !! max 0 (min (cnt - 1) (ceiling (p * fromIntegral cnt) - 1))) / 1000
-
-    readCatalog db = do
-        entries <- scanPrefix db "N"
-        let parsed =
-                [ (B.index k 1, (T.decodeUtf8 (B.drop 2 k), v))
-                | (k, v) <- entries
-                , B.length k >= 2
-                ]
-        case S.toList (S.fromList (fst <$> parsed)) of
-            [cb] -> case [ c | c <- cids, chainByte c == cb ] of
-                (c : _) -> do
-                    tids <- forM (snd <$> parsed) $ \(name, v) -> case B.unpack v of
-                        [a, b, x, y] -> return (name, TableId (be32 a b x y))
-                        _ -> ioError $ userError $ "invalid table id of " <> T.unpack name
-                    return (c, tids)
-                [] -> ioError $ userError $ "unknown chain byte " <> show cb
-            bs -> ioError $ userError $ "expected the tables of one chain, got chain bytes " <> show bs
-
-    cids = unsafeChainId <$> [0 .. 255]
-
-    be32 a b x y = foldl (\acc w -> acc * 256 + fromIntegral w) 0 [a, b, x, y]
+    warmTuning = coldMeasureTuning tuning
 
     drawReads sq tids = do
         counts <- forM tids $ \(name, tid) ->
@@ -842,6 +931,180 @@ measureColdReads sqlitePath coldDir n seed = do
                             return (tid, keyBytes, bound :: Word64, expected)
                         Nothing -> drawOne (attempts + 1)
         replicateM n (drawOne 0)
+
+-- -------------------------------------------------------------------------- --
+-- By-txid reads
+
+-- | Timed by-txid reads, checked against SQLite.
+--
+-- One read is what a by-txid request needs of the cold store: the @T@ get of
+-- the txid, the @I@ gets of its key ids and the exact @R@ gets of the rows.
+--
+data TxidLatency = TxidLatency
+    { _tlReads :: !Int
+        -- ^ sampled reads; each is done once in the warm timed pass
+    , _tlColdReads :: !Int
+        -- ^ reads in the cold pass: the first sample of each distinct
+        -- (table, txid)
+    , _tlRows :: !Int
+        -- ^ rows of all sampled reads
+    , _tlMismatches :: !Int
+        -- ^ answers, over all passes, that differ from SQLite's rows in
+        -- rowid order
+    , _tlWarmP50 :: !Double
+    , _tlWarmP99 :: !Double
+    , _tlColdP50 :: !Double
+    , _tlColdP99 :: !Double
+    }
+    deriving (Show, Eq, Generic)
+
+-- | The rows of one txid of a user table, in the order of the @T@ list: the
+-- row key and its exact @R@ value, which is 'Nothing' if the @R@ entry or the
+-- @I@ entry is missing. An absent @T@ entry reads as no rows.
+--
+coldReadTxid :: R.DB -> ChainId -> TableId -> Word64 -> IO [(B.ByteString, Maybe B.ByteString)]
+coldReadTxid db c tid txid = R.get db mempty (txidKey c tid txid) >>= \case
+    Nothing -> return []
+    Just bytes -> case decodeKeyIdList bytes of
+        Nothing -> ioError $ userError $ "corrupt T entry of txid " <> show txid
+        Just ids -> forM ids $ \i -> R.get db mempty (idKey c tid i) >>= \case
+            Nothing -> return (B.empty, Nothing)
+            Just k -> ((,) k) <$> R.get db mempty (rowKey c tid k txid)
+
+-- | @measureTxidReads tuning sqlite coldDir n seed@ draws @n@ (table, txid)
+-- pairs from the user tables, each from a uniformly drawn row, and answers
+-- each from the cold store. The expected answer is SQLite's
+-- @SELECT rowkey, rowdata ... WHERE txid = ? ORDER BY rowid@.
+--
+-- The passes are those of 'measureColdReadsWith': warm (every sample once
+-- untimed, once timed) and cold (direct reads, an 8 MiB block cache, each
+-- distinct (table, txid) once).
+--
+measureTxidReads :: ColdTuning -> FilePath -> FilePath -> Int -> Word64 -> IO TxidLatency
+measureTxidReads tuning sqlitePath coldDir n seed = do
+    (c, tids) <- withReadOnlyRocksDbTuned coldDir modernDefaultOptions warmTuning $ \db ->
+        readColdCatalog (_rocksDbHandle db)
+    samples <- withSqliteReadOnly sqlitePath $ \sq -> draw sq [ x | x@(name, _) <- tids, not (isSysTable name) ]
+    let coldSamples = nubOrdOn (\(tid, t, _) -> (tid, t)) samples
+        check db (tid, t, expected) = do
+            got <- coldReadTxid db c tid t
+            void $ evaluate (length got)
+            return (got /= expected)
+        timed db r = do
+            t0 <- getMonotonicTimeNSec
+            bad <- check db r
+            t1 <- getMonotonicTimeNSec
+            return (bad, t1 - t0)
+    (badWarm, warm) <- withReadOnlyRocksDbTuned coldDir modernDefaultOptions warmTuning $ \db -> do
+        bad0 <- mapM (check (_rocksDbHandle db)) samples
+        rs <- mapM (timed (_rocksDbHandle db)) samples
+        return (length (filter id bad0) + length (filter fst rs), snd <$> rs)
+    let coldTuning = warmTuning
+            { _tuningDirectReads = True
+            , _tuningBlockCacheBytes = Just (8 * 1024 * 1024)
+            }
+    (badCold, cold) <- withReadOnlyRocksDbTuned coldDir modernDefaultOptions coldTuning $ \db -> do
+        rs <- mapM (timed (_rocksDbHandle db)) coldSamples
+        return (length (filter fst rs), snd <$> rs)
+    let warmS = sort warm
+        coldS = sort cold
+    return TxidLatency
+        { _tlReads = length samples
+        , _tlColdReads = length coldSamples
+        , _tlRows = sum [ length e | (_, _, e) <- samples ]
+        , _tlMismatches = badWarm + badCold
+        , _tlWarmP50 = pctUs 0.50 warmS
+        , _tlWarmP99 = pctUs 0.99 warmS
+        , _tlColdP50 = pctUs 0.50 coldS
+        , _tlColdP99 = pctUs 0.99 coldS
+        }
+  where
+    warmTuning = coldMeasureTuning tuning
+
+    draw sq tids = do
+        counts <- forM tids $ \(name, tid) ->
+            queryAll sq ("SELECT coalesce(max(rowid), 0) FROM " <> quoteName name) [] >>= \case
+                [[SQ.SQLInteger m]] -> return (name, tid, fromIntegral m :: Int)
+                r -> ioError $ userError $ "max rowid of " <> T.unpack name <> ": " <> show r
+        let weighted = filter (\(_, _, m) -> m > 0) counts
+            totalRows = sum [ m | (_, _, m) <- weighted ]
+            pick = go' weighted
+              where
+                go' ((nm, t, m) : rest) x
+                    | x < m = (nm, t, m)
+                    | otherwise = go' rest (x - m)
+                go' [] _ = error "measureTxidReads: empty table list"
+        when (totalRows == 0) $ ioError $ userError "no user table rows to sample"
+        gen <- newIORef (mkStdGen (fromIntegral seed))
+        let rand :: Int -> Int -> IO Int
+            rand lo hi = atomicModifyIORef' gen $ \g -> let (x, g') = uniformR (lo, hi) g in (g', x)
+            drawOne attempts
+                | attempts > (100 :: Int) = ioError $ userError "too many missing rowids while sampling"
+                | otherwise = do
+                    (name, tid, m) <- pick <$> rand 0 (totalRows - 1)
+                    rid <- rand 1 m
+                    mtx <- withStatement sq
+                        ("SELECT txid FROM " <> quoteName name <> " WHERE rowid = ?")
+                        [SQ.SQLInteger (fromIntegral rid)] $ \stmt -> SQ.step stmt >>= \case
+                            SQ.Done -> return Nothing
+                            SQ.Row -> Just <$> SQ.columnInt64 stmt 0
+                    case mtx of
+                        Nothing -> drawOne (attempts + 1)
+                        Just txid -> do
+                            rows <- queryAll sq
+                                ("SELECT CAST(rowkey AS BLOB), rowdata FROM " <> quoteName name
+                                    <> " WHERE txid = ? ORDER BY rowid")
+                                [SQ.SQLInteger txid]
+                            expected <- forM rows $ \case
+                                [SQ.SQLBlob k, SQ.SQLBlob v] -> return (k, Just v)
+                                r -> ioError $ userError $ "unexpected row: " <> show r
+                            return (tid, fromIntegral txid :: Word64, expected)
+        replicateM n (drawOne 0)
+
+-- -------------------------------------------------------------------------- --
+-- A run of @cw-measure cold@
+
+-- | What @cw-measure cold@ writes: the sizes, the latency of the point reads,
+-- the settings, the build time, and the by-txid read latency if it was asked
+-- for. @project@ reads @sizes@ and @latency@ only.
+--
+data ColdRun = ColdRun
+    { _crSizes :: !ColdSizes
+    , _crLatency :: !ColdLatency
+    , _crTuning :: !ColdTuning
+    , _crBuildSeconds :: !Double
+        -- ^ copy, flush and forced compaction
+    , _crTxid :: !(Maybe TxidLatency)
+    }
+    deriving (Show, Eq)
+
+instance ToJSON ColdRun where
+    toJSON r = object $
+        [ "sizes" .= _crSizes r
+        , "latency" .= _crLatency r
+        , "tuning" .= _crTuning r
+        , "buildSeconds" .= _crBuildSeconds r
+        ] <> [ "txidReadLatency" .= l | Just l <- [_crTxid r] ]
+
+-- | Builds the store, then measures @n@ point reads and @txidReads@ by-txid
+-- reads (none if 0).
+--
+runColdMeasure :: Logger l => l -> ColdTuning -> ColdBuildSpec -> Int -> Word64 -> Int -> IO ColdRun
+runColdMeasure logger tuning spec n seed txidReads = do
+    t0 <- getMonotonicTimeNSec
+    sizes <- buildColdFromSqliteWith tuning logger spec
+    t1 <- getMonotonicTimeNSec
+    latency <- measureColdReadsWith tuning (_cbSqlite spec) (_cbOut spec) n seed
+    txid <- if txidReads > 0
+        then Just <$> measureTxidReads tuning (_cbSqlite spec) (_cbOut spec) txidReads seed
+        else return Nothing
+    return ColdRun
+        { _crSizes = sizes
+        , _crLatency = latency
+        , _crTuning = tuning
+        , _crBuildSeconds = fromIntegral (t1 - t0) / 1e9
+        , _crTxid = txid
+        }
 
 -- -------------------------------------------------------------------------- --
 -- Projection
@@ -1100,6 +1363,12 @@ instance ToJSON ColdLatency where
 instance FromJSON ColdLatency where
     parseJSON = genericParseJSON (jsonOptions 3)
 
+-- | The four latencies in microseconds, and the counts around them.
+instance ToJSON TxidLatency where
+    toJSON = genericToJSON (jsonOptions 3)
+instance FromJSON TxidLatency where
+    parseJSON = genericParseJSON (jsonOptions 3)
+
 instance ToJSON RorS where
     toJSON = genericToJSON defaultOptions
 instance FromJSON RorS where
@@ -1145,6 +1414,19 @@ renderColdLatency l = T.unlines
     , T.pack $ printf "cold (%d distinct keys): p50 %.1f us, p99 %.1f us, max %.1f us"
         (_clColdReads l) (_clColdP50Us l) (_clColdP99Us l) (_clColdMaxUs l)
     , "latency verdict (p50 warm < 200 us, p99 cold < 5 ms): " <> sshowT (latencyVerdict l)
+    ]
+
+renderColdTuning :: ColdTuning -> Text
+renderColdTuning t = T.pack $ printf "tuning: zstd 3 (64 KB dictionary), block %d bytes, bloom %d bits, bottommost zstd %s, dynamic level bytes %s, cache index and filter %s"
+    (_ctBlockSize t) (_ctBloomBits t)
+    (maybe "off" show (_ctBottommostZstdLevel t))
+    (show (_ctDynamicLevelBytes t)) (show (_ctCacheIndexAndFilter t))
+
+renderTxidLatency :: TxidLatency -> Text
+renderTxidLatency l = T.unlines
+    [ "by-txid reads: " <> sshowT (_tlReads l) <> " (" <> sshowT (_tlRows l) <> " rows), mismatches: " <> sshowT (_tlMismatches l)
+    , T.pack $ printf "warm: p50 %.1f us, p99 %.1f us" (_tlWarmP50 l) (_tlWarmP99 l)
+    , T.pack $ printf "cold (%d distinct txids): p50 %.1f us, p99 %.1f us" (_tlColdReads l) (_tlColdP50 l) (_tlColdP99 l)
     ]
 
 renderProjection :: Projection -> Text
