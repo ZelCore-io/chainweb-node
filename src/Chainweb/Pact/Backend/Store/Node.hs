@@ -177,7 +177,10 @@ withPactStorageMode mode logger v cfg root reset k = do
         when e $ do
             removeDirectoryRecursive p
             logFunctionText logger Info $ "--reset-chain-databases: removed " <> T.pack p
-    layout <- resolvePactLayout logger (_phStore cfg) reset root
+    -- a read-only open (tools) resolves the layout without writing
+    layout <- if mode == ColdReadOnly
+        then readPactLayout logger (_phStore cfg) root
+        else resolvePactLayout logger (_phStore cfg) reset root
     sem <- newQSem (_phFreezerConcurrency cfg)
     let st cold = PactStorage layout cold cfg sem defaultFreezerPollMicros
     case _plColdDir layout of

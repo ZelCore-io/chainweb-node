@@ -45,6 +45,7 @@ module Chainweb.Pact.Backend.Store.Layout
 ( -- * Layout
   PactLayout(..)
 , resolvePactLayout
+, readPactLayout
 , currentSqliteDir
 , withSqliteDirLock
 , ensureSplitDir
@@ -81,6 +82,7 @@ import Control.Monad
 import Data.Aeson
 import qualified Data.ByteString.Lazy as BL
 import Data.IORef
+import qualified Data.List as L
 import qualified Data.Map.Strict as M
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -248,6 +250,12 @@ data PactLayoutError
     | BackupRefused PactHistoryStore
     | UnknownSplitMarker FilePath Text
         -- ^ a marker file that this binary does not understand
+    | ShadowNeedsSplitSide FilePath
+        -- ^ shadow mode on a populated legacy directory without a split
+        -- side: the legacy directory
+    | ReadOnlyNeedsRepair PactHistoryStore FilePath Text
+        -- ^ a read-only open ('readPactLayout') of a root that needs a
+        -- change only a node start makes: the mode, the root, and what
     | SqliteOnlyTool Text FilePath NonSqliteLayout
         -- ^ a tool that reads the Pact SQLite files directly (compaction,
         -- @pact-diff@, the grand hash, @db-checksum@, @cw-compare@'s
@@ -291,6 +299,20 @@ pactLayoutErrorMessage = \case
         [ "--pact-history-store shadow needs the untouched legacy SQLite directory", p d <> ","
         , "but it is missing or carries the split format marker."
         , "Start with --pact-history-store split, or restore a legacy copy into", p d <> "."
+        ]
+    ShadowNeedsSplitSide d -> T.unwords
+        [ "--pact-history-store shadow on the populated legacy directory", p d
+        , "needs a split side built from the same history:", p (takeDirectory d </> splitDirName)
+        , "and", p (takeDirectory d </> coldDirName) <> ", for instance from a split-mode node run on a copy of"
+        , p d <> ". An empty split side has no history for the startup rewind, so the chain would break at once."
+        , "Nothing was created. Build the split side next to", p d <> ", or start with --pact-history-store sqlite or split."
+        ]
+    ReadOnlyNeedsRepair m root what -> T.unwords
+        [ "A read-only open of the Pact history under", p root, "changes nothing on disk,"
+        , "but with --pact-history-store", pactHistoryStoreToText m, "this directory needs a repair"
+        , "that only a node start makes:", what <> "."
+        , "Start the node once with --pact-history-store", pactHistoryStoreToText m <> ", stop it,"
+        , "and run the tool again."
         ]
     ResetRefused m -> T.unwords
         [ "--reset-chain-databases is refused with --pact-history-store", pactHistoryStoreToText m <> ":"
@@ -482,7 +504,19 @@ resolvePactLayout
         -- ^ reset (@--reset-chain-databases@)
     -> FilePath
     -> IO PactLayout
-resolvePactLayout logger mode reset root = do
+resolvePactLayout logger mode reset root = resolveLayout False logger mode reset root
+
+-- | 'resolvePactLayout' for read-only callers (the in-process side of
+-- @cw-compare@, @cw-measure txlog-digest@ and @split-size@): it writes
+-- nothing. A state that a node start would repair (state B, a stale marker
+-- in sqlite mode, a missing split side or cold store in shadow mode) is
+-- refused with 'ReadOnlyNeedsRepair'.
+--
+readPactLayout :: Logger l => l -> PactHistoryStore -> FilePath -> IO PactLayout
+readPactLayout logger mode root = resolveLayout True logger mode False root
+
+resolveLayout :: Logger l => Bool -> l -> PactHistoryStore -> Bool -> FilePath -> IO PactLayout
+resolveLayout readOnly logger mode reset root = do
     when (reset && mode /= HistorySqlite) $ throwIO $ ResetRefused mode
     st <- readDirState root
     when (_dsSplit st && not (_dsSplitMarker st)) $
@@ -518,6 +552,8 @@ resolvePactLayout logger mode reset root = do
                 , "is left over (for instance from shadow mode) and is not used."
                 ]
             when (_dsSqliteMarker st) $ do
+                needsRepair $ "the split format marker in " <> T.pack sqliteDir
+                    <> " is left over from an unfinished rename and must be removed"
                 removeFile (sqliteDir </> splitMarkerFileName)
                 syncPath sqliteDir
                 logg Warn $ "Removed the split format marker from " <> T.pack sqliteDir
@@ -534,6 +570,8 @@ resolvePactLayout logger mode reset root = do
                 unless (_dsCold st) $ throwIO $ MissingColdStore coldDir
                 layout splitDir Nothing (Just coldDir)
             | _dsSqliteMarker st -> do
+                needsRepair $ "the rename of " <> T.pack sqliteDir <> " to "
+                    <> T.pack splitDir <> " that a previous run started must be finished"
                 renameDirectory sqliteDir splitDir
                 syncPath root
                 logg Info $ "Finished the rename of " <> T.pack sqliteDir <> " to "
@@ -545,6 +583,15 @@ resolvePactLayout logger mode reset root = do
             | _dsSqliteMarker st || not (_dsSqlite st) && _dsSplit st ->
                 throwIO $ ShadowNeedsLegacy sqliteDir
             | otherwise -> do
+                -- a populated legacy directory needs a split side built from
+                -- the same history; refused before anything is created
+                populated <- legacyPopulated
+                when (populated && not (_dsSplit st)) $
+                    throwIO $ ShadowNeedsSplitSide sqliteDir
+                unless (_dsSqlite st && _dsSplit st && _dsCold st) $
+                    needsRepair $ "the shadow layout is incomplete (" <> T.intercalate ", "
+                        [ T.pack d <> " is missing" | (False, d) <- [(_dsSqlite st, sqliteDir), (_dsSplit st, splitDir), (_dsCold st, coldDir)] ]
+                        <> ")"
                 createDirectoryIfMissing True sqliteDir
                 -- M1: sqlite-split appears by a rename, with its marker in
                 -- it, so a crash never leaves it without one. A temporary
@@ -568,6 +615,11 @@ resolvePactLayout logger mode reset root = do
     splitTmpDir = splitDir <.> "tmp"
     coldDir = root </> coldDirName
     logg = logFunctionText logger
+    needsRepair what = when readOnly $ throwIO $ ReadOnlyNeedsRepair mode root what
+    -- a chain's Pact SQLite file in the legacy directory
+    legacyPopulated = doesDirectoryExist sqliteDir >>= \case
+        False -> return False
+        True -> any ("pact-v1-chain-" `L.isPrefixOf`) <$> listDirectory sqliteDir
 
 -- | Makes sure the SQLite files live in @sqlite-split@ with a marker. Called
 -- before every trim; trimming starts only after it returns. The first call on

@@ -68,7 +68,7 @@ import Chainweb.Pact.Backend.Store.Layout
 import Chainweb.Pact.Backend.Store.Node
 import Chainweb.Pact.Backend.Store.Shadow (ShadowEnv(..))
 import Chainweb.Pact.Backend.Store.SQLite (sqlitePactStore, withSqliteErrorDetail)
-import Chainweb.Pact.Backend.Utils (chainwebPragmas, withSqliteDb, withTempSQLiteConnection)
+import Chainweb.Pact.Backend.Utils (chainDbFileName, chainwebPragmas, withSqliteDb, withTempSQLiteConnection)
 import Chainweb.Pact.Backend.Store.Types
 import Chainweb.Storage.Table.RocksDB (withTempRocksDb, writeBatchSync)
 import Chainweb.Test.Pact.Store.Freezer hiding (tests)
@@ -259,8 +259,22 @@ drainTest = withFixture $ \root _twin -> do
     withPactStorage quietLogger v cfg { _phFreezerEnabled = False } root False $ \st ->
         withChain st $ \cst -> drainChainFreezer cst >>= (@?= False)
 
+-- | The split side of a shadow layout, built from the same history as the
+-- populated legacy directory of the fixture: an untrimmed copy of its file,
+-- with a marker that records no trim. Shadow mode refuses a populated legacy
+-- directory without one.
+buildSplitSide :: FilePath -> IO ()
+buildSplitSide root = do
+    let d = root </> splitDirName
+    createDirectory d
+    copyFile (root </> sqliteDirName </> chainDbFileName cid) (d </> chainDbFileName cid)
+    void $ writeSplitMarker d cid 0
+    Just m <- readSplitMarker d
+    writeMarkerFile d m { _smFirstTrimChain = Nothing, _smFirstTrimHeight = Nothing, _smTrimFrontiers = mempty }
+
 shadowBrokenTest :: Assertion
 shadowBrokenTest = withFixture $ \root _twin -> do
+    buildSplitSide root
     let cfg = testConfig { _phStore = HistoryShadow }
         brokenFile = root </> splitDirName </> shadowBrokenFileName cid
     withPactStorage quietLogger v cfg root False $ \st -> withChain st $ \cst -> case _cstStore cst of
@@ -283,6 +297,7 @@ shadowBrokenTest = withFixture $ \root _twin -> do
 -- temporary file): the write is logged at Error and the chain goes on.
 shadowBrokenWriteFailsTest :: Assertion
 shadowBrokenWriteFailsTest = withFixture $ \root _twin -> do
+    buildSplitSide root
     let cfg = testConfig { _phStore = HistoryShadow }
         brokenFile = root </> splitDirName </> shadowBrokenFileName cid
     logs <- newIORef []

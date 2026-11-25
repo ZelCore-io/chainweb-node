@@ -18,6 +18,7 @@ import Control.Monad
 
 import Data.Aeson (eitherDecodeFileStrict)
 import Data.IORef
+import qualified Data.List as L
 import qualified Data.Map.Strict as M
 import qualified Data.Text as T
 import Database.SQLite3.Direct (Utf8(..))
@@ -57,6 +58,10 @@ tests = testGroup "Pact layout"
         resetTest
     , testCase "shadow start: sqlite-split appears only with its marker; a leftover temporary directory from a crash is replaced (M1)"
         shadowAtomicStartTest
+    , testCase "read-only layout read: every cell gives the read-write outcome or ReadOnlyNeedsRepair, and the directory listing is unchanged"
+        readOnlyTest
+    , testCase "shadow on a populated legacy directory without a split side refuses up front and creates nothing"
+        shadowNeedsSplitSideTest
     , testCase "shadow marker: no trim recorded at start; the first trim records its chain and height, later trims and restarts keep it (M2)"
         shadowMarkerTest
     ]
@@ -102,7 +107,7 @@ mkMarker d = void $ writeSplitMarker d cid0 42
 -- -------------------------------------------------------------------------- --
 -- The table
 
-data State = A | ACold | B | CCold | CNoCold | AandC | D
+data State = A | ACold | B | CCold | CNoCold | AandC | D | Empty
     deriving (Show, Eq, Enum, Bounded)
 
 setup :: FilePath -> State -> IO ()
@@ -117,6 +122,8 @@ setup r = \case
         mkDataDir (splitDir r) >> mkMarker (splitDir r)
         createDirectory (coldDir r)
     D -> mkDataDir (splitDir r) >> createDirectory (coldDir r)
+    -- a fresh start: the legacy directory exists and holds no chain file
+    Empty -> createDirectory (sqliteDir r)
 
 data Outcome
     = Uses
@@ -136,6 +143,7 @@ expected HistorySqlite = \case
     CNoCold -> Fails (TrimmedDirInSqliteMode . splitDir)
     AandC -> Uses sqliteDir Nothing Nothing (Just "is left over")
     D -> Fails (SplitDirWithoutMarker . splitDir)
+    Empty -> Uses sqliteDir Nothing Nothing Nothing
 expected HistorySplit = \case
     A -> Uses sqliteDir Nothing (Just coldDir) Nothing
     ACold -> Uses sqliteDir Nothing (Just coldDir) Nothing
@@ -144,9 +152,12 @@ expected HistorySplit = \case
     CNoCold -> Fails (MissingColdStore . coldDir)
     AandC -> Fails (\r -> AmbiguousSqliteDirs (sqliteDir r) (splitDir r))
     D -> Fails (SplitDirWithoutMarker . splitDir)
+    Empty -> Uses sqliteDir Nothing (Just coldDir) Nothing
 expected HistoryShadow = \case
-    A -> Uses splitDir (Just sqliteDir) (Just coldDir) Nothing
-    ACold -> Uses splitDir (Just sqliteDir) (Just coldDir) Nothing
+    -- a populated legacy directory needs a split side of the same history
+    A -> Fails (ShadowNeedsSplitSide . sqliteDir)
+    ACold -> Fails (ShadowNeedsSplitSide . sqliteDir)
+    Empty -> Uses splitDir (Just sqliteDir) (Just coldDir) Nothing
     B -> Fails (ShadowNeedsLegacy . sqliteDir)
     CCold -> Fails (ShadowNeedsLegacy . sqliteDir)
     CNoCold -> Fails (ShadowNeedsLegacy . sqliteDir)
@@ -180,7 +191,7 @@ tableTest = forM_ [minBound .. maxBound] $ \mode -> forM_ [minBound .. maxBound]
                 -- the data survives where the layout points
                 doesFileExist (d </> "pact-v1-chain-0.sqlite") >>= \case
                     True -> return ()
-                    False -> unless (mode == HistoryShadow && st `elem` [A, ACold]) $
+                    False -> unless (st == Empty) $
                         assertFailure (cell <> ": the data file is missing in " <> d)
                 case warning of
                     Nothing -> assertEqual (cell <> ": warnings") [] logs
@@ -238,8 +249,10 @@ ensureSplitDirTest = withRoot $ \r -> withLogger $ \logger _ -> do
     -- shadow mode: the split side exists from the start, so nothing is
     -- renamed (the marker is covered by "shadow marker")
     withRoot $ \r2 -> do
-        mkDataDir (sqliteDir r2)
+        createDirectory (sqliteDir r2)
         ls <- resolvePactLayout logger HistoryShadow False r2
+        -- the node writes its legacy file after the start
+        mkDataDir (sqliteDir r2)
         ensureSplitDir logger ls cid0 7
         currentSqliteDir ls >>= (@?= splitDir r2)
         doesDirectoryExist (sqliteDir r2) >>= assertBool "shadow lost the legacy dir"
@@ -404,7 +417,7 @@ shadowAtomicStartTest = withLogger $ \logger _ -> do
     let tmpOf r = splitDir r <.> "tmp"
     -- a fresh start
     withRoot $ \r -> do
-        mkDataDir (sqliteDir r)
+        createDirectory (sqliteDir r)
         l <- resolvePactLayout logger HistoryShadow False r
         currentSqliteDir l >>= (@?= splitDir r)
         void $ readMarkerFile (splitDir r)
@@ -412,7 +425,7 @@ shadowAtomicStartTest = withLogger $ \logger _ -> do
     -- the crash states of the creation: an empty temporary directory, and one
     -- with its marker written
     forM_ [False, True] $ \withMarker -> withRoot $ \r -> do
-        mkDataDir (sqliteDir r)
+        createDirectory (sqliteDir r)
         createDirectory (tmpOf r)
         when withMarker $ mkMarker (tmpOf r)
         l <- resolvePactLayout logger HistoryShadow False r
@@ -429,7 +442,7 @@ shadowAtomicStartTest = withLogger $ \logger _ -> do
 -- trim of the node records where it happened, as in split mode.
 shadowMarkerTest :: IO ()
 shadowMarkerTest = withLogger $ \logger _ -> withRoot $ \r -> do
-    mkDataDir (sqliteDir r)
+    createDirectory (sqliteDir r)
     l <- resolvePactLayout logger HistoryShadow False r
     m0 <- readMarkerFile (splitDir r)
     _smFirstTrimChain m0 @?= Nothing
@@ -447,3 +460,56 @@ shadowMarkerTest = withLogger $ \logger _ -> withRoot $ \r -> do
     ensureSplitDir logger l2 (unsafeChainId 6) 123
     ensureSplitDir logger l2 (unsafeChainId 4) 50
     readMarkerFile (splitDir r) >>= (@?= frontiers [("4", 77), ("5", 99), ("6", 123)])
+
+-- -------------------------------------------------------------------------- --
+-- Read-only opens
+
+-- | Every file and directory under the root, with the files' bytes.
+listing :: FilePath -> IO [(FilePath, Maybe String)]
+listing r = do
+    es <- L.sort <$> listDirectory r
+    fmap concat $ forM es $ \e -> do
+        let q = r </> e
+        doesDirectoryExist q >>= \case
+            True -> ((e, Nothing) :) . map (\(f, b) -> (e </> f, b)) <$> listing q
+            False -> (\b -> [(e, Just b)]) <$> readFile' q
+  where
+    readFile' f = do
+        b <- readFile f
+        length b `seq` return b
+
+readOnlyTest :: Assertion
+readOnlyTest = forM_ [minBound .. maxBound] $ \mode -> forM_ [minBound .. maxBound] $ \st ->
+    withRoot $ \r -> withLogger $ \logger _ -> do
+        setup r st
+        let cell = show mode <> " x " <> show st
+            repair = (mode, st) `elem`
+                [ (HistorySqlite, B), (HistorySplit, B), (HistoryShadow, Empty) ]
+        before <- listing r
+        res <- try $ readPactLayout logger mode r
+        afterRead <- listing r
+        assertEqual (cell <> ": the directory listing changed") before afterRead
+        case (repair, expected mode st, res) of
+            (True, _, Left err@(ReadOnlyNeedsRepair m r' _)) -> do
+                m @?= mode
+                r' @?= r
+                assertBool (cell <> ": " <> T.unpack (pactLayoutErrorMessage err))
+                    ("only a node start makes" `T.isInfixOf` pactLayoutErrorMessage err)
+            (True, _, other) -> assertFailure $ cell <> ": expected ReadOnlyNeedsRepair, got " <> either show (const "a layout") other
+            (False, Fails e, Left err) -> assertEqual cell (e r) err
+            (False, Uses s _ _ _, Right l) -> currentSqliteDir l >>= assertEqual cell (s r)
+            (False, _, Left err) -> assertFailure $ cell <> ": failed with " <> show err
+            (False, _, Right _) -> assertFailure $ cell <> ": expected a failure"
+
+shadowNeedsSplitSideTest :: Assertion
+shadowNeedsSplitSideTest = withRoot $ \r -> withLogger $ \logger _ -> do
+    mkDataDir (sqliteDir r)
+    before <- listing r
+    try (resolvePactLayout logger HistoryShadow False r) >>= \case
+        Left err@(ShadowNeedsSplitSide d) -> do
+            d @?= sqliteDir r
+            let msg = pactLayoutErrorMessage err
+            assertBool (T.unpack msg) ("split side built from the same history" `T.isInfixOf` msg)
+        Left e -> assertFailure (show e)
+        Right _ -> assertFailure "expected ShadowNeedsSplitSide"
+    listing r >>= assertEqual "nothing was created" before
