@@ -686,6 +686,7 @@ test-suite chainweb-tests
         Chainweb.Test.Pact.Store.ColdKey
         Chainweb.Test.Pact.Store.ColdRead
         Chainweb.Test.Pact.Store.Freezer
+        Chainweb.Test.Pact.Store.Schedule
         Chainweb.Test.Pact.Store.Split
         Chainweb.Test.Payload.Store
         Chainweb.Test.ResponseSizeLimiter

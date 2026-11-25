@@ -61,6 +61,7 @@ import qualified Chainweb.Test.Pact.Store.Cold (tests)
 import qualified Chainweb.Test.Pact.Store.ColdKey (tests)
 import qualified Chainweb.Test.Pact.Store.ColdRead (tests)
 import qualified Chainweb.Test.Pact.Store.Freezer (tests)
+import qualified Chainweb.Test.Pact.Store.Schedule (tests)
 import qualified Chainweb.Test.Pact.Store.Split (tests)
 import qualified Chainweb.Test.Pact.Store.SQLite (tests)
 import qualified Chainweb.Test.Payload.Store (tests)
@@ -197,6 +198,7 @@ suite rdb =
         , Chainweb.Test.Pact.Store.ColdKey.tests
         , Chainweb.Test.Pact.Store.ColdRead.tests
         , Chainweb.Test.Pact.Store.Freezer.tests
+        , Chainweb.Test.Pact.Store.Schedule.tests
         , Chainweb.Test.Pact.Store.Split.tests
         , Chainweb.Test.Payload.Store.tests
         , Chainweb.Test.BlockHeader.Genesis.tests

@@ -28,6 +28,7 @@ module Chainweb.Pact.Service.PactQueue
 , resetPactQueueStats
 , PactQueue
 , PactQueueStats(..)
+, pactQueueBlockWaiting
 ) where
 
 import Control.Applicative
@@ -64,6 +65,11 @@ data PactQueue = PactQueue
     , _pactQueuePactQueueNewBlockMsgCounters :: !(IORef PactQueueCounters)
     , _pactQueuePactQueueOtherMsgCounters :: !(IORef PactQueueCounters)
     }
+
+-- | Whether a block waits for validation: the freezer's trim gate does not
+-- start a chunk at the tip while one does (storage redesign, spec 6.5).
+pactQueueBlockWaiting :: PactQueue -> STM Bool
+pactQueueBlockWaiting q = not <$> isEmptyTBQueue (_pactQueueValidateBlock q)
 
 initPactQueueCounters :: PactQueueCounters
 initPactQueueCounters = PactQueueCounters

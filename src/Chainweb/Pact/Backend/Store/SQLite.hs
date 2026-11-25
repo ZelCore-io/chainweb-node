@@ -31,6 +31,8 @@ module Chainweb.Pact.Backend.Store.SQLite
     , sqliteTrimChunk
     , sqliteWithTrimSavepoint
     , sqliteExplainTrim
+    , SqliteFileStats(..)
+    , sqliteFileStats
 
       -- * Split routing (storage redesign P3, spec 4.3)
     , LegacyRead(..)
@@ -964,15 +966,48 @@ sqliteExplainTrim db t rule = fmap concat $ forM (trimStatements t rule 1 2 3) $
 
 -- | Runs a trim chunk in the savepoint @trim@: released on success, rolled
 -- back on any exception.
+--
+-- The savepoint must be the outermost transaction (parked pointer N1): the
+-- trim position moves forward in the cold store after the chunk, so a chunk
+-- inside an outer transaction that later rolls back would leave the position
+-- past rows that are back in SQLite. So the connection must be in autocommit
+-- mode; otherwise this throws before any statement runs.
 sqliteWithTrimSavepoint :: SQLiteEnv -> IO a -> IO a
 sqliteWithTrimSavepoint db act = fmap fst $ generalBracket
-    (Pact4.exec_ db "SAVEPOINT [trim];")
+    (do
+        auto <- SQ3.getAutoCommit db
+        unless auto $ internalError
+            "freezer: a trim chunk must not run inside an outer transaction (the trim position would move past rows a rollback restores)"
+        Pact4.exec_ db "SAVEPOINT [trim];")
     (\_ -> \case
         ExitCaseSuccess {} -> Pact4.exec_ db "RELEASE SAVEPOINT [trim];"
         _ -> do
             Pact4.exec_ db "ROLLBACK TRANSACTION TO SAVEPOINT [trim];"
             Pact4.exec_ db "RELEASE SAVEPOINT [trim];"
     ) $ \_ -> act
+
+-- | The size of the database file as SQLite counts it: the file's bytes
+-- (@page_count * page_size@) and its live bytes
+-- (@(page_count - freelist_count) * page_size@).
+data SqliteFileStats = SqliteFileStats
+    { _sfsFileBytes :: !Integer
+    , _sfsLiveBytes :: !Integer
+    }
+    deriving (Eq, Show)
+
+sqliteFileStats :: SQLiteEnv -> IO SqliteFileStats
+sqliteFileStats db = do
+    pages <- pragmaInt "PRAGMA page_count"
+    free <- pragmaInt "PRAGMA freelist_count"
+    size <- pragmaInt "PRAGMA page_size"
+    return SqliteFileStats
+        { _sfsFileBytes = pages * size
+        , _sfsLiveBytes = (pages - free) * size
+        }
+  where
+    pragmaInt q = freezerQry db q [] [Pact4.RInt] >>= \case
+        [[Pact4.SInt n]] -> return (fromIntegral n)
+        r -> internalError $ "freezer: bad pragma row: " <> sshow r
 
 -- -------------------------------------------------------------------------- --
 -- Split routing (storage redesign P3, spec 4.3)

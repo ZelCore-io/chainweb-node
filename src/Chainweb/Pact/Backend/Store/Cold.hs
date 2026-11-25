@@ -55,9 +55,19 @@ module Chainweb.Pact.Backend.Store.Cold
 
   -- * Reads
 , coldReadNewest
+
+  -- * Rewinds and freezer steps
+, RewindGuard
+, newRewindGuard
+, guardGeneration
+, guardClaimStep
+, guardReleaseStep
+, guardBeginRewind
+, guardEndRewind
 ) where
 
 import Control.Concurrent.MVar
+import Control.Concurrent.STM
 import Control.Exception
 import Control.Monad
 
@@ -338,6 +348,8 @@ data ColdChain = ColdChain
     , _ccFreezerView :: !ColdFreezerView
         -- ^ for the freezer's verify step only; split routing must never use
         -- it (it is not clamped to the verified frontier)
+    , _ccRewindGuard :: !RewindGuard
+        -- ^ keeps a hot rewind and a freezer step of the chain apart
     }
 
 -- | The freezer's view of a chain, for the verify step (spec 6.2 step 3).
@@ -403,6 +415,7 @@ openColdChainHooked writer midPublish cs c = do
             return
             (decodeColdMeta bytes)
     catalog <- readCatalog
+    guard' <- newRewindGuard
     metaRef <- newIORef meta
     catalogRef <- newIORef catalog
     let readers = Readers
@@ -483,6 +496,7 @@ openColdChainHooked writer midPublish cs c = do
             , _fvRowsAtTxId = rowsAtTxId written
             , _fvKeyVersions = keyVersions written
             }
+        , _ccRewindGuard = guard'
         }
   where
     db = _csDb cs
@@ -804,3 +818,81 @@ be32 :: B.ByteString -> Maybe Word32
 be32 b
     | B.length b == 4 = Just $! B.foldl' (\a x -> a `shiftL` 8 .|. fromIntegral x) 0 b
     | otherwise = Nothing
+
+-- -------------------------------------------------------------------------- --
+-- Rewinds and freezer steps
+
+-- | Keeps a rewind of the hot store and a freezer step of the same chain
+-- apart (parked pointer M3).
+--
+-- The race: a freezer step reads its blocks from a snapshot of the read
+-- connection and writes them to the cold store. If a rewind on the Pact
+-- connection removes some of those blocks in the meantime, the step would
+-- write and publish rows that are no longer in SQLite, and a split read below
+-- the frontier would return them.
+--
+-- The rules:
+--
+-- * A step takes the generation before it opens its read snapshot, and
+--   claims the step after the read, before the write ('guardClaimStep'). The
+--   claim fails when a rewind began or ended since that generation (the
+--   snapshot may hold rewound rows), or when a rewind in progress has a target
+--   below the step's end. A failed claim drops the step; nothing is written.
+-- * A rewind that removes rows ('guardBeginRewind') waits while a claimed
+--   step ends above its target, then bumps the generation and sets the floor.
+--   The step publishes first, so the rewind then sees the new written
+--   frontier and is refused below it. A rewind at or above a claimed step's
+--   end does not wait.
+-- * 'guardEndRewind' runs when the rewind's batch commits or rolls back. It
+--   bumps the generation again: a snapshot opened during the batch does not
+--   see the batch's writes.
+--
+-- A step's trim is not covered: it runs on the Pact connection under the
+-- same lock as the rewind, and checks the frontier's block hash first.
+--
+data RewindGuard = RewindGuard
+    { _rgGeneration :: !(TVar Word64)
+    , _rgFloor :: !(TVar (Maybe Pact4.TxId))
+        -- ^ the lowest target of the rewinds in progress
+    , _rgInflight :: !(TVar (Maybe Pact4.TxId))
+        -- ^ the end txid of the claimed step
+    }
+
+newRewindGuard :: IO RewindGuard
+newRewindGuard = RewindGuard <$> newTVarIO 0 <*> newTVarIO Nothing <*> newTVarIO Nothing
+
+-- | The generation, taken before a step opens its read snapshot.
+guardGeneration :: RewindGuard -> IO Word64
+guardGeneration = readTVarIO . _rgGeneration
+
+-- | Claims a step that ends at the given txid; 'False' if the step must be
+-- dropped (see 'RewindGuard').
+guardClaimStep :: RewindGuard -> Word64 -> Pact4.TxId -> IO Bool
+guardClaimStep g gen end = atomically $ do
+    gen' <- readTVar (_rgGeneration g)
+    fl <- readTVar (_rgFloor g)
+    if gen' /= gen || maybe False (< end) fl
+    then return False
+    else True <$ writeTVar (_rgInflight g) (Just end)
+
+-- | Ends the claim of a step, after its publish or on an exception.
+guardReleaseStep :: RewindGuard -> IO ()
+guardReleaseStep g = atomically $ writeTVar (_rgInflight g) Nothing
+
+-- | Begins a rewind that removes the rows at and above the target txid.
+guardBeginRewind :: RewindGuard -> Pact4.TxId -> IO ()
+guardBeginRewind g target = atomically $ do
+    readTVar (_rgInflight g) >>= \case
+        Just end | end > target -> retry
+        _ -> return ()
+    modifyTVar' (_rgGeneration g) (+ 1)
+    modifyTVar' (_rgFloor g) (Just . maybe target (min target))
+
+-- | Ends the rewinds in progress, when their batch commits or rolls back.
+-- Does nothing when none is in progress.
+guardEndRewind :: RewindGuard -> IO ()
+guardEndRewind g = atomically $ readTVar (_rgFloor g) >>= \case
+    Nothing -> return ()
+    Just _ -> do
+        writeTVar (_rgFloor g) Nothing
+        modifyTVar' (_rgGeneration g) (+ 1)

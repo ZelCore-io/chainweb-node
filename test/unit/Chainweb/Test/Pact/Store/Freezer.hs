@@ -1,4 +1,5 @@
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE NumericUnderscores #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
@@ -28,6 +29,7 @@ module Chainweb.Test.Pact.Store.Freezer
 , quietLogger
 , testConfig
 , withNode
+, withNodeW
 , withPlainNode
 , runToEnd
 , finalFrontier
@@ -217,6 +219,10 @@ withNodeW tw root cfg writer mkHooks gate k = do
                     , _feConfig = cfg
                     , _feWithPactDb = \act -> withMVar lock act
                     , _feBeforeTrimChunk = gate node
+                    , _feAfterTrimChunk = \_ -> return ()
+                    , _fePollMicros = 50_000
+                    , _feSplitCounters = Nothing
+                    , _feCacheStats = coldCacheStats cs
                     , _feTrimWindow = tw
                     , _feLogger = quietLogger
                     , _feHooks = mkHooks node

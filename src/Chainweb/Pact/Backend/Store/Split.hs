@@ -77,6 +77,11 @@ data SplitEnv = SplitEnv
 -- miss in cold); a hot miss while nothing is frozen counts nowhere. Every call
 -- to the cold store counts in '_scColdReads'. @SYS:Pacts@ cold reads are
 -- timed (ruling 5): total and maximum, in microseconds.
+--
+-- A @SYS:Pacts@ '_psDistinctKeys' call counts as one cold read too, and as a
+-- cold hit when the cold store returned any key: that hit counts key-set
+-- reads, not point hits, so '_scSysPactsColdHits' is not a point-hit rate
+-- when key listings are frequent.
 data SplitCounters = SplitCounters
     { _scColdReads
     , _scSysPactsHotHits
@@ -138,6 +143,7 @@ splitPactStore env = hot
     , _psRowsAtTxId = rowsAtTxId env
     , _psRowsInTxIdRange = rowsInTxIdRange env
     , _psRewindDbTo = rewindDbTo env
+    , _psWithBatch = \act -> _psWithBatch hot act `finally` guardEndRewind (rewindGuard env)
     , _psBackupTo = \_ -> throwIO (BackupRefused HistorySplit)
     }
   where
@@ -327,11 +333,40 @@ rowsInTxIdRange env t from to = do
 -- | Refuses a rewind whose target ends below the __written__ frontier, before
 -- any SQL write; otherwise the hot rewind. A target the hot store does not
 -- know is left to the hot rewind, which fails as the legacy store fails.
+--
+-- A rewind that removes rows (its target ends below the hot tip's end txid)
+-- first waits for a freezer step of the chain that is being written above its
+-- target, and holds the chain's 'RewindGuard' until its batch ('_psWithBatch')
+-- commits or rolls back, so no freezer step interleaves with it (parked
+-- pointer M3). A rewind to the tip removes nothing and takes no guard, so
+-- appending blocks never waits for the freezer. A rewind outside a batch
+-- holds the guard until the next batch ends: steps above its target wait
+-- until then.
 rewindDbTo :: SplitEnv -> Maybe ParentHeader -> IO TxId
 rewindDbTo env p = do
-    target <- _psGetEndTxId (_seHot env) "rewindDbToBlock" p
-    written <- _ccWritten (_seCold env)
-    case (target, written) of
-        (Historical e, Just w) | e < _frEndTxId w ->
-            throwIO (RewindBelowFrontier (_seChain env) e w)
-        _ -> _psRewindDbTo (_seHot env) p
+    target <- _psGetEndTxId hot "rewindDbToBlock" p
+    case target of
+        Historical e -> removesRows e >>= \case
+            False -> checkAndRewind target
+            True -> do
+                guardBeginRewind (rewindGuard env) e
+                checkAndRewind target `onException` guardEndRewind (rewindGuard env)
+        NoHistory -> checkAndRewind target
+  where
+    hot = _seHot env
+
+    removesRows e = _psGetLatestBlock hot >>= \case
+        Nothing -> return False
+        Just (h, hash) -> _psGetEndTxId' hot "rewindDbToBlock" h hash >>= \case
+            Historical tipEnd -> return (e < tipEnd)
+            NoHistory -> return True
+
+    checkAndRewind target = do
+        written <- _ccWritten (_seCold env)
+        case (target, written) of
+            (Historical e, Just w) | e < _frEndTxId w ->
+                throwIO (RewindBelowFrontier (_seChain env) e w)
+            _ -> _psRewindDbTo hot p
+
+rewindGuard :: SplitEnv -> RewindGuard
+rewindGuard = _ccRewindGuard . _seCold
