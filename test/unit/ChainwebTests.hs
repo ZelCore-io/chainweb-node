@@ -57,6 +57,7 @@ import qualified Chainweb.Test.MinerReward (tests)
 import qualified Chainweb.Test.Mining (tests)
 import qualified Chainweb.Test.Misc (tests)
 import qualified Chainweb.Test.Pact.Store.Characterization (tests)
+import qualified Chainweb.Test.Pact.Store.Cold (tests)
 import qualified Chainweb.Test.Pact.Store.ColdKey (tests)
 import qualified Chainweb.Test.Pact.Store.SQLite (tests)
 import qualified Chainweb.Test.Payload.Store (tests)
@@ -189,6 +190,7 @@ suite rdb =
         , Chainweb.Test.Mining.tests rdb
         , Chainweb.Test.MinerReward.tests
         , Chainweb.Test.Misc.tests
+        , Chainweb.Test.Pact.Store.Cold.tests
         , Chainweb.Test.Pact.Store.ColdKey.tests
         , Chainweb.Test.Payload.Store.tests
         , Chainweb.Test.BlockHeader.Genesis.tests
