@@ -68,11 +68,12 @@ import Chainweb.Pact.Backend.Store.Layout
 import Chainweb.Pact.Backend.Store.Node
 import Chainweb.Pact.Backend.Store.Shadow (ShadowEnv(..))
 import Chainweb.Pact.Backend.Store.SQLite (sqlitePactStore, withSqliteErrorDetail)
-import Chainweb.Pact.Backend.Utils (withSqliteDb)
+import Chainweb.Pact.Backend.Utils (chainwebPragmas, withSqliteDb, withTempSQLiteConnection)
 import Chainweb.Pact.Backend.Store.Types
-import Chainweb.Storage.Table.RocksDB (withTempRocksDb)
+import Chainweb.Storage.Table.RocksDB (withTempRocksDb, writeBatchSync)
 import Chainweb.Test.Pact.Store.Freezer hiding (tests)
-import Chainweb.Pact.Backend.Store.Freezer (freezeOnce)
+import Chainweb.Pact.Backend.Store.Freezer (FreezerHooks(..), freezeOnce, noHooks)
+import Chainweb.BlockHeight (BlockHeight)
 import Chainweb.Test.TestVersions (slowForkingCpmTestVersion)
 import Chainweb.Test.Utils.Storage (checkShadowNotBroken, testStorageLogger)
 import Chainweb.Test.Utils (petersen)
@@ -99,6 +100,8 @@ tests = testGroup "Split store node"
     , testCase "test storage: a shadow chain whose split side broke fails the test, with the storage log" shadowBrokenFailsTestTest
     , testCase "test storage: the release closes the storage also when the shadow check fails" releaseAfterFailedCheckTest
     , testCase "test storage: when the shadow check and the release both fail, the check's error stays, with the release's attached" releaseFailsTooTest
+    , testCase "online upgrade (spec 7.2): a populated sqlite directory run in sqlite mode, then in split mode: the freezer catches up from the first block; reads equal a sqlite twin (genesis 0 and genesis 1000)" upgradeTest
+    , testCase "split -> sqlite -> split before the first trim (spec 7.4): the start checks pass, the freezer resumes, reads equal a sqlite twin" rollbackBeforeTrimTest
     , testCase "split start with an empty or recreated pactCold next to a trimmed sqlite-split refuses (store id)" emptyColdTest
     , testCase "split start with an older pactCold restored next to a newer sqlite-split refuses (trim frontier)" olderColdTest
     , testCase "restart with the block header database below the frontier: initializeLatestBlock, exitOnRewindBelowFrontier, the fatal-error handler gets the refusal unwrapped" restartBelowFrontierTest
@@ -797,3 +800,92 @@ olderColdTest = withFixture $ \root _twin -> withSystemTempDirectory "older-cold
     copyDir from to = do
         createDirectory to
         listDirectory from >>= mapM_ (\f -> copyFile (from </> f) (to </> f))
+
+-- | The fixture history moved up by @off@ heights; txids stay.
+shiftHistory :: BlockHeight -> [BlockCommit] -> [BlockCommit]
+shiftHistory off = fmap (\b -> b { _bcHeight = _bcHeight b + off })
+
+-- | Every key read at every bound, every by-txid read, and the keys of
+-- every data table: the store against a sqlite twin.
+sameReads :: PactStore -> PactStore -> Assertion
+sameReads s twin = forM_ dataTables $ \t -> do
+    let bs = [0 .. 141]
+    ks <- _psDistinctKeys twin (KeysAsStored Nothing) t >>= either (assertFailure . show) return
+    (show <$> _psDistinctKeys s (KeysAsStored Nothing) t) >>= (@?= show (Right ks :: Either () [B.ByteString]))
+    forM_ ("absent" : ks) $ \k -> forM_ bs $ \b -> do
+        a <- _psReadNewest s t k (Just b)
+        e <- _psReadNewest twin t k (Just b)
+        assertEqual (show (t, k, b)) (show e) (show a)
+    -- SYS:* tables have no by-txid reads below F, as in "Split store"
+    unless ("SYS:" `T.isPrefixOf` t) $ forM_ bs $ \x -> do
+        a <- _psRowsAtTxId s t x
+        e <- _psRowsAtTxId twin t x
+        assertEqual (show (t, x)) (show e) (show a)
+
+withTwin :: [BlockCommit] -> (PactStore -> IO a) -> IO a
+withTwin hist k = withTempSQLiteConnection chainwebPragmas $ \twin -> do
+    _psInitSchema (sqlitePactStore twin)
+    commitAll twin hist
+    k (sqlitePactStore twin)
+
+storeOf :: ChainStorage -> PactStore
+storeOf cst = chainStorePactStore (_cstSql cst) (_cstStore cst)
+
+-- | Spec 7.2: a node switches from sqlite to split on its populated
+-- directory without any offline step.
+upgradeTest :: Assertion
+upgradeTest = forM_ [0, 1000] $ \off -> do
+    let hist = shiftHistory off (history ++ [block 13])
+        at h = (frontierAt h) { _frHeight = fromIntegral h + off }
+    withHistoryFixture (take (tipHeight + 1) hist) $ \root -> withTwin hist $ \twin -> do
+        -- a sqlite-mode node on the directory appends a block
+        withPactStorage quietLogger v defaultPactHistoryConfig root False $ \st -> do
+            assertBool "no cold store in sqlite mode" (isNothing (_pstCold st))
+            withChain st $ \cst -> do
+                isStore (_cstStore cst) @?= "sqlite"
+                _psCommitBlock (storeOf cst) (last hist) >>= either (assertFailure . show) return
+        doesDirectoryExist (root </> coldDirName) >>= assertBool "sqlite mode creates no cold store" . not
+        -- the same directory in split mode
+        withPactStorage quietLogger v testConfig root False $ \st ->
+            withChain st { _pstFreezerPollMicros = 3_600_000_000 } $ \cst -> do
+                isStore (_cstStore cst) @?= "split"
+                Just cf <- return (_cstFreezer cst)
+                drainChainFreezer cst >>= (@?= True)
+                _ccVerified (_cfCold cf) >>= (@?= Just (at 8))
+                sameReads (storeOf cst) twin
+        doesDirectoryExist (root </> sqliteDirName) >>= assertBool "sqlite renamed at the first trim" . not
+        -- a restart in split mode starts and reads the same
+        withPactStorage quietLogger v testConfig root False $ \st -> withChain st $ \cst ->
+            sameReads (storeOf cst) twin
+
+-- | Spec 7.4, "Pact history, before trimming": a split node whose freezer
+-- published a step but never trimmed (here a crash right after the publish)
+-- goes back to sqlite mode, which runs on the untouched files and appends a
+-- block, and then to split mode again.
+rollbackBeforeTrimTest :: Assertion
+rollbackBeforeTrimTest = withFixture $ \root _ -> withTwin (history ++ [block 13]) $ \twin -> do
+    r <- try $ withNode root testConfig writeBatchSync
+        (\_ -> noHooks { _fhAfterPublish = throwIO (Crash 3) }) (const (return ())) $ \n ->
+            freezeOnce (_nEnv n)
+    case r of
+        Left (Crash 3) -> return ()
+        Left c -> assertFailure (show c)
+        Right o -> assertFailure ("expected the crash after the publish, got " <> show o)
+    doesDirectoryExist (root </> splitDirName) >>= assertBool "nothing trimmed, no sqlite-split" . not
+    -- back to sqlite: the files are legacy files; the node appends a block
+    withPactStorage quietLogger v defaultPactHistoryConfig root False $ \st -> withChain st $ \cst -> do
+        isStore (_cstStore cst) @?= "sqlite"
+        _psCommitBlock (storeOf cst) (block 13) >>= either (assertFailure . show) return
+        sameReads (storeOf cst) twin
+    -- split again: the cold frontier is still in BlockHistory, the freezer
+    -- finishes the step's trim and goes on
+    withPactStorage quietLogger v testConfig root False $ \st ->
+        withChain st { _pstFreezerPollMicros = 3_600_000_000 } $ \cst -> do
+            Just cf <- return (_cstFreezer cst)
+            _ccVerified (_cfCold cf) >>= (@?= Just (frontierAt 2))
+            drainChainFreezer cst >>= (@?= True)
+            _ccVerified (_cfCold cf) >>= (@?= Just finalFrontier)
+            sameReads (storeOf cst) twin
+    Just m <- readSplitMarker (root </> splitDirName)
+    sid <- withColdStore (root </> coldDirName) ColdReadOnly 8388608 coldStoreId
+    assertBool "the marker and the cold store share the store id" (isJust sid && _smStoreId m == sid)

@@ -24,6 +24,8 @@ module Chainweb.Test.Pact.Store.Freezer
 , commitAll
 , dataTables
 , withFixture
+, withHistoryFixture
+, history
 , Node(..)
 , Crash(..)
 , quietLogger
