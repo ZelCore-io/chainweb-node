@@ -25,7 +25,9 @@
 --   answers take hot rows at or above @F@ and cold rows below it, so a
 --   frontier that moved during the read neither duplicates nor drops a row.
 -- * Tables that 'frozenTable' rejects are answered by SQLite alone. The cold
---   store is only asked about a table in its published catalog.
+--   store is only asked about a table in its published catalog; a table
+--   missing from it was never frozen or trimmed, so its reads below @F@ take
+--   SQLite's answer unchanged too ('coldOrHot').
 -- * Below @F@ the hot store keeps the newest version of each key (anchors),
 --   except @SYS:Pacts@ ('keepsNoAnchors'), which keeps nothing below @F@.
 --
@@ -184,6 +186,18 @@ cold env t def act = _ccTableId (_seCold env) t >>= \case
         bump env $ \c -> c { _scColdReads = _scColdReads c + 1 }
         act
 
+-- | Below @F@, the cold answer of a read that replaces the hot one, or the
+-- hot answer unchanged when the table is not in the cold catalog. A table
+-- missing from the catalog was never frozen, so it was never trimmed either
+-- (the trim and the catalog both come from @VersionedTableMutation@), and
+-- SQLite holds all its rows.
+coldOrHot :: SplitEnv -> Text -> a -> IO a -> IO a
+coldOrHot env t hot act = _ccTableId (_seCold env) t >>= \case
+    Nothing -> return hot
+    Just _ -> do
+        bump env $ \c -> c { _scColdReads = _scColdReads c + 1 }
+        act
+
 -- | 'cold' for a @SYS:Pacts@ read: also counted, timed and its hit counted.
 coldPacts :: SplitEnv -> Text -> IO (Maybe a) -> IO (Maybe a)
 coldPacts env t = coldPactsBy env t Nothing (maybe False (const True))
@@ -279,7 +293,7 @@ distinctKeys env q t = _psDistinctKeys (_seHot env) q t >>= \case
                 cs <- if b == 0 then return [] else coldPactsBy env t [] (not . null) (_ccDistinctKeys (_seCold env) t b)
                 return $ Right $ S.toAscList (S.fromList cs <> S.fromList hot)
             | otherwise -> case bound of
-                Just b | b < f -> Right <$> cold env t [] (_ccDistinctKeys (_seCold env) t b)
+                Just b | b < f -> Right <$> coldOrHot env t hot (_ccDistinctKeys (_seCold env) t b)
                 _ -> return (Right hot)
   where
     bound = case q of
@@ -304,7 +318,7 @@ rowsAtTxId env t x = _psRowsAtTxId (_seHot env) t x >>= \case
     Left e -> return (Left e)
     Right hot -> verifiedTxId env >>= \f -> if
             | f == 0 || not (frozenTable t) || isSys t -> return (Right hot)
-            | x < f -> Right . maybe [] id <$> cold env t Nothing (_ccRowsAtTxId (_seCold env) t x)
+            | x < f -> Right <$> coldOrHot env t hot (maybe [] id <$> _ccRowsAtTxId (_seCold env) t x)
             | otherwise -> return (Right hot)
 
 -- | Hot rows at or above @F@, then cold rows in @[from, min to F)@: both
@@ -320,12 +334,11 @@ rowsInTxIdRange env t from to = _psRowsInTxIdRange (_seHot env) t from to >>= \c
     Left e -> return (Left e)
     Right hot -> verifiedTxId env >>= \f -> if
             | f == 0 || not (frozenTable t) -> return (Right hot)
-            | otherwise -> do
-                let hot' = [ r | r@(x, _, _) <- hot, x >= f ]
-                cs <- if from < min to f
-                    then cold env t [] (_ccRowsInTxIdRange (_seCold env) t from (min to f))
-                    else return []
-                return (Right (hot' ++ cs))
+            -- the range starts at or above F: hot holds every row of it
+            | from >= min to f -> return (Right [ r | r@(x, _, _) <- hot, x >= f ])
+            | otherwise -> fmap Right $ coldOrHot env t hot $ do
+                cs <- _ccRowsInTxIdRange (_seCold env) t from (min to f)
+                return ([ r | r@(x, _, _) <- hot, x >= f ] ++ cs)
 
 -- -------------------------------------------------------------------------- --
 -- Rewind

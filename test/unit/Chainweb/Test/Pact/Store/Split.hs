@@ -46,6 +46,7 @@ import Chainweb.Pact.Backend.Store.SQLite
 import Chainweb.Pact.Backend.Store.Split
 import Chainweb.Pact.Backend.Store.Types
 import Chainweb.Pact.Backend.Types (SQLiteEnv)
+import qualified Pact.Types.SQLite as P4SQL
 import Chainweb.Storage.Table.RocksDB (writeBatchSync)
 import Chainweb.Test.Pact.Store.Freezer
     ( cid, mkHash, block, commitAll, dataTables, withFixture, Node(..), Crash(..)
@@ -71,6 +72,7 @@ tests = testGroup "Split store"
     , testCase "a freezer step and its trim between the hot statement and the frontier read: every read op equals the legacy twin" trimRaceTest
     , testCase "a trim cut short at one frontier resumes, and the next step's trim removes stale anchors, inside a read's hot statement: every read op equals the legacy twin (n2)" trimResumeRaceTest
     , testCase "backup is refused" backupTest
+    , testCase "a frozen-name table missing from the cold catalog with rows below F: every read op equals the legacy twin" uncataloguedTest
     ]
 
 -- -------------------------------------------------------------------------- --
@@ -529,3 +531,21 @@ backupTest = withSplit $ \s -> withSystemTempDirectory "split-backup" $ \tmp ->
     try (_psBackupTo (_sStore s) (tmp </> "backup.sqlite")) >>= \case
         Left e -> e @?= BackupRefused HistorySplit
         Right () -> assertFailure "expected BackupRefused"
+
+-- | A table with rows below F that no @VersionedTableMutation@ row names is
+-- never frozen or trimmed, so it is not in the cold catalog and SQLite holds
+-- all its rows: every read must return SQLite's answer, below F too.
+uncataloguedTest :: Assertion
+uncataloguedTest = withSplit $ \s -> do
+    let orphan = (block 13)
+            { _bcNewTables = ["Orphan_Table"]
+            , _bcRows = [("Orphan_Table", [("a", 15, "{\"a\":1}"), ("b", 15, "{\"b\":1}"), ("a", 42, "{\"a\":2}"), ("c", 135, "{\"c\":3}")])]
+            , _bcEndTxId = 140
+            }
+    _psCommitBlock (sqlitePactStore (_nPact (_sNode s))) orphan >>= either (assertFailure . show) return
+    commitAll (_sTwin s) [orphan]
+    forM_ [_nPact (_sNode s), _sTwin s] $ \db ->
+        P4SQL.exec' db "DELETE FROM VersionedTableMutation WHERE tablename = ?" [P4SQL.SText "Orphan_Table"]
+    _ccTableId (_nCold (_sNode s)) "Orphan_Table" >>= (@?= Nothing)
+    compareTable s (bounds ++ [132 .. 141]) "Orphan_Table" "Orphan_Table"
+    compareKeys s (bounds ++ [132 .. 141]) "Orphan_Table" "Orphan_Table"
