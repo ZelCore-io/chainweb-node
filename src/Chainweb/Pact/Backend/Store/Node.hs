@@ -81,7 +81,7 @@ import Chainweb.Pact.Backend.Store.Freezer
 import Chainweb.Pact.Backend.Store.Layout
 import Chainweb.Pact.Backend.Store.Shadow
 import Chainweb.Pact.Backend.Store.Split
-import Chainweb.Pact.Backend.Store.SQLite (sqlitePactStore)
+import Chainweb.Pact.Backend.Store.SQLite (sqliteHasBlockHistory, sqlitePactStore, withSqliteErrorDetail)
 import Chainweb.Pact.Backend.Store.Types
 import Chainweb.Pact.Backend.Types (SQLiteEnv)
 import Chainweb.Pact.Backend.Utils (startSqliteDb, stopSqliteDb, withSqliteDb)
@@ -249,7 +249,8 @@ shadowBrokenFileName cid = "SHADOW-BROKEN-chain-" <> T.unpack (chainIdToText cid
 -- * split: the hot file in the current SQLite directory, the chain of the
 --   cold store, and the start checks: the verified frontier's (height, hash)
 --   is in @BlockHistory@, and the SQLite tip is at or above the written
---   frontier. Otherwise 'SplitStartRefused'.
+--   frontier. Otherwise 'SplitStartRefused'. A new hot file, which has no
+--   schema until the checkpointer creates it, counts as empty.
 -- * shadow: the legacy file in @sqlite@ is the primary connection; the split
 --   side's hot file is in @sqlite-split@. A chain marked broken by an earlier
 --   run starts broken, without a freezer.
@@ -379,11 +380,14 @@ withChainStorage logger st cid reset k = do
 
 -- | The start checks of a chain in split mode.
 splitStartChecks :: ChainId -> SQLiteEnv -> ColdChain -> IO ()
-splitStartChecks cid hot cc = do
+splitStartChecks cid hot cc = withSqliteErrorDetail hot $ do
     let store = sqlitePactStore hot
-    tip <- _psGetLatestBlock store
+    -- A new hot file (a fresh node or test directory) has no schema until the
+    -- checkpointer creates it: it is empty, and holds no frontier block.
+    hasHistory <- sqliteHasBlockHistory hot
+    tip <- if hasHistory then _psGetLatestBlock store else return Nothing
     _ccVerified cc >>= mapM_ (\f -> do
-        ok <- _psLookupBlock store (_frHeight f, _frHash f)
+        ok <- if hasHistory then _psLookupBlock store (_frHeight f, _frHash f) else return False
         unless ok $ throwIO $ SplitStartRefused $ T.unwords
             [ "Refusing to start chain", chainIdToText cid, "with --pact-history-store split:"
             , "the verified frontier of the cold store, height", sshow (_frHeight f) <> ", block"

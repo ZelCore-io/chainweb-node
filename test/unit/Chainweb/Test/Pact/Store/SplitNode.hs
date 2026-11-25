@@ -43,14 +43,18 @@ import Chainweb.Pact.Backend.Store.Config
 import Chainweb.Pact.Backend.Store.Layout
 import Chainweb.Pact.Backend.Store.Node
 import Chainweb.Pact.Backend.Store.Shadow (ShadowEnv(..))
-import Chainweb.Pact.Backend.Store.SQLite (sqlitePactStore)
+import Chainweb.Pact.Backend.Store.SQLite (sqlitePactStore, withSqliteErrorDetail)
+import Chainweb.Pact.Backend.Utils (withSqliteDb)
 import Chainweb.Pact.Backend.Store.Types
 import Chainweb.Storage.Table.RocksDB (withTempRocksDb)
 import Chainweb.Test.Pact.Store.Freezer hiding (tests)
 import Chainweb.Test.TestVersions (slowForkingCpmTestVersion)
+import Chainweb.Test.Utils.Storage (checkShadowNotBroken, testStorageLogger)
 import Chainweb.Test.Utils (petersen)
 import Chainweb.Version (ChainwebVersion)
 import Chainweb.Version.Testnet04 (testnet04)
+
+import qualified Pact.Types.SQLite as Pact4
 
 tests :: TestTree
 tests = testGroup "Split store node"
@@ -64,6 +68,10 @@ tests = testGroup "Split store node"
     , testCase "shadow: a broken chain is persisted; a restart runs it on legacy alone, without a freezer" shadowBrokenTest
     , testCase "shadow: a failed write of the broken flag is logged at Error" shadowBrokenWriteFailsTest
     , testCase "restart at freeze depth 3: the freezer waits for the startup rewind, so a recent rewind is not refused" freezerAfterRewindTest
+    , testCase "split start on a fresh directory: the hot file has no schema yet; the chain starts and the store runs" freshSplitTest
+    , testCase "shadow start on a fresh directory: the split side does not break" freshShadowTest
+    , testCase "a failed SQLite statement names SQLite's message, not only the error code" errorDetailTest
+    , testCase "test storage: a shadow chain whose split side broke fails the test, with the storage log" shadowBrokenFailsTestTest
     ]
 
 v :: ChainwebVersion
@@ -272,3 +280,82 @@ freezerAfterRewindTest = withFixture $ \root _twin -> do
                 drainChainFreezer cst >>= (@?= True)
                 _ccVerified (_cfCold cf) >>= \f -> assertBool ("frontier below the tip: " <> show f)
                     (maybe False ((<= 3) . _frHeight) f)
+
+-- | A split node on a fresh directory, as every Pact service test under
+-- @CHAINWEB_TEST_STORAGE=pact-split@ starts: the hot file is new, so it has
+-- no @BlockHistory@ until the checkpointer creates the schema. The start
+-- checks run before that and must read such a file as empty (they failed
+-- with @Database error: ErrorError@, SQLite's "no such table").
+freshSplitTest :: Assertion
+freshSplitTest = withSystemTempDirectory "split-node" $ \tmp -> do
+    let root = tmp </> "0"
+    withPactStorage quietLogger v testConfig root False $ \st ->
+        withChainStorage quietLogger st cid False $ \cst -> do
+            isStore (_cstStore cst) @?= "split"
+            let store = chainStorePactStore (_cstSql cst) (_cstStore cst)
+            _psInitSchema store
+            _psGetLatestBlock store >>= (@?= Nothing)
+            forM_ (block <$> [0 .. 3]) $ \b ->
+                _psCommitBlock store b >>= either (assertFailure . show) return
+            _psGetLatestBlock store >>= (@?= Just (3, mkHash 3 0))
+
+-- | The same fresh start in shadow mode: the split side must not break, so
+-- that a shadow run compares the split store rather than the legacy one
+-- alone.
+freshShadowTest :: Assertion
+freshShadowTest = withSystemTempDirectory "split-node" $ \tmp -> do
+    let root = tmp </> "0"
+    logs <- newIORef []
+    let logger = genericLogger Warn (\t -> modifyIORef' logs (t :))
+    withPactStorage quietLogger v testConfig { _phStore = HistoryShadow } root False $ \st ->
+        withChainStorage logger st cid False $ \cst -> case _cstStore cst of
+            ChainStoreShadow env -> do
+                let store = chainStorePactStore (_cstSql cst) (_cstStore cst)
+                _psInitSchema store
+                forM_ (block <$> [0 .. 3]) $ \b ->
+                    _psCommitBlock store b >>= either (assertFailure . show) return
+                _psGetLatestBlock store >>= (@?= Just (3, mkHash 3 0))
+                ls <- readIORef logs
+                readIORef (_shBroken env) >>= assertBool ("split side not broken: " <> show ls) . not
+                assertBool ("no ShadowBroken record: " <> show ls) $
+                    not (any ("ShadowBroken" `T.isInfixOf`) ls)
+            _ -> assertFailure "expected shadow"
+
+-- | The Pact 4 SQLite helpers raise @Database error: ErrorError@ and drop
+-- SQLite's message; 'withSqliteErrorDetail' puts it back.
+errorDetailTest :: Assertion
+errorDetailTest = withSystemTempDirectory "split-node" $ \tmp ->
+    withSqliteDb cid quietLogger tmp False $ \db ->
+        try (withSqliteErrorDetail db (Pact4.qry_ db "SELECT x FROM NoSuchTable" [Pact4.RInt])) >>= \case
+            Left (e :: IOException) -> do
+                let t = displayException e
+                assertBool ("keeps the code: " <> t) ("Database error: ErrorError" `T.isInfixOf` T.pack t)
+                assertBool ("names SQLite's message: " <> t) ("no such table: NoSuchTable" `T.isInfixOf` T.pack t)
+            Right _ -> assertFailure "expected an error"
+
+-- | The Pact service suites under @CHAINWEB_TEST_STORAGE=pact-shadow@ check
+-- every chain at its end ('checkShadowNotBroken'): a broken split side runs
+-- the chain on the legacy store alone, so the suite would pass without
+-- testing the split store.
+shadowBrokenFailsTestTest :: Assertion
+shadowBrokenFailsTestTest = withSystemTempDirectory "split-node" $ \tmp -> do
+    let root = tmp </> "0"
+    logs <- newIORef []
+    withPactStorage quietLogger v testConfig { _phStore = HistoryShadow } root False $ \st ->
+        withChainStorage (testStorageLogger logs) st cid False $ \cst -> case _cstStore cst of
+            ChainStoreShadow env -> do
+                _psInitSchema (chainStorePactStore (_cstSql cst) (_cstStore cst))
+                checkShadowNotBroken logs cst
+                -- a split-side write fails: the hot file loses BlockHistory
+                Just cf <- return (_cstFreezer cst)
+                Pact4.exec_ (_cfHot cf) "DROP TABLE BlockHistory"
+                _psCommitBlock (chainStorePactStore (_cstSql cst) (_cstStore cst)) (block 0)
+                    >>= either (assertFailure . show) return
+                readIORef (_shBroken env) >>= assertBool "broken"
+                try (checkShadowNotBroken logs cst) >>= \case
+                    Left (e :: IOException) -> do
+                        let t = T.pack (displayException e)
+                        assertBool ("names the break: " <> T.unpack t) ("split side of the chain broke" `T.isInfixOf` t)
+                        assertBool ("carries ShadowBroken: " <> T.unpack t) ("ShadowBroken" `T.isInfixOf` t)
+                    Right () -> assertFailure "expected the check to fail"
+            _ -> assertFailure "expected shadow"

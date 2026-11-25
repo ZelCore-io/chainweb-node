@@ -37,9 +37,13 @@ module Chainweb.Pact.Backend.Store.SQLite
       -- * Split routing (storage redesign P3, spec 4.3)
     , LegacyRead(..)
     , sqliteExplainLegacyRead
+
+      -- * Errors and the start checks of a split node
+    , withSqliteErrorDetail
+    , sqliteHasBlockHistory
     ) where
 
-import Control.Exception (SomeAsyncException, evaluate)
+import Control.Exception (IOException, SomeAsyncException, evaluate)
 import Control.Lens (over, view, _Left)
 import Control.Monad
 import Control.Monad.Catch
@@ -59,6 +63,9 @@ import qualified Data.Vector as V
 import Database.SQLite3.Direct (Utf8(..))
 import qualified Database.SQLite3.Direct as SQ3
 import GHC.Stack
+import Data.List (isPrefixOf)
+import qualified Data.Text.Encoding.Error as T (lenientDecode)
+import System.IO.Error (ioeGetErrorString, isUserError)
 
 import Chainweb.BlockHash
 import Chainweb.BlockHeader
@@ -1035,3 +1042,32 @@ sqliteExplainLegacyRead db r t = do
     forM rows $ \case
         [_, _, _, Pact4.SText (Utf8 d)] -> return (T.decodeUtf8 d)
         row -> internalError $ "split: bad plan row: " <> sshow row
+
+-- | Puts SQLite's message back into the errors of the Pact 4 SQLite helpers
+-- ("Pact.Types.SQLite"). Their prepare, step and bind failures raise
+-- @user error (Database error: <code>)@ with the result code alone
+-- (@ErrorError@ for every SQLITE_ERROR), which drops SQLite's text such as
+-- "no such table: BlockHistory". This rethrows such an error with
+-- @sqlite3_errmsg@ of the connection appended. Other exceptions pass
+-- unchanged.
+--
+-- Use it where the text of the error is not part of 3.2.1's behaviour (the
+-- start checks of a split node); the store's own operations keep 3.2.1's
+-- text.
+withSqliteErrorDetail :: SQLiteEnv -> IO a -> IO a
+withSqliteErrorDetail db act = act `catch` \(e :: IOException) ->
+    if isUserError e && "Database error: " `isPrefixOf` ioeGetErrorString e
+    then do
+        SQ3.Utf8 msg <- SQ3.errmsg db
+        throwM $ userError $ ioeGetErrorString e
+            <> " (SQLite: " <> T.unpack (T.decodeUtf8With T.lenientDecode msg) <> ")"
+    else throwM e
+
+-- | Whether the connection's database has the @BlockHistory@ table: a new
+-- file has none until the checkpointer creates the schema ('initSchema').
+sqliteHasBlockHistory :: SQLiteEnv -> IO Bool
+sqliteHasBlockHistory db =
+    Pact4.qry db "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'BlockHistory';" [] [Pact4.RInt]
+        >>= \case
+            [[Pact4.SInt n]] -> return (n > 0)
+            r -> internalError $ "sqliteHasBlockHistory: unexpected result " <> sshow r

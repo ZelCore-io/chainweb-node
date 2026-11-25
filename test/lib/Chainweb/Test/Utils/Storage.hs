@@ -37,6 +37,9 @@
 -- A split or shadow layout needs a directory (the hot file and the cold
 -- store), so in split and shadow these use a fresh temporary directory per
 -- chain in place of the temporary or in-memory SQLite file of the default.
+-- In shadow, a chain whose split side broke while the test ran fails the
+-- test at its end ('checkShadowNotBroken'), so that a shadow run cannot pass
+-- on the legacy store alone.
 --
 -- These stay on a single SQLite connection in every mode, because the test
 -- owns that connection or builds the checkpointer itself:
@@ -59,12 +62,16 @@ module Chainweb.Test.Utils.Storage
 , acquireTestChainStorage
 , testChainStorageResource
 , withTestChainStorage
+, testStorageLogger
+, checkShadowNotBroken
 ) where
 
 import Control.Concurrent.Async (async, cancel, race, wait, waitCatch)
 import Control.Concurrent.MVar
 import Control.Exception
+import Control.Monad (when)
 import Control.Monad.IO.Class (liftIO)
+import Data.IORef
 import Control.Monad.Trans.Resource (ResourceT, allocate)
 import System.Directory (removeDirectoryRecursive)
 import System.FilePath ((</>))
@@ -81,6 +88,7 @@ import Text.Read (readMaybe)
 
 import Chainweb.Logger (GenericLogger, genericLogger)
 import Chainweb.Pact.Backend.Store.Node
+import Chainweb.Pact.Backend.Store.Shadow (ShadowEnv(..))
 import Chainweb.ChainId (ChainId)
 import Chainweb.Pact.Backend.Types (SQLiteEnv)
 import Chainweb.Version (ChainwebVersion)
@@ -213,10 +221,11 @@ acquireSplitChainStorage :: ChainwebVersion -> ChainId -> IO (ChainStorage, IO (
 acquireSplitChainStorage v cid = do
     tmp <- getCanonicalTemporaryDirectory
     dir <- createTempDirectory tmp "pact-storage"
+    logs <- newIORef []
     (st, release) <- acquireCps (\k -> withTestPactStorage v (dir </> "0") $ \ps ->
-            withChainStorage testStorageLogger ps cid False k)
+            withChainStorage (testStorageLogger logs) ps cid False k)
         `onException` removeDirectoryRecursive dir
-    return (st, release `finally` removeDirectoryRecursive dir)
+    return (st, (checkShadowNotBroken logs st >> release) `finally` removeDirectoryRecursive dir)
 
 -- | 'acquireTestChainStorage' as a resource. In sqlite mode the storage is
 -- on the given SQLite resource, as before.
@@ -237,12 +246,34 @@ withTestChainStorage
     -> IO b
 withTestChainStorage v cid withSqlite k = testSplitStorage >>= \case
     False -> withSqlite (\sql -> sqliteChainStorage sql >>= k)
-    True -> withSystemTempDirectory "pact-storage" $ \dir ->
+    True -> withSystemTempDirectory "pact-storage" $ \dir -> do
+        logs <- newIORef []
         withTestPactStorage v (dir </> "0") $ \ps ->
-            withChainStorage testStorageLogger ps cid False k
+            withChainStorage (testStorageLogger logs) ps cid False $ \cst -> do
+                r <- k cst
+                checkShadowNotBroken logs cst
+                return r
 
-testStorageLogger :: GenericLogger
-testStorageLogger = genericLogger Error (\_ -> return ())
+-- | The logger of a test chain's storage: keeps the records at 'Warn' and
+-- above, for 'checkShadowNotBroken'.
+testStorageLogger :: IORef [T.Text] -> GenericLogger
+testStorageLogger logs = genericLogger Warn (\t -> atomicModifyIORef' logs (\ls -> (t : ls, ())))
+
+-- | In shadow mode, fails when the split side of the chain broke while the
+-- test ran. A broken split side makes the shadow store run on the legacy
+-- store alone, so the test would pass without exercising the split store;
+-- the failure carries the storage's log records (@ShadowBroken@ and the
+-- differences that led to it).
+checkShadowNotBroken :: IORef [T.Text] -> ChainStorage -> IO ()
+checkShadowNotBroken logs cst = case _cstStore cst of
+    ChainStoreShadow env -> do
+        broken <- readIORef (_shBroken env)
+        when broken $ do
+            ls <- reverse <$> readIORef logs
+            throwIO $ userError $ T.unpack $ T.unlines $
+                "pact-shadow: the split side of the chain broke during the test, so the test ran on the legacy store alone. Storage log:"
+                : take 20 ls
+    _ -> return ()
 
 -- | Holds a bracket open on a thread of its own until the release action
 -- runs, for resources that are acquired and released separately
