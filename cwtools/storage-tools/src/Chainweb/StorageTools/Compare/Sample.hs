@@ -23,13 +23,15 @@ module Chainweb.StorageTools.Compare.Sample
 , historyMaxHeight
 , sampleTargets
 , redrawTargets
+, withFrontierBoundaries
+, frontierTargets
 , genesisCoverage
 ) where
 
 import Control.Lens (at, (^?), _Just)
 
 import qualified Data.HashSet as HS
-import Data.List (sortOn)
+import Data.List (nub, sortOn)
 import qualified Data.Map.Strict as M
 import Data.Word
 
@@ -180,6 +182,39 @@ sampleTargets spec = go (mkStdGen (fromIntegral (_ssSeed spec))) (_ssCount spec)
                 ws = if u < _ssBoundaryShare spec && not (null near) then near else regular
                 ((c, h), g3) = drawFrom ws g2
             in (cls, c, h) : go g3 (k - 1)
+
+-- | Adds the frontier heights of a split or shadow test side (one per
+-- covered chain) to the boundaries, so that a fixed share of the targets sits
+-- within 'boundaryDistance' heights of a frontier (spec 10.1).
+--
+withFrontierBoundaries :: [BlockHeight] -> SampleSpec -> SampleSpec
+withFrontierBoundaries fs spec = spec
+    { _ssBoundaries = _ssBoundaries spec <> [ f | f <- nub fs, f `notElem` _ssBoundaries spec ] }
+
+-- | @cw-compare --frontier-targets N@: @N@ targets, each within
+-- 'boundaryDistance' heights of one of the frontier heights, drawn like
+-- those of 'sampleTargets' (seed, classes, coverage) but only from the
+-- windows near a frontier. A class without a covered height near a frontier
+-- (History above the last Pact 4 height, say) is left out; without any
+-- frontier the result is empty.
+--
+frontierTargets :: [BlockHeight] -> Int -> SampleSpec -> [(RequestClass, ChainId, BlockHeight)]
+frontierTargets fs n spec = go (mkStdGen (fromIntegral (_ssSeed spec) * 6_151 + 15_485_863)) n
+  where
+    pools =
+        [ (cls, near)
+        | (cls, _, near) <- classPools spec { _ssBoundaries = fs }
+        , not (null near)
+        ]
+    nPools = length pools
+
+    go g k
+        | k <= 0 || nPools == 0 = []
+        | otherwise =
+            let (p, g1) = uniformR (0, nPools - 1) g
+                (cls, near) = pools !! p
+                ((c, h), g2) = drawFrom near g1
+            in (cls, c, h) : go g2 (k - 1)
 
 -- | The redraws of a class, for a target that its generation had to drop (a
 -- poll or SPV target without a transaction in its window): an infinite list

@@ -65,6 +65,15 @@ module Chainweb.StorageTools.Compare.Report
 , reportRealKeyCompared
 , reportSettings
 , maxDiffSamples
+
+  -- * Frontier split and test-side latency
+, FrontierSide(..)
+, LatencyStats(..)
+, addTestLatency
+, reportFrontiers
+, reportFrontierHeights
+, reportFrontierCount
+, reportLatency
 , maxBodyBytes
 
   -- * Gate verdict
@@ -86,6 +95,7 @@ import qualified Data.Aeson.KeyMap as KM
 import Data.Aeson.Types (parseMaybe)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Lazy as BL
+import Data.List (sort)
 import qualified Data.Map.Strict as M
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
@@ -96,7 +106,10 @@ import System.Exit (ExitCode(..))
 
 -- internal modules
 
+import Chainweb.BlockHeight (BlockHeight)
+import Chainweb.ChainId (ChainId)
 import Chainweb.StorageTools.Compare.Types
+import Chainweb.Utils (toText)
 
 -- -------------------------------------------------------------------------- --
 -- Outcomes
@@ -238,6 +251,11 @@ data Report = Report
         -- ^ see 'reportEntrySuccess'
     , _repExpectedEntries :: ![(RequestClass, T.Text)]
         -- ^ see 'reportExpectEntries'
+    , _repLatency :: !(M.Map RequestClass [(ChainId, Maybe BlockHeight, Word64)])
+        -- ^ per class, the chain, target and test-side latency in µs of each
+        -- request the test side answered, see 'addTestLatency'
+    , _repFrontiers :: !(M.Map ChainId BlockHeight)
+        -- ^ see 'reportFrontiers'
     }
 
 -- | The number of differences kept with their bodies.
@@ -251,7 +269,7 @@ maxBodyBytes :: Int
 maxBodyBytes = 4_096
 
 emptyReport :: Report
-emptyReport = Report mempty mempty mempty mempty mempty mempty 0 0 0 mempty 0 0 0 mempty mempty [] 0 mempty mempty [] mempty mempty []
+emptyReport = Report mempty mempty mempty mempty mempty mempty 0 0 0 mempty 0 0 0 mempty mempty [] 0 mempty mempty [] mempty mempty [] mempty mempty
 
 -- | Adds the outcome of a request. The result does not depend on the order
 -- in which outcomes are added.
@@ -586,6 +604,74 @@ reportGenSkippedTotal = sum . _repGenSkipped
 reportSettings :: [(T.Text, T.Text)] -> Report -> Report
 reportSettings kvs rep = rep { _repSettings = kvs }
 
+-- -------------------------------------------------------------------------- --
+-- Frontier split and test-side latency
+
+-- | Where a target sits relative to the verified frontier of its chain:
+-- below it (answered from the cold store in split mode), or at or above it.
+-- A chain without a frontier has every target at or above it.
+--
+data FrontierSide = BelowFrontier | AboveFrontier
+    deriving (Show, Eq, Ord, Enum, Bounded)
+
+data LatencyStats = LatencyStats
+    { _lsP50 :: !Word64
+    , _lsP99 :: !Word64
+    , _lsMax :: !Word64
+    }
+    deriving (Show, Eq)
+
+-- | Records the test side's latency of a request, in µs: the time from
+-- sending it to having its whole answer, for the attempt whose answer the
+-- verdict uses.
+--
+addTestLatency :: Request -> Word64 -> Report -> Report
+addTestLatency r us rep = rep
+    { _repLatency = M.insertWith (<>) (_reqClass r) [(_reqChain r, _reqTarget r, us)] (_repLatency rep) }
+
+-- | The frontier heights per chain that split the targets below and above:
+-- those of the split test side, or of its split twin (@--frontier-from@).
+--
+reportFrontiers :: M.Map ChainId BlockHeight -> Report -> Report
+reportFrontiers fs rep = rep { _repFrontiers = fs }
+
+reportFrontierHeights :: Report -> M.Map ChainId BlockHeight
+reportFrontierHeights = _repFrontiers
+
+frontierSideOf :: Report -> ChainId -> BlockHeight -> FrontierSide
+frontierSideOf rep cid h = case M.lookup cid (_repFrontiers rep) of
+    Just f | h < f -> BelowFrontier
+    _ -> AboveFrontier
+
+latenciesOn :: Report -> RequestClass -> FrontierSide -> [Word64]
+latenciesOn rep cls side =
+    [ us
+    | (cid, Just h, us) <- M.findWithDefault [] cls (_repLatency rep)
+    , frontierSideOf rep cid h == side
+    ]
+
+-- | The targets of a class that the test side answered, below or at and
+-- above the frontier. Requests without a target height count on neither
+-- side.
+--
+reportFrontierCount :: Report -> RequestClass -> FrontierSide -> Int
+reportFrontierCount rep cls = length . latenciesOn rep cls
+
+-- | p50, p99 and max of the test side's latencies of a class below or at and
+-- above the frontier, nearest rank; 'Nothing' without a latency there.
+--
+reportLatency :: Report -> RequestClass -> FrontierSide -> Maybe LatencyStats
+reportLatency rep cls side = case sort (latenciesOn rep cls side) of
+    [] -> Nothing
+    xs -> Just LatencyStats
+        { _lsP50 = rank 0.50 xs
+        , _lsP99 = rank 0.99 xs
+        , _lsMax = last xs
+        }
+  where
+    rank :: Double -> [Word64] -> Word64
+    rank q xs = xs !! max 0 (min (length xs - 1) (ceiling (q * fromIntegral (length xs)) - 1))
+
 -- | The status in @result@ (plain @/local@) or @preflightResult.result@
 -- (preflight) of a Pact answer.
 --
@@ -837,6 +923,17 @@ reportSummary rep = T.unlines $
        , "pact failure (oracle status 200, Pact result status failure) per class: "
             <> T.intercalate ", " [ requestClassText c <> " " <> sh (reportPactFailures rep c) | c <- allRequestClasses, isPinnedClass c ]
        ]
+    <> [ l
+       | not (M.null (_repLatency rep))
+       , l <- [ "", "test-side latency (µs, p50/p99/max), below / at or above the frontier (" <> frontiersText <> "):" ]
+       ]
+    <> [ "  " <> requestClassText c <> ": below " <> sh (reportFrontierCount rep c BelowFrontier)
+            <> latText (reportLatency rep c BelowFrontier)
+            <> ", above " <> sh (reportFrontierCount rep c AboveFrontier)
+            <> latText (reportLatency rep c AboveFrontier)
+       | c <- allRequestClasses
+       , M.member c (_repLatency rep)
+       ]
     <> [ "", "allowed per rule:" ]
     <> [ "  " <> allowRuleText r <> ": " <> sh (reportAllowedFor rep r) | r <- [minBound .. maxBound] ]
     <> [ "    #" <> sh (_asIndex a) <> " " <> requestLine (_asRequest a) (_asDepths a) <> ": " <> _asEvidence a
@@ -847,6 +944,13 @@ reportSummary rep = T.unlines $
     <> [ "", "differences (first " <> sh maxDiffSamples <> "):" ]
     <> concatMap diffLines (reportDiffSamples rep)
   where
+    frontiersText
+        | M.null (_repFrontiers rep) = "no frontier"
+        | otherwise = T.intercalate ", "
+            [ "chain " <> toText c <> " " <> sh h | (c, h) <- M.toList (_repFrontiers rep) ]
+    latText = \case
+        Nothing -> ""
+        Just l -> " (" <> sh (_lsP50 l) <> "/" <> sh (_lsP99 l) <> "/" <> sh (_lsMax l) <> ")"
     sh :: Show a => a -> T.Text
     sh = T.pack . show
 
@@ -916,10 +1020,18 @@ instance ToJSON Report where
                    , "realKeyCompared" .= reportRealKeyCompared rep c
                    , "skippedPerReason" .= object
                         [ K.fromText (skipReasonText r) .= reportSkippedIn rep c r | r <- [minBound .. maxBound] ]
+                   , "belowFrontier" .= reportFrontierCount rep c BelowFrontier
+                   , "aboveFrontier" .= reportFrontierCount rep c AboveFrontier
+                   , "latencyUs" .= object
+                        [ "below" .= latencyJson (reportLatency rep c BelowFrontier)
+                        , "above" .= latencyJson (reportLatency rep c AboveFrontier)
+                        ]
                    ]
                 )
             | c <- allRequestClasses
             ]
+        , "frontiers" .= object
+            [ K.fromText (toText cid) .= h | (cid, h) <- M.toList (_repFrontiers rep) ]
         , "orderOnly" .= object
             [ "total" .= reportClassTotal rep KindOrderOnly
             , "txids" .= reportOrderOnlyTxids rep
@@ -965,6 +1077,8 @@ instance ToJSON Report where
       where
         depthsJson Nothing = Null
         depthsJson (Just (dO, dT)) = object [ "oracle" .= dO, "test" .= dT ]
+        latencyJson Nothing = Null
+        latencyJson (Just l) = object [ "p50" .= _lsP50 l, "p99" .= _lsP99 l, "max" .= _lsMax l ]
         answerJson Nothing _ = Null
         answerJson (Just a) n = object
             [ "status" .= _ansStatus a

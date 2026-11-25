@@ -10,6 +10,7 @@ import qualified Chainweb.StorageTools.Test.InProcess as InProcess
 import qualified Chainweb.StorageTools.Test.Migrate as Migrate
 import qualified Chainweb.StorageTools.Test.RangeDb as RangeDb
 import qualified Chainweb.StorageTools.Test.Requests as Requests
+import qualified Chainweb.StorageTools.Test.Split as Split
 
 main :: IO ()
 main = defaultMain $ testGroup "storage-tools"
@@ -21,4 +22,5 @@ main = defaultMain $ testGroup "storage-tools"
     , Cold.tests
     , InProcess.tests
     , Migrate.tests
+    , Split.tests
     ]

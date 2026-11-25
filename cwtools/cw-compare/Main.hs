@@ -27,6 +27,18 @@
 -- History, preflight, @/poll@, @/spv@) are covered on those chains only, and
 -- their requests on other chains are skipped as not covered, never sent.
 --
+-- With @--pact-history-store split@ or @shadow@, the in-process side opens a
+-- split or shadow database as a node does (the cold store read-only, no
+-- freezer), and each covered chain's verified frontier height joins the
+-- sampling boundaries, so that a fixed share of the targets sits within 5
+-- heights of it (spec 10.1). @--frontier-targets N@, instead of @--count@,
+-- generates only such targets, as a supplement to a saved request set.
+-- @--frontier-from DIR@ takes the frontier heights of another database, so
+-- that a sqlite-mode run is sampled and split at the same heights as its
+-- split twin. The report counts, per class, the targets below and at or
+-- above the frontier and gives the test side's latency (p50, p99, max in
+-- microseconds) on each side of it.
+--
 -- Requests and the oracle lookups that build them are rate limited per host
 -- across all threads; two sides on one host share the limit. While the pause
 -- file exists, no request is made, to either side.
@@ -58,6 +70,7 @@ module Main (main) where
 
 import Control.Exception (IOException, catch)
 import Control.Monad
+import Data.Function ((&))
 import qualified Data.ByteString.Char8 as B8
 import qualified Data.Map.Strict as M
 import qualified Data.Text as T
@@ -75,6 +88,7 @@ import System.LogLevel
 import Chainweb.BlockHeight
 import Chainweb.ChainId
 import Chainweb.Logger
+import Chainweb.Pact.Backend.Store.Config (PactHistoryStore(..), pactHistoryStoreReader, pactHistoryStoreToText)
 import Chainweb.Storage.Table.RocksDB.Tuning (defaultTuning, payloadZstdTuning)
 import Chainweb.StorageTools.Compare.InProcess
 import Chainweb.StorageTools.Compare.PactSet
@@ -85,6 +99,7 @@ import Chainweb.StorageTools.Compare.Run
 import Chainweb.StorageTools.Compare.Sample
 import Chainweb.StorageTools.Compare.Types
 import Chainweb.StorageTools.FileLimit
+import Chainweb.StorageTools.Measure.Split (readFrontierHeights)
 import Chainweb.Utils (toText)
 import Chainweb.Version
 import Chainweb.Version.Mainnet (mainnet)
@@ -105,6 +120,8 @@ data Options = Options
     , _optReport :: !FilePath
     , _optRunOptions :: !RunOptions
         -- ^ 'runOptionsParser': @--oracle-local-timeout@
+    , _optFrontierFrom :: !(Maybe FilePath)
+        -- ^ @--frontier-from DIR@: the frontier heights of another database
     }
 
 data TestSide
@@ -116,6 +133,7 @@ data DbSide = DbSide
     , _tdPactChains :: ![ChainId]
     , _tdZstd :: !Bool
     , _tdLocal :: !LocalSettings
+    , _tdPactHistory :: !PactHistoryStore
     }
 
 data Source
@@ -124,12 +142,16 @@ data Source
 
 data Generate = Generate
     { _genClasses :: ![RequestClass]
-    , _genCount :: !Int
+    , _genCount :: !GenCount
     , _genSeed :: !Word64
     , _genPactSet :: !(Maybe FilePath)
     , _genSameSnapshot :: !Bool
     , _genSave :: !(Maybe FilePath)
     }
+
+-- | @--count N@: N sampled targets; @--frontier-targets N@: N targets within
+-- 5 heights of a frontier only, as a supplement to a saved request set.
+data GenCount = Count !Int | FrontierTargets !Int
 
 chainsReader :: ReadM [ChainId]
 chainsReader = eitherReader $ \s -> forM (splitOn ',' s) $ \c -> case reads c of
@@ -176,6 +198,13 @@ testDbOptions = DbSide
         <> help "with --test-db: the payload compression the database was written with (default: snappy)"
         )
     <*> localSettingsParser
+    <*> option pactHistoryStoreReader
+        ( long "pact-history-store"
+        <> metavar "sqlite|split|shadow"
+        <> value HistorySqlite
+        <> showDefaultWith (T.unpack . pactHistoryStoreToText)
+        <> help "with --test-db: the Pact history store of the database. sqlite refuses a split or shadow layout; split and shadow open it as a node does, the cold store read-only with the node's block cache and no freezer, and add each chain's verified frontier height to the sampling boundaries"
+        )
 
 testSideOptions :: Parser TestSide
 testSideOptions = TestUrl <$> strOption
@@ -207,11 +236,16 @@ generateOptions = Generate
         <> showDefaultWith (const (T.unpack (T.intercalate "," (map requestClassText allRequestClasses))))
         <> help "the request classes; a class without a request compared voids the run. Only all 7 classes can pass; fewer give at best a partial pass (exit 4)"
         )
-    <*> option auto
-        ( long "count"
-        <> metavar "N"
-        <> help "the number of requests to generate"
-        )
+    <*> (Count <$> option auto
+            ( long "count"
+            <> metavar "N"
+            <> help "the number of requests to generate"
+            )
+        <|> FrontierTargets <$> option auto
+            ( long "frontier-targets"
+            <> metavar "N"
+            <> help "instead of --count: generate N targets, each within 5 heights of a frontier (of --test-db in split or shadow mode, or of --frontier-from), as a supplement to a saved request set"
+            ))
     <*> option auto
         ( long "seed"
         <> metavar "S"
@@ -278,6 +312,11 @@ options = Options
         <> help "where to write the JSON report; a text summary goes to stdout"
         )
     <*> runOptionsParser
+    <*> optional (strOption
+        ( long "frontier-from"
+        <> metavar "DIR"
+        <> help "split the report below and above the verified frontier heights of this split or shadow database (its cold store is opened read-only), and sample near them, so that a sqlite-mode run is split at the same heights as its split twin"
+        ))
 
 -- -------------------------------------------------------------------------- --
 -- Main
@@ -310,6 +349,17 @@ main = do
         settings = case _optTest o of
             TestUrl _ -> []
             TestDb td -> localSettingsText (_tdLocal td)
+                <> [("pactHistoryStore", pactHistoryStoreToText (_tdPactHistory td))]
+        covered = M.keys (let Coverage m = coverage in m)
+    -- the frontier heights: of --frontier-from, else of a split or shadow
+    -- test database; read before the side opens (its freezer is off, so they
+    -- do not move)
+    frontiers <- case (_optFrontierFrom o, _optTest o) of
+        (Just d, _) -> readFrontierHeights d covered
+        (Nothing, TestDb td) | _tdPactHistory td /= HistorySqlite -> readFrontierHeights (_tdDir td) covered
+        _ -> return mempty
+    unless (M.null frontiers) $ logFunctionText logger Info $ "frontier heights: " <> T.intercalate ", "
+        [ toText c <> " " <> T.pack (show h) | (c, h) <- M.toList frontiers ]
     raiseFileLimit >>= logFunctionText logger Info . describeFileLimits
     hl <- newHostLimiters (_optRate o) (_optPauseFile o)
     oracle <- Side "oracle" (_optOracle o) <$> limiterFor hl (_optOracle o)
@@ -321,7 +371,9 @@ main = do
             api <- oracleServiceApi hl v (_optOracle o)
             let spec = SampleSpec
                     { _ssSeed = _genSeed g
-                    , _ssCount = _genCount g
+                    , _ssCount = case _genCount g of
+                        Count n -> n
+                        FrontierTargets n -> n
                     , _ssClasses = _genClasses g
                     , _ssCoverage = coverage
                     , _ssBoundaries = if _versionName v == _versionName mainnet then mainnetBoundaries else []
@@ -329,7 +381,13 @@ main = do
                     , _ssHistoryMax = historyMaxHeight v
                     , _ssPactChains = pactChains
                     }
-                targets = sampleTargets spec
+                    & withFrontierBoundaries (M.elems frontiers)
+            targets <- case _genCount g of
+                Count _ -> return (sampleTargets spec)
+                FrontierTargets n -> do
+                    when (M.null frontiers) $ die
+                        "--frontier-targets: no frontier height (use --test-db with --pact-history-store split or shadow, or --frontier-from)"
+                    return (frontierTargets (M.elems frontiers) n spec)
             logFunctionText logger Info $ "generating " <> T.pack (show (length targets)) <> " requests"
             progress <- newGenProgress (logFunctionText logger Info) (length targets)
             (rs, skips, draws) <- generateRequestsRedrawingP (Just progress) (GenOptions (_genSameSnapshot g)) api pset (_genSeed g)
@@ -355,7 +413,7 @@ main = do
     rep0 <- case _optTest o of
         TestUrl url -> limiterFor hl url >>= compareWith . Side "test" url
         TestDb td -> withInProcessSide logger (inProcessSpec o td) compareWith
-    let rep = reportSettings settings $ gen $ reportExpectClasses classes rep0
+    let rep = reportFrontiers frontiers $ reportSettings settings $ gen $ reportExpectClasses classes rep0
     logFunctionText logger Info $ "verdict: " <> T.pack (show (reportVerdict rep))
     writeReport (_optReport o) rep
     T.putStr (reportSummary rep)
@@ -408,4 +466,5 @@ inProcessSpec o td = InProcessSpec
         , _ipTuning = if _tdZstd td then payloadZstdTuning else defaultTuning
         , _ipLocal = _tdLocal td
         , _ipPauseFile = _optPauseFile o
+        , _ipPactHistory = _tdPactHistory td
         }

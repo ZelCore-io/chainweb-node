@@ -15,11 +15,30 @@
 --
 module Chainweb.StorageTools.Test.InProcess
 ( tests
+
+  -- * The fixture, for "Chainweb.StorageTools.Test.Split"
+, Fixture(..)
+, buildFixture
+, removeFixture
+, copyTree
+, fxVersion
+, fxChains
+, fxPactConfig
+, cid0
+, finalHeight
+, quietLogger
+, specFor
+, e2eSpec
+, listing
+, oracleApi
+, generated
+, everyClassTargets
+, fullCoverage
 ) where
 
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (async, cancel, poll, wait)
-import Control.Exception (bracket, throwIO, try)
+import Control.Exception (SomeException, bracket, fromException, throwIO, try)
 import Control.Lens (view)
 import Control.Monad
 import Control.Monad.IO.Class (liftIO)
@@ -73,6 +92,7 @@ import Chainweb.Logger
 import Chainweb.Mempool.Consensus (mkMempoolConsensus)
 import Chainweb.Mempool.Mempool (InsertType(..), mempoolInsert)
 import Chainweb.Miner.Pact (Miner(..), MinerId(..), MinerKeys(..))
+import Chainweb.Pact.Backend.Store.Config (PactHistoryStore(..))
 import Chainweb.Pact.Backend.Store.Layout (NonSqliteLayout(..), PactLayoutError(..))
 import Chainweb.Pact.Backend.Types (IntraBlockPersistence(..))
 import Chainweb.Test.Utils.Storage (NonSqliteFixture(..), makeNonSqliteFixtures)
@@ -424,6 +444,7 @@ specFor dir = InProcessSpec
     , _ipTuning = defaultTuning
     , _ipLocal = defaultLocalSettings
     , _ipPauseFile = Nothing
+    , _ipPactHistory = HistorySqlite
     }
 
 -- | POSTs a body to a side and returns the status and the body.
@@ -724,11 +745,11 @@ endToEnd getFx = testGroup "EndToEnd"
 tests :: TestTree
 tests = withResource buildFixture removeFixture $ \getFx -> testGroup "InProcess"
     [ endToEnd getFx
-    , testCase "a split database before its first trim, a trimmed one and a shadow one are refused before anything opens (sqlite-only until P5)" $ do
+    , testCase "in sqlite mode, a split database before its first trim, a trimmed one and a shadow one are refused before anything opens; in split mode the guard lets them through" $ do
         tmp <- getCanonicalTemporaryDirectory
         base <- createTempDirectory tmp "inprocess-guard"
         fxs <- makeNonSqliteFixtures base
-        forM_ fxs $ \nfx -> forM_ [_nsfDbDir nfx, _nsfDbDir nfx </> "0"] $ \d ->
+        forM_ fxs $ \nfx -> forM_ [_nsfDbDir nfx, _nsfDbDir nfx </> "0"] $ \d -> do
             try (withInProcessSide quietLogger (specFor d) $ \_ -> return ()) >>= \case
                 Left (SqliteOnlyTool tool _ found) -> do
                     tool @?= "cw-compare (in-process side)"
@@ -739,6 +760,14 @@ tests = withResource buildFixture removeFixture $ \getFx -> testGroup "InProcess
                         _ -> False
                 Left e -> assertFailure $ _nsfName nfx <> ": another error: " <> show e
                 Right () -> assertFailure $ _nsfName nfx <> ": not refused"
+            -- split and shadow open the layout as a node does: the guard does
+            -- not refuse it (these fixtures have an empty rocksDb, so opening
+            -- fails later; "Split harness" serves a real split database)
+            forM_ [HistorySplit, HistoryShadow] $ \m ->
+                (try (withInProcessSide quietLogger (specFor d) { _ipPactHistory = m } $ \_ -> return ()) :: IO (Either SomeException ())) >>= \case
+                    Left e | Just SqliteOnlyTool{} <- fromException e ->
+                        assertFailure $ _nsfName nfx <> ": refused in " <> show m
+                    _ -> return ()
         removeDirectoryRecursive base
     , testCase "same DB on both sides: header, payload and /local Same, report Pass" $ do
         fx <- getFx

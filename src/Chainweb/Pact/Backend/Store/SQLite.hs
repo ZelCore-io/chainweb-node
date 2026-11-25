@@ -33,6 +33,7 @@ module Chainweb.Pact.Backend.Store.SQLite
     , sqliteExplainTrim
     , SqliteFileStats(..)
     , sqliteFileStats
+    , sqliteUserTables
 
       -- * Split routing (storage redesign P3, spec 4.3)
     , LegacyRead(..)
@@ -1015,6 +1016,13 @@ sqliteFileStats db = do
     pragmaInt q = freezerQry db q [] [Pact4.RInt] >>= \case
         [[Pact4.SInt n]] -> return (fromIntegral n)
         r -> internalError $ "freezer: bad pragma row: " <> sshow r
+
+-- | The user tables of @VersionedTableCreation@, named as stored, in name
+-- order. For tools (@cw-measure txlog-digest@).
+sqliteUserTables :: SQLiteEnv -> IO [Text]
+sqliteUserTables db = freezerQry db
+    "SELECT tablename FROM VersionedTableCreation ORDER BY tablename"
+    [] [Pact4.RText] >>= traverse freezerTableName
 
 -- -------------------------------------------------------------------------- --
 -- Split routing (storage redesign P3, spec 4.3)

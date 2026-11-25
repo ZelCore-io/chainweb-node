@@ -340,6 +340,7 @@ library storage-tools
         Chainweb.StorageTools.Http
         Chainweb.StorageTools.Measure.Cold
         Chainweb.StorageTools.Measure.Payload
+        Chainweb.StorageTools.Measure.Split
         Chainweb.StorageTools.Migrate
         Chainweb.StorageTools.RangeDb
     build-depends:
@@ -355,6 +356,7 @@ library storage-tools
         , bytestring
         , clock
         , containers
+        , crypton
         , direct-sqlite
         , directory
         , exceptions
@@ -366,7 +368,9 @@ library storage-tools
         , lens
         , loglevel
         , merkle-log
+        , ram
         , optparse-applicative
+        , pact
         , pact-tng
         , random
         , rocksdb-haskell-kadena
@@ -493,6 +497,7 @@ test-suite storage-tools-tests
         Chainweb.StorageTools.Test.Migrate
         Chainweb.StorageTools.Test.RangeDb
         Chainweb.StorageTools.Test.Requests
+        Chainweb.StorageTools.Test.Split
     build-depends:
         -- internal
         , chainweb

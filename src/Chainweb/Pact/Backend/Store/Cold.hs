@@ -43,6 +43,7 @@ module Chainweb.Pact.Backend.Store.Cold
 , coldStoreRocksDb
 , coldRawGet
 , coldRawKeys
+, coldVerifiedFrontier
 
   -- * Chains
 , StepRow(..)
@@ -279,6 +280,17 @@ coldRawKeys cs = withIterator (_csDb cs) $ \it -> do
             Nothing -> return (reverse acc)
             Just k -> I.iterNext it >> go (k : acc)
     go []
+
+-- | The verified frontier of a chain, read from its @M@ entry without opening
+-- the chain ('openColdChain' opens a chain once per process). For tools.
+--
+coldVerifiedFrontier :: ColdStore -> ChainId -> IO (Maybe Frontier)
+coldVerifiedFrontier cs c = coldRawGet cs (metaKey c) >>= \case
+    Nothing -> return Nothing
+    Just bytes -> either
+        (\e -> coldError $ "chain " <> chainIdToText c <> ": bad meta: " <> T.pack e)
+        (return . _cmVerified)
+        (decodeColdMeta bytes)
 
 withIterator :: RocksDb -> (I.Iterator -> IO a) -> IO a
 withIterator db act =

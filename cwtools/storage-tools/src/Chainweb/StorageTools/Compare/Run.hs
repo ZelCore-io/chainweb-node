@@ -70,6 +70,7 @@ import Servant.Client (baseUrlHost, parseBaseUrl)
 
 import qualified Options.Applicative as O
 
+import GHC.Clock (getMonotonicTimeNSec)
 import System.Clock (Clock(Realtime), TimeSpec(..), getTime)
 
 import System.LogLevel
@@ -226,6 +227,9 @@ data Env = Env
     , _envStarted :: !(IORef Int)
         -- ^ requests started
     , _envLog :: !(LogLevel -> T.Text -> IO ())
+    , _envOnTestAnswer :: !(Word64 -> IO ())
+        -- ^ called with the test side's latency (µs) of each request sent
+        -- to it, see 'compareTimed'
     }
 
 sideOf :: Env -> Role -> Side
@@ -343,8 +347,12 @@ toAnswer :: Request -> (Int, B.ByteString) -> Answer
 toAnswer r (s, b) = Answer s b $ if isPinnedClass (_reqClass r) then answerPin b else Nothing
 
 sendTo :: Env -> Role -> Request -> T.Text -> IO (Either T.Text Answer)
-sendTo env role r path = fmap (toAnswer r) <$>
-    sendRaw env role (_reqMethod r) path (requestHeaders r) (_reqBody r)
+sendTo env role r path = do
+    t0 <- getMonotonicTimeNSec
+    a <- fmap (toAnswer r) <$> sendRaw env role (_reqMethod r) path (requestHeaders r) (_reqBody r)
+    t1 <- getMonotonicTimeNSec
+    when (role == TestRole) $ _envOnTestAnswer env ((t1 - t0) `div` 1_000)
+    return a
 
 -- | Sending a request once to both sides.
 --
@@ -581,6 +589,19 @@ checkOrphan env r ph = case (_reqTarget r, apiPrefixOfPath (_reqPath r)) of
 -- -------------------------------------------------------------------------- --
 -- Comparing
 
+-- | 'compareOne' and the test side's latency (µs) of the request whose
+-- answer the verdict uses: the last one sent to the test side, from the
+-- start of the call to the whole answer (the limiter's wait and transport
+-- retries included). 'Nothing' if the request was not sent to the test side
+-- or it gave no answer.
+--
+compareTimed :: Env -> (Int, Request) -> IO (Outcome, Maybe Word64)
+compareTimed env x = do
+    ref <- newIORef Nothing
+    o <- compareOne env { _envOnTestAnswer = writeIORef ref . Just } x
+    lat <- readIORef ref
+    return (o, if isJust (_outTest o) then lat else Nothing)
+
 compareOne :: Env -> (Int, Request) -> IO Outcome
 compareOne env (i, r) = do
     atomicModifyIORef' (_envStarted env) (\n -> (n + 1, ()))
@@ -710,7 +731,7 @@ runCompareClasses
     -> IO Report
 runCompareClasses logger opts cov oracle test reqs = do
     mgr <- newCompareManager (_roResponseTimeout opts)
-    env <- Env opts mgr cov oracle test <$> newIORef mempty <*> newIORef 0 <*> pure logg
+    env <- Env opts mgr cov oracle test <$> newIORef mempty <*> newIORef 0 <*> pure logg <*> pure (\_ -> return ())
     queue <- newMVar (zip [0 ..] reqs)
     rep <- newMVar emptyReport
     finished <- newIORef (0 :: Int)
@@ -719,14 +740,14 @@ runCompareClasses logger opts cov oracle test reqs = do
                 [] -> return ([], Nothing)
                 x : xs -> return (xs, Just x)
             forM_ next $ \x -> do
-                o <- compareOne env x
+                (o, lat) <- compareTimed env x
                 case effectiveVerdict (_outVerdict o) of
                     Differ d -> logg Warn $ "difference in request #" <> sshow (_outIndex o)
                         <> " (" <> _reqPath (_outRequest o) <> "): " <> d
                     Skipped reason | _outAttempts o > 0 -> logg Warn $ "request #" <> sshow (_outIndex o)
                         <> " (" <> _reqPath (_outRequest o) <> ") skipped: " <> skipReasonText reason
                     _ -> return ()
-                modifyMVar_ rep (evaluate . flip addOutcome o)
+                modifyMVar_ rep (evaluate . maybe id (addTestLatency (_outRequest o)) lat . flip addOutcome o)
                 n <- atomicModifyIORef' finished (\k -> (k + 1, k + 1))
                 when (n `mod` 1_000 == 0) $ logg Info $ "compared " <> sshow n <> " requests"
                 worker

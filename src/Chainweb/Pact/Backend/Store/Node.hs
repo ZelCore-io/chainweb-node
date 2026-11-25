@@ -31,6 +31,7 @@ module Chainweb.Pact.Backend.Store.Node
 , PactStorageError(..)
 , pactStorageErrorMessage
 , withPactStorage
+, withPactStorageMode
 , sqliteOnlyStorage
 , refuseReset
 , pactStorageDirs
@@ -145,7 +146,25 @@ withPactStorage
         -- ^ reset
     -> (PactStorage -> IO a)
     -> IO a
-withPactStorage logger v cfg root reset k = do
+withPactStorage = withPactStorageMode ColdReadWrite
+
+-- | 'withPactStorage' with the cold store opened in the given mode. The
+-- in-process side of @cw-compare@ and @cw-measure txlog-digest@ open it
+-- 'ColdReadOnly', with the freezer off ('_phFreezerEnabled').
+--
+withPactStorageMode
+    :: Logger l
+    => ColdOpenMode
+    -> l
+    -> ChainwebVersion
+    -> PactHistoryConfig
+    -> FilePath
+        -- ^ @<db-dir>/0@
+    -> Bool
+        -- ^ reset
+    -> (PactStorage -> IO a)
+    -> IO a
+withPactStorageMode mode logger v cfg root reset k = do
     either (throwIO . HistoryStoreRefused) return
         $ validatePactHistoryVersion v (_phStore cfg)
     refuseReset cfg reset
@@ -160,7 +179,7 @@ withPactStorage logger v cfg root reset k = do
     let st cold = PactStorage layout cold cfg sem defaultFreezerPollMicros
     case _plColdDir layout of
         Nothing -> k (st Nothing)
-        Just d -> withColdStore d ColdReadWrite (_phColdBlockCacheBytes cfg) (k . st . Just)
+        Just d -> withColdStore d mode (_phColdBlockCacheBytes cfg) (k . st . Just)
 
 -- | The storage of the @storage/3.2.1@ head on a SQLite directory, for tests
 -- and tools: sqlite mode, no cold store, no freezer.

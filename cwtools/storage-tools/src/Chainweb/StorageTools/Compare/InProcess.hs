@@ -25,6 +25,15 @@
 --   answer @/local@, @/poll@ and @/spv@ requests. Each Pact chain must have its
 --   SQLite file: a missing file is an error, not a new database.
 --
+-- * With '_ipPactHistory' split or shadow (P3, Task 29), the Pact services
+--   run on the node's Pact history storage ('withPactStorageMode'): the cold
+--   store under @pactCold@ is opened read-only, with the node's cold block
+--   cache size (a zstd-dict store read without its cache was 22% slower in
+--   gate A) and no freezer, so it is never written and the frontiers do not
+--   move. The SQLite files are those of the layout (@sqlite-split@ once
+--   trimmed). In sqlite mode, a split or shadow layout is refused
+--   ('refuseNonSqliteLayout'), as before.
+--
 -- __Use a copy or a snapshot only, never a production node's files__: point
 -- it at a copy of a node's database directory. Pact opens the SQLite files
 -- read-write (and may checkpoint their WAL), and at start it rewinds them to
@@ -53,7 +62,7 @@ import Control.Exception (bracket, throwIO)
 import Control.Monad
 
 import Data.Function ((&))
-import Data.List (sort)
+import Data.List (intercalate, sort)
 import qualified Data.HashMap.Strict as HM
 import qualified Data.HashSet as HS
 import qualified Data.Text as T
@@ -76,9 +85,10 @@ import Chainweb.CutDB
 import Chainweb.Logger
 import Chainweb.Mempool.Consensus (mkMempoolConsensus)
 import Chainweb.Mempool.Mempool (MempoolBackend, noopMempool)
-import Chainweb.Pact.Backend.Store.Layout (refuseNonSqliteLayout)
-import Chainweb.Pact.Backend.Store.Node (sqliteOnlyStorage)
-import Chainweb.Pact.Backend.Store.Config (PactHistoryConfig(..))
+import Chainweb.Pact.Backend.Store.Cold (ColdOpenMode(..))
+import Chainweb.Pact.Backend.Store.Layout (refuseNonSqliteLayout, splitDirName, sqliteDirName)
+import Chainweb.Pact.Backend.Store.Node (PactStorage, sqliteOnlyStorage, withPactStorageMode)
+import Chainweb.Pact.Backend.Store.Config (PactHistoryConfig(..), PactHistoryStore(..))
 import Chainweb.Pact.Backend.Types (IntraBlockPersistence(..))
 import Chainweb.Pact.Backend.Utils (chainDbFileName)
 import Chainweb.Pact.RestAPI.Server (PactServerData(..))
@@ -123,6 +133,11 @@ data InProcessSpec = InProcessSpec
     , _ipPauseFile :: Maybe FilePath
         -- ^ while this file exists, the side's limiter grants no permit, as
         -- for the oracle (@--pause-file@)
+    , _ipPactHistory :: PactHistoryStore
+        -- ^ @--pact-history-store@ of the database. 'HistorySqlite' refuses
+        -- a split or shadow layout; 'HistorySplit' and 'HistoryShadow' open
+        -- it as a node does, with the cold store read-only, the node's cold
+        -- block cache size and no freezer
     }
 
 -- | The settings of a node's Pact service that change @/local@ answers,
@@ -262,15 +277,20 @@ inProcessCutDbParams v = (defaultCutDbParams v (_cutFetchTimeout (_configCuts co
 withInProcessSide :: Logger l => l -> InProcessSpec -> (Side -> IO a) -> IO a
 withInProcessSide logger0 spec act = do
     dir <- resolveDbDir (_ipDbDir spec)
-    -- the in-process side opens <dir>/sqlite as legacy files (sqlite-only
-    -- until P5): refuse a split or shadow layout
-    refuseNonSqliteLayout "cw-compare (in-process side)" dir
+    -- in sqlite mode the side opens <dir>/sqlite as legacy files: refuse a
+    -- split or shadow layout. In split and shadow mode it opens the layout
+    -- the way a node does.
+    when (mode == HistorySqlite) $
+        refuseNonSqliteLayout "cw-compare (in-process side)" dir
     forM_ pactChains $ \cid -> do
         unless (HS.member cid (chainIds v)) $ throwIO $ userError $
             "in-process side: chain " <> T.unpack (toText cid) <> " is not a chain of " <> show (_versionName v)
-        let f = dir </> "sqlite" </> chainDbFileName cid
-        doesFileExist f >>= \ok -> unless ok $ throwIO $ userError $
-            "in-process side: no SQLite file for chain " <> T.unpack (toText cid) <> ": " <> f
+        let dirs = case mode of
+                HistorySqlite -> [sqliteDirName]
+                _ -> [splitDirName, sqliteDirName]
+            fs = [ dir </> d </> chainDbFileName cid | d <- dirs ]
+        or <$> mapM doesFileExist fs >>= \ok -> unless ok $ throwIO $ userError $
+            "in-process side: no SQLite file for chain " <> T.unpack (toText cid) <> ": " <> intercalate " or " fs
     withReadOnlyRocksDbTuned (dir </> "rocksDb") modernDefaultOptions (_ipTuning spec) $ \src -> do
         -- 'initWebBlockHeaderDb' writes the genesis headers only if they are
         -- missing; a node database has them.
@@ -280,7 +300,8 @@ withInProcessSide logger0 spec act = do
             let cutTable = cutHashesTable cutRdb
             seedCut v logger wbhdb (cutHashesTable src) cutTable
             mempool <- noopMempool
-            withPacts v (inProcessPactConfig v (_ipLocal spec)) logger wbhdb pdb mempool (dir </> "sqlite") pactChains $ \pacts -> do
+            withStorage dir $ \storage ->
+              withPacts v pactConf logger wbhdb pdb mempool storage pactChains $ \pacts -> do
                 mgr <- HTTP.newManager HTTP.defaultManagerSettings
                 let webPact = mkWebPactExecutionService (HM.fromList pacts)
                 headerStore <- newWebBlockHeaderStore mgr wbhdb (logFunction logger)
@@ -309,7 +330,16 @@ withInProcessSide logger0 spec act = do
                             }
   where
     v = _ipVersion spec
+    mode = _ipPactHistory spec
     logger = addLabel ("component", "cw-compare-in-process") logger0
+    pactConf0 = inProcessPactConfig v (_ipLocal spec)
+    pactConf = pactConf0 { _pactHistory = (_pactHistory pactConf0) { _phStore = mode } }
+
+    -- split and shadow: the node's storage ('withPactStorageMode'), the cold
+    -- store read-only with the node's block cache, no freezer
+    withStorage dir k = case mode of
+        HistorySqlite -> sqliteOnlyStorage (dir </> sqliteDirName) >>= k
+        _ -> withPactStorageMode ColdReadOnly logger v (_pactHistory pactConf) dir False k
     allChains = sort (HS.toList (chainIds v))
     pactChains = HS.toList (HS.fromList (_ipPactChains spec))
 
@@ -333,8 +363,8 @@ seedCut v logger wbhdb src dst = do
     hm <- readHighestCutHeaders' v (logFunctionText logger) wbhdb src
     casInsert dst (cutToCutHashes Nothing (unsafeMkCut v hm))
 
--- | Starts a Pact service on each chain, on its SQLite file, the way a node
--- does ('withPactService').
+-- | Starts a Pact service on each chain, on the storage, the way a node does
+-- ('withPactService').
 --
 withPacts
     :: Logger l
@@ -344,17 +374,16 @@ withPacts
     -> WebBlockHeaderDb
     -> PayloadDb RocksDbTable
     -> MempoolBackend Pact4.UnparsedTransaction
-    -> FilePath
+    -> PactStorage
     -> [ChainId]
     -> ([(ChainId, PactExecutionService)] -> IO a)
     -> IO a
-withPacts v conf logger wbhdb pdb mempool sqliteDir cids0 k = go cids0 []
+withPacts v conf logger wbhdb pdb mempool storage cids0 k = go cids0 []
   where
     go [] acc = k (reverse acc)
     go (cid : rest) acc = do
         bhdb <- getWebBlockHeaderDb wbhdb cid
         mpc <- mkMempoolConsensus mempool bhdb (Just pdb)
         let l = addLabel ("chain", toText cid) logger
-        storage <- sqliteOnlyStorage sqliteDir
         withPactService v cid l Nothing mpc bhdb pdb storage conf $ \q ->
             go rest ((cid, mkPactExecutionService q) : acc)

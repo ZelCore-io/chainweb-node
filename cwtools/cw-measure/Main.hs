@@ -11,7 +11,7 @@
 --
 module Main (main) where
 
-import Control.Monad (forM_, unless, when)
+import Control.Monad (forM, forM_, unless, when)
 import Data.Aeson.Types (parseEither)
 
 import Data.Aeson
@@ -32,6 +32,9 @@ import Chainweb.Logger (genericLogger)
 import Chainweb.Storage.Table.RocksDB.Tuning
 import Chainweb.StorageTools.Measure.Cold
 import Chainweb.StorageTools.Measure.Payload
+import Chainweb.StorageTools.Measure.Split
+import Chainweb.BlockHeight (BlockHeight(..))
+import Chainweb.Pact.Backend.Store.Config (PactHistoryStore, pactHistoryStoreReader)
 import Chainweb.Version
 import Chainweb.Version.Mainnet (mainnet)
 import Chainweb.Version.Registry (findKnownVersion)
@@ -41,6 +44,8 @@ data Command
     | PayloadRead FilePath RocksDbTuning Int Word64
     | Cold ColdBuildSpec ColdTuning Int Word64 Int (Maybe FilePath)
     | Project ProjectArgs
+    | SplitSize FilePath [ChainId]
+    | TxlogDigestCmd ChainwebVersion FilePath ChainId PactHistoryStore (Maybe BlockHeight)
 
 data ProjectArgs = ProjectArgs
     { _paChain3 :: FilePath
@@ -51,6 +56,10 @@ data ProjectArgs = ProjectArgs
     , _paChain0Hot :: Word64
     , _paJson :: Maybe FilePath
     }
+
+chainsReader :: ReadM [ChainId]
+chainsReader = eitherReader $ \s -> forM (T.splitOn "," (T.pack s)) $ \c ->
+    either (Left . show) Right (chainIdFromText c)
 
 chainReader :: ReadM ChainId
 chainReader = eitherReader $ \s -> either (Left . show) Right $ chainIdFromText (T.pack s)
@@ -139,10 +148,35 @@ commands = hsubparser $ mconcat
             <*> optional (option auto (long "chain0-ratio" <> metavar "X" <> help "real-engine ratio for chain 0's history tables; default: chain 19's history ratio, with the transaction index, SYS:Modules and SYS:ModuleSources out of both sides as in chain 0's history"))
             <*> option auto (long "chain0-hot-bytes" <> metavar "N" <> value specChain0HotBytes <> showDefault <> help "chain 0's anchors and system tables (spec 4.3)")
             <*> optional (strOption (long "json" <> metavar "FILE" <> help "write the projection as JSON"))
+    , cmdF "split-size" "sizes of a split or shadow database per chain: each cold keyspace, the hot SQLite file and its live bytes; JSON on stdout"
+        splitSizeFooter
+        $ SplitSize
+            <$> strOption (long "db" <> metavar "DIR" <> help "the database directory (the one that holds pactCold, or its parent); the cold store and the SQLite files are opened read-only: a copy or a snapshot only, never a production node's files. Flush the cold store before: approximateSize and the total count SST files only")
+            <*> option chainsReader (long "chains" <> metavar "0,3,..." <> help "the chains to measure")
+    , cmdF "txlog-digest" "SHA-256 of a chain's txlog per user table and over all tables, through the Pact store of the mode; JSON on stdout"
+        txlogFooter
+        $ TxlogDigestCmd
+            <$> versionOption
+            <*> strOption (long "db" <> metavar "DIR" <> help "the database directory (the one that holds sqlite or sqlite-split, or its parent). Pact opens the SQLite file read-write, the cold store read-only: a copy or a snapshot only, never a production node's files")
+            <*> option chainReader (long "chain" <> metavar "CHAIN")
+            <*> option pactHistoryStoreReader (long "pact-history-store" <> metavar "sqlite|split" <> help "the Pact history store of the database")
+            <*> optional (option (BlockHeight <$> auto) (long "below-height" <> metavar "H" <> help "hash only the rows of the blocks below height H"))
     ]
   where
     cmd name desc p = command name (info p (progDesc desc))
     cmdF name desc foot p = command name (info p (progDesc desc <> footer foot))
+
+    splitSizeFooter = unwords
+        [ "JSON: {totalSstBytes, chains: {CHAIN: {coldKeyspaceBytes: {I, K, M, N, R, T, X},"
+        , "coldKeyspaceDataBytes: {...}, coldBytes, hotFileBytes, hotLiveBytes, hotDiskBytes}}}. File bytes are page_count x page_size, live bytes (page_count - freelist_count) x page_size; disk bytes the main and -wal files. SST metadata is spread over the keyspaces in proportion to their data bytes (coldKeyspaceDataBytes: raw approximateSize)."
+        ]
+
+    txlogFooter = unwords
+        [ "For every user table: txids ascending, within a txid the rows in the order the store returns them;"
+        , "each row hashed as txid (8 bytes BE), length-prefixed row key, length-prefixed row data."
+        , "JSON: {chain, store, belowHeight, endTxId, all, tables: {TABLE: {sha256, txids, rows}}}."
+        , "Two databases with equal digests give the same txlog answer, order included, for every txid."
+        ]
 
     coldFooter = unwords
         [ "Exits non-zero if any cold read differs from SQLite."
@@ -236,6 +270,10 @@ main = do
                     , "pactTotalGB" .= _projPactTotalGB pWhole
                     ]
                 ]
+        SplitSize db cids -> BL.putStr . (<> "\n") . encode =<< measureSplitSize db cids
+        TxlogDigestCmd v db cid mode below -> do
+            let logger = genericLogger Warn (T.hPutStrLn stderr)
+            BL.putStr . (<> "\n") . encode =<< txlogDigest logger v db cid mode below
   where
     readCold f = BL.readFile f >>= \bytes -> case eitherDecode bytes of
         Left e -> fail $ f <> ": " <> e
