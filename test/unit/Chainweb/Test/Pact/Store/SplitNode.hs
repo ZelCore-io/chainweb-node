@@ -97,11 +97,13 @@ tests = testGroup "Split store node"
     , testCase "a failed SQLite statement names SQLite's message, not only the error code" errorDetailTest
     , testCase "test storage: a shadow chain whose split side broke fails the test, with the storage log" shadowBrokenFailsTestTest
     , testCase "test storage: the release closes the storage also when the shadow check fails" releaseAfterFailedCheckTest
+    , testCase "test storage: when the shadow check and the release both fail, the check's error stays, with the release's attached" releaseFailsTooTest
     , testCase "restart with the block header database below the frontier: initializeLatestBlock, exitOnRewindBelowFrontier, the fatal-error handler gets the refusal unwrapped" restartBelowFrontierTest
     , testGroup "W5"
         [ testCase "Pact 5: fork point above the written frontier; /local at every height equals a sqlite-mode twin fed the same blocks" (w5Test W5P5)
         , testCase "Pact 4: same, with intra-block versions (PersistIntraBlockWrites)" (w5Test W5P4)
         , testCase "fork point below the written frontier: RewindBelowFrontier; the node keeps serving its tip" belowFrontierForkTest
+        , testCase "fork point exactly at the written frontier F is a legal reorg; at F-1 it is refused" frontierForkPointTest
         , testCase "split goldens: pact-store-pact4-history, -missing-table-errors, -lookup-txs, -reads reproduce byte for byte (no --accept), depth 1" splitGoldensTest
         , testCase "full-history check: getEarliestBlock is genesis after trimming" fullHistoryTest
         , testCase "shadow mode: a Pact 4 and a Pact 5 run log zero ShadowDifference" shadowW5Test
@@ -419,6 +421,31 @@ releaseAfterFailedCheckTest = do
         Right () -> assertFailure "expected the shadow check to fail the release"
     readIORef closed >>= assertBool "the storage is closed although the check failed"
 
+-- | As 'releaseAfterFailedCheckTest', with a release that fails too (M-5):
+-- the check's error is the one the test sees, and the release's error is
+-- attached to it rather than hiding it.
+releaseFailsTooTest :: Assertion
+releaseFailsTooTest = do
+    (cst, release) <- acquireSplitChainStorageFor (testPactHistoryConfigFor [TestPactShadow])
+        (throwIO (userError "release-side failure")) v cid
+    case _cstStore cst of
+        ChainStoreShadow env -> do
+            let store = chainStorePactStore (_cstSql cst) (_cstStore cst)
+            _psInitSchema store
+            Just cf <- return (_cstFreezer cst)
+            Pact4.exec_ (_cfHot cf) "DROP TABLE BlockHistory"
+            _psCommitBlock store (block 0) >>= either (assertFailure . show) return
+            readIORef (_shBroken env) >>= assertBool "broken"
+        _ -> assertFailure "expected shadow"
+    try release >>= \case
+        Left (e :: IOException) -> do
+            let t = T.pack (displayException e)
+            assertBool ("the release's error attached: " <> T.unpack t) ("release-side failure" `T.isInfixOf` t)
+            let (beforeRelease, _) = T.breakOn "release-side failure" t
+            assertBool ("the check's error comes before the release's: " <> T.unpack t)
+                ("split side of the chain broke" `T.isInfixOf` beforeRelease)
+        Right () -> assertFailure "expected the shadow check to fail the release"
+
 -- -------------------------------------------------------------------------- --
 -- W5 (spec 10.2): the Characterization script on a split store at a small
 -- freeze depth, the freezer drained after every block, with a reorg.
@@ -572,6 +599,29 @@ belowFrontierForkTest = w5With W5P5 (ScriptSplit 3) $ \cp cst -> do
     let next = head (forkFrom tipH)
     C.extend cp (Just tipH) [C.p5Block next [C.tx 10 0 [Put "t1" "a" 30]]]
     _psGetLatestBlock (cpStore cp) >>= (@?= Just (10, view blockHash next))
+
+-- | The boundary of the refusal (M-1): a reorg whose fork point is exactly
+-- the written frontier F keeps all the history it needs in SQLite, so it must
+-- go through; at F-1 it is refused. Catches @<@ turned into @<=@ (a stalled
+-- node) and the reverse.
+frontierForkPointTest :: Assertion
+frontierForkPointTest = w5With W5P5 (ScriptSplit 3) $ \cp cst -> do
+    let mainH = take 10 C.p5Headers
+    forM_ (zip3 (Nothing : (Just <$> init mainH)) mainH (take 10 (C.scenario <> mainExtra))) $ \(p, h, txs) ->
+        C.extend cp p [C.p5Block h txs]
+    Just f <- writtenFrontier cst
+    let fh = fromIntegral (_frHeight f) :: Int
+    assertBool ("frontier strictly between genesis and the tip: " <> show f) (fh >= 1 && fh < 9)
+    view blockHash (mainH !! fh) @?= _frHash f
+    let forkAt k = C.extend cp (Just (mainH !! k)) [C.p5Block (head (forkFrom (mainH !! k))) (head forkTxs)]
+    try (forkAt (fh - 1)) >>= \case
+        Left (RewindBelowFrontier c _ f') -> do
+            c @?= cid
+            f' @?= f
+        Right () -> assertFailure "fork point F-1: expected RewindBelowFrontier"
+    forkAt fh
+    _psGetLatestBlock (cpStore cp)
+        >>= (@?= Just (fromIntegral fh + 1, view blockHash (head (forkFrom (mainH !! fh)))))
 
 -- | The goldens that only read reproduce byte for byte on a split store at
 -- freeze depth 1, so most of their reads cross into the cold store.

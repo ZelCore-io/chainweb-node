@@ -19,7 +19,7 @@ module Chainweb.StorageTools.Test.InProcess
 
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (async, cancel, poll, wait)
-import Control.Exception (bracket, throwIO)
+import Control.Exception (bracket, throwIO, try)
 import Control.Lens (view)
 import Control.Monad
 import Control.Monad.IO.Class (liftIO)
@@ -73,7 +73,9 @@ import Chainweb.Logger
 import Chainweb.Mempool.Consensus (mkMempoolConsensus)
 import Chainweb.Mempool.Mempool (InsertType(..), mempoolInsert)
 import Chainweb.Miner.Pact (Miner(..), MinerId(..), MinerKeys(..))
+import Chainweb.Pact.Backend.Store.Layout (NonSqliteLayout(..), PactLayoutError(..))
 import Chainweb.Pact.Backend.Types (IntraBlockPersistence(..))
+import Chainweb.Test.Utils.Storage (NonSqliteFixture(..), makeNonSqliteFixtures)
 import Chainweb.Pact.Backend.Utils (chainDbFileName, startSqliteDb, stopSqliteDb)
 import Chainweb.Pact.PactService (runPactService)
 import Chainweb.Pact.Service.PactInProcApi (pactMemPoolAccess)
@@ -722,6 +724,22 @@ endToEnd getFx = testGroup "EndToEnd"
 tests :: TestTree
 tests = withResource buildFixture removeFixture $ \getFx -> testGroup "InProcess"
     [ endToEnd getFx
+    , testCase "a split database before its first trim, a trimmed one and a shadow one are refused before anything opens (sqlite-only until P5)" $ do
+        tmp <- getCanonicalTemporaryDirectory
+        base <- createTempDirectory tmp "inprocess-guard"
+        fxs <- makeNonSqliteFixtures base
+        forM_ fxs $ \nfx -> forM_ [_nsfDbDir nfx, _nsfDbDir nfx </> "0"] $ \d ->
+            try (withInProcessSide quietLogger (specFor d) $ \_ -> return ()) >>= \case
+                Left (SqliteOnlyTool tool _ found) -> do
+                    tool @?= "cw-compare (in-process side)"
+                    assertBool (_nsfName nfx <> ": " <> show found) $ case (_nsfName nfx, found) of
+                        ("split-untrimmed", SplitNotTrimmed _) -> True
+                        ("split-trimmed", SplitTrimmed _) -> True
+                        ("shadow", ShadowLayout _) -> True
+                        _ -> False
+                Left e -> assertFailure $ _nsfName nfx <> ": another error: " <> show e
+                Right () -> assertFailure $ _nsfName nfx <> ": not refused"
+        removeDirectoryRecursive base
     , testCase "same DB on both sides: header, payload and /local Same, report Pass" $ do
         fx <- getFx
         a <- copyDb fx "same-a"

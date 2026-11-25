@@ -20,6 +20,8 @@
 -- Diff Pact state between two databases.
 module Chainweb.Pact.Backend.PactState.Diff
   ( main
+  , pactDiff
+  , PactDiffConfig(..)
   )
   where
 
@@ -27,6 +29,7 @@ import Streaming.Prelude qualified as S
 import Chainweb.BlockHeight (BlockHeight)
 import Chainweb.Logger (logFunctionText, logFunctionJson)
 import Chainweb.Pact.Backend.Compaction qualified as C
+import Chainweb.Pact.Backend.Store.Layout (refuseNonSqliteLayout)
 import Chainweb.Pact.Backend.PactState (TableDiffable(..), getLatestPactStateAtDiffable, doesPactDbExist, withChainDb, allChains)
 import Chainweb.Utils (fromText, toText)
 import Chainweb.Version (ChainwebVersion(..), ChainId, chainIdToText)
@@ -71,8 +74,20 @@ instance Monoid IsDifferent where
   mempty = NoDifference
 
 main :: IO ()
-main = do
-  cfg <- execParser opts
+main = pactDiff =<< execParser opts
+  where
+    opts :: ParserInfo PactDiffConfig
+    opts = info (parser <**> helper)
+      (fullDesc <> progDesc "Compare two Pact databases")
+
+-- | The @pact-diff@ tool. It refuses a split or shadow Pact history layout on
+-- either side before it reads anything ('refuseNonSqliteLayout'): otherwise
+-- it would diff trimmed files, or skip every chain of a trimmed directory
+-- whose @sqlite@ is gone, and report no difference.
+pactDiff :: PactDiffConfig -> IO ()
+pactDiff cfg = do
+  refuseNonSqliteLayout "pact-diff" cfg.firstDbDir
+  refuseNonSqliteLayout "pact-diff" cfg.secondDbDir
 
   when (cfg.firstDbDir == cfg.secondDbDir) $ do
     Text.putStrLn "Source and target Pact database directories cannot be the same."
@@ -122,19 +137,15 @@ main = do
       exitFailure
     NoDifference -> do
       Text.putStrLn "Diff complete. No differences found."
+
+parser :: Parser PactDiffConfig
+parser = PactDiffConfig
+  <$> strOption (long "first-database-dir" <> help "First Pact database directory")
+  <*> strOption (long "second-database-dir" <> help "Second Pact database directory")
+  <*> fmap parseChainwebVersion (strOption (long "graph-version" <> help "Chainweb version for graph. Only needed for non-standard graphs." <> value (toText (_versionName mainnet)) <> showDefault))
+  <*> fmap (fromIntegral @Int) (option auto (long "target-blockheight" <> metavar "BLOCKHEIGHT" <> help "Target Blockheight"))
+  <*> strOption (long "log-dir" <> help "Directory where logs will be placed" <> value ".")
   where
-    opts :: ParserInfo PactDiffConfig
-    opts = info (parser <**> helper)
-      (fullDesc <> progDesc "Compare two Pact databases")
-
-    parser :: Parser PactDiffConfig
-    parser = PactDiffConfig
-      <$> strOption (long "first-database-dir" <> help "First Pact database directory")
-      <*> strOption (long "second-database-dir" <> help "Second Pact database directory")
-      <*> fmap parseChainwebVersion (strOption (long "graph-version" <> help "Chainweb version for graph. Only needed for non-standard graphs." <> value (toText (_versionName mainnet)) <> showDefault))
-      <*> fmap (fromIntegral @Int) (option auto (long "target-blockheight" <> metavar "BLOCKHEIGHT" <> help "Target Blockheight"))
-      <*> strOption (long "log-dir" <> help "Directory where logs will be placed" <> value ".")
-
     parseChainwebVersion :: Text -> ChainwebVersion
     parseChainwebVersion = lookupVersionByName . fromMaybe (error "ChainwebVersion parse failed") . fromText
 

@@ -15,6 +15,7 @@ module Main (main) where
 
 import Chainweb.BlockHeight
 
+import Chainweb.Pact.Backend.Store.Layout (refuseNonSqliteLayout)
 import Chainweb.Pact.Backend.Types
 import Chainweb.Pact.Backend.Utils
 import Chainweb.Pact.Types
@@ -71,8 +72,13 @@ type TableContents = B.ByteString
 
 -- this will produce both the raw bytes for all of the tables concatenated
 -- together, and the raw bytes of each individual table (this is over a single chain)
+--
+-- It refuses a file of a split or shadow Pact history layout: a trimmed file
+-- would give the checksum of the trimmed state (sqlite-only until P5).
 work :: Args -> IO (Builder, Map TableName TableContents)
-work args = withSQLiteConnection (_sqliteFile args) chainwebPragmas (runReaderT go)
+work args = do
+    refuseNonSqliteLayout "db-checksum" (_sqliteFile args)
+    withSQLiteConnection (_sqliteFile args) chainwebPragmas (runReaderT go)
   where
     low = _startBlockHeight args
     high = case _endBlockHeight args of

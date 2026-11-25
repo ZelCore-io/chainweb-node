@@ -1,6 +1,7 @@
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TypeApplications #-}
 
@@ -54,6 +55,11 @@ module Chainweb.Pact.Backend.Store.Layout
 , splitMarkerVersion
 , readSplitMarker
 , writeSplitMarker
+
+  -- * Guard of the sqlite-only tools
+, NonSqliteLayout(..)
+, refuseNonSqliteLayout
+, nonSqliteLayoutAt
 
   -- * Errors
 , PactLayoutError(..)
@@ -207,6 +213,12 @@ data PactLayoutError
     | BackupRefused PactHistoryStore
     | UnknownSplitMarker FilePath Text
         -- ^ a marker file that this binary does not understand
+    | SqliteOnlyTool Text FilePath NonSqliteLayout
+        -- ^ a tool that reads the Pact SQLite files directly (compaction,
+        -- @pact-diff@, the grand hash, @db-checksum@, @cw-compare@'s
+        -- in-process side) was handed a split or shadow layout: the tool's
+        -- name, the path it was handed, and the layout found
+        -- ('refuseNonSqliteLayout')
     deriving (Show, Eq)
 
 instance Exception PactLayoutError where
@@ -261,6 +273,22 @@ pactLayoutErrorMessage = \case
         [ "The format marker", p f, "is not one this binary understands (" <> why <> ")."
         , "Run the binary that wrote it, or restore a consistent snapshot."
         ]
+    SqliteOnlyTool tool path found -> T.unwords $
+        [ tool, "refuses", p path <> ":", "it is part of a", nonSqliteLayoutText found <> "."
+        , tool, "reads the Pact SQLite files directly, so it works only on databases of"
+        , "--pact-history-store sqlite until P5 of the storage redesign ports it."
+        , "On a split or shadow layout the SQLite files may be trimmed, and the result would be wrong."
+        ] ++ case found of
+            ShadowLayout root ->
+                [ "In shadow mode", p (root </> sqliteDirName), "is the complete legacy copy:"
+                , "stop the node, copy that directory into a database directory of its own"
+                , "(as <new-db-dir>/0/" <> T.pack sqliteDirName <> "),"
+                , "and run", tool, "on the copy."
+                ]
+            _ ->
+                [ "Run", tool, "on legacy files rebuilt with storage-export,"
+                , "or on a database of a node run with --pact-history-store sqlite."
+                ]
   where
     p = T.pack
 
@@ -317,6 +345,90 @@ readDirState root = do
     sqliteDir = root </> sqliteDirName
     splitDir = root </> splitDirName
     hasMarker d = (/= Nothing) <$> readSplitMarker d
+
+-- -------------------------------------------------------------------------- --
+-- Guard of the sqlite-only tools
+
+-- | A Pact history layout other than that of @--pact-history-store sqlite@,
+-- found on disk by 'nonSqliteLayoutAt'. Each carries the layout root
+-- (@<db-dir>/0@), or the marked directory.
+--
+data NonSqliteLayout
+    = SplitTrimmed FilePath
+        -- ^ @sqlite-split@ without @sqlite@ (state C or D)
+    | SplitRenameInterrupted FilePath
+        -- ^ @sqlite@ with a marker (state B)
+    | SplitNotTrimmed FilePath
+        -- ^ @pactCold@ beside @sqlite@: split mode before its first trim
+    | ShadowLayout FilePath
+        -- ^ @sqlite@ and @sqlite-split@: shadow mode (or one left over by it)
+    | MarkedDir FilePath
+        -- ^ a directory under another name that carries the format marker
+    deriving (Show, Eq)
+
+nonSqliteLayoutText :: NonSqliteLayout -> Text
+nonSqliteLayoutText = \case
+    SplitTrimmed r -> "split Pact history layout, trimmed (" <> T.pack (r </> splitDirName) <> ")"
+    SplitRenameInterrupted r -> "split Pact history layout whose first-trim rename did not finish (format marker in "
+        <> T.pack (r </> sqliteDirName) <> ")"
+    SplitNotTrimmed r -> "split Pact history layout, not trimmed yet (cold store "
+        <> T.pack (r </> coldDirName) <> ")"
+    ShadowLayout r -> "shadow Pact history layout (" <> T.pack (r </> sqliteDirName) <> " and "
+        <> T.pack (r </> splitDirName) <> ")"
+    MarkedDir d -> "split Pact history layout (format marker in " <> T.pack d <> ")"
+
+-- | The layout around a path that a sqlite-only tool was handed: 'Nothing'
+-- for a layout of @--pact-history-store sqlite@ (or no layout at all).
+--
+-- The path may be the layout root @<db-dir>/0@, the directory of the SQLite
+-- files (@<db-dir>/0/sqlite@, as the compaction tool derives it, or
+-- @sqlite-split@), the directory of a node of the tests (which keeps its
+-- SQLite files in the root in sqlite mode), or a SQLite file in one of those.
+-- A directory named @sqlite@ or @sqlite-split@ is inspected through its
+-- parent, so that the @sqlite@ of a split layout that is not trimmed yet, or
+-- of a shadow layout, is not taken for a legacy directory.
+--
+-- Throws 'UnknownSplitMarker' for a marker this binary does not understand.
+--
+nonSqliteLayoutAt :: FilePath -> IO (Maybe NonSqliteLayout)
+nonSqliteLayoutAt path0 = do
+    isFile <- doesFileExist path0
+    let dir = dropTrailingPathSeparator $ if isFile then takeDirectory path0 else path0
+        name = takeFileName dir
+        root
+            | name == sqliteDirName || name == splitDirName = takeDirectory dir
+            | otherwise = dir
+    st <- readDirState root
+    ownMarker <- if name == sqliteDirName || name == splitDirName
+        then return False
+        else (/= Nothing) <$> readSplitMarkerIfDir dir
+    return $ if
+        | _dsSplit st && _dsSqlite st -> Just (ShadowLayout root)
+        | _dsSplit st -> Just (SplitTrimmed root)
+        | _dsSqliteMarker st -> Just (SplitRenameInterrupted root)
+        | _dsCold st -> Just (SplitNotTrimmed root)
+        | ownMarker -> Just (MarkedDir dir)
+        | otherwise -> Nothing
+  where
+    readSplitMarkerIfDir d = doesDirectoryExist d >>= \case
+        True -> readSplitMarker d
+        False -> return Nothing
+
+-- | The guard of the tools that open the Pact SQLite files directly. It
+-- throws 'SqliteOnlyTool' when the path is part of a split or shadow layout
+-- ('nonSqliteLayoutAt'), and returns otherwise without touching anything.
+--
+-- Shadow is refused too, although its @sqlite@ is a complete legacy copy:
+-- the node keeps writing it, and the message points to the copy instead.
+--
+refuseNonSqliteLayout
+    :: Text
+        -- ^ the tool, for the message
+    -> FilePath
+    -> IO ()
+refuseNonSqliteLayout tool path = nonSqliteLayoutAt path >>= \case
+    Nothing -> return ()
+    Just found -> throwIO $ SqliteOnlyTool tool path found
 
 -- | Resolves the layout under @root@ (@<db-dir>/0@) for a mode, following the
 -- table of Task 20. It may finish an interrupted rename (state B in split

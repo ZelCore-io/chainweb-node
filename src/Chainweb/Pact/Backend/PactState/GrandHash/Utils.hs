@@ -34,6 +34,7 @@ import Chainweb.Pact.Backend.PactState (getLatestPactStateAt, getLatestBlockHeig
 import Chainweb.Pact.Backend.PactState.EmbeddedSnapshot (Snapshot(..))
 import Chainweb.Pact.Backend.PactState.GrandHash.Algorithm (computeGrandHash)
 import Chainweb.Pact.Backend.Types
+import Chainweb.Pact.Backend.Store.Layout (refuseNonSqliteLayout)
 import Chainweb.Pact.Backend.Utils (startSqliteDb, stopSqliteDb)
 import Chainweb.Storage.Table.RocksDB (RocksDb)
 import Chainweb.TreeDB (seekAncestor)
@@ -205,6 +206,9 @@ withConnections :: (Logger logger)
   -> (HashMap ChainId SQLiteEnv -> IO x)
   -> IO x
 withConnections logger pactDir cids f = do
+  -- the grand hash of trimmed files would be wrong, and Import writes SQLite
+  -- files: sqlite-only until P5
+  refuseNonSqliteLayout "The grand hash tool" pactDir
   checkPactDbsExist pactDir cids
   bracket openConnections closeConnections f
   where

@@ -1,6 +1,7 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE NumericUnderscores #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications #-}
 
 -- |
@@ -49,6 +50,14 @@
 -- @Pact4.SQLite@, and the compaction and twice-replay cases that open
 -- 'Chainweb.Pact.Backend.Utils.withSqliteDb' directly.
 --
+-- These run their nodes in sqlite mode in every mode ('withSqlitePactStorage',
+-- 'Chainweb.Test.Utils.pinSqliteNodes'), because they compact a node's SQLite
+-- files, and compaction is sqlite-only until P5 (it refuses a split or shadow
+-- layout, 'Chainweb.Pact.Backend.Store.Layout.refuseNonSqliteLayout'):
+-- @txlogsCompactionTest@ (@remote-tests@), and @compactLiveNodeTest@,
+-- @compactAndResumeTest@ and the unregistered @pactImportTest@ of
+-- "Chainweb.Test.MultiNode" (@compaction-tests@).
+--
 module Chainweb.Test.Utils.Storage
 ( TestStorageOption(..)
 , testStorageOptions
@@ -58,7 +67,10 @@ module Chainweb.Test.Utils.Storage
 , testPactHistoryConfig
 , testPactHistoryConfigFor
 , withTestPactStorage
+, withSqlitePactStorage
 , testSplitStorage
+, NonSqliteFixture(..)
+, makeNonSqliteFixtures
 , acquireTestChainStorage
 , acquireSplitChainStorageFor
 , testChainStorageResource
@@ -74,7 +86,9 @@ import Control.Monad (when)
 import Control.Monad.IO.Class (liftIO)
 import Data.IORef
 import Control.Monad.Trans.Resource (ResourceT, allocate)
-import System.Directory (removeDirectoryRecursive)
+import System.Directory (createDirectoryIfMissing, removeDirectoryRecursive)
+import System.IO (hPutStrLn, stderr)
+import System.IO.Error (ioeGetErrorString, ioeSetErrorString)
 import System.FilePath ((</>))
 import System.IO.Temp (createTempDirectory, getCanonicalTemporaryDirectory, withSystemTempDirectory)
 
@@ -98,6 +112,9 @@ import System.LogLevel (LogLevel(..))
 import Chainweb.BlockHeight (BlockHeight(..))
 import Chainweb.Chainweb.Configuration (PayloadCompression(..), payloadCompressionTuning)
 import Chainweb.Pact.Backend.Store.Config
+import Chainweb.Pact.Backend.Store.Layout (coldDirName, splitDirName, sqliteDirName, writeSplitMarker)
+import Chainweb.Pact.Backend.Utils (chainDbFileName)
+import Chainweb.ChainId (unsafeChainId)
 import Chainweb.Payload.PayloadStore
 import Chainweb.Storage.Table.RocksDB.Tuning (RocksDbTuning)
 
@@ -191,6 +208,12 @@ withTestPactStorage v dir k = do
     cfg0 <- testPactHistoryConfig
     withTestPactStorageFor cfg0 v dir k
 
+-- | The Pact history storage of a test node pinned to sqlite mode, whatever
+-- @CHAINWEB_TEST_STORAGE@ says: the SQLite files of chainweb-node 3.2.1
+-- directly in @dir@. For the tests that compact a node's files.
+withSqlitePactStorage :: FilePath -> (PactStorage -> IO a) -> IO a
+withSqlitePactStorage dir k = sqliteOnlyStorage dir >>= k
+
 -- | 'withTestPactStorage' with the given configuration in place of that of
 -- @CHAINWEB_TEST_STORAGE@.
 withTestPactStorageFor :: PactHistoryConfig -> ChainwebVersion -> FilePath -> (PactStorage -> IO a) -> IO a
@@ -246,7 +269,23 @@ acquireSplitChainStorageFor cfg onClosed v cid = do
     (st, release) <- acquireCps (\k -> (withTestPactStorageFor cfg v (dir </> "0") $ \ps ->
             withChainStorage (testStorageLogger logs) ps cid False k) >> onClosed)
         `onException` removeDirectoryRecursive dir
-    return (st, (checkShadowNotBroken logs st `finally` release) `finally` removeDirectoryRecursive dir)
+    return (st, checkThenRelease (checkShadowNotBroken logs st) release `finally` removeDirectoryRecursive dir)
+
+-- | Runs the check, then the release also when the check throws. When both
+-- throw, the check's error is the one rethrown, with the release's error
+-- attached to its text (M-5): an 'IOException' keeps its type, another
+-- exception is rethrown unchanged after the release's error is printed.
+checkThenRelease :: IO () -> IO () -> IO ()
+checkThenRelease check release = try check >>= \case
+    Right () -> release
+    Left (e :: SomeException) -> try release >>= \case
+        Right () -> throwIO e
+        Left (re :: SomeException) -> case fromException e of
+            Just (ioe :: IOException) -> throwIO $ ioeSetErrorString ioe
+                $ ioeGetErrorString ioe <> "\n(the release failed too: " <> displayException re <> ")"
+            Nothing -> do
+                hPutStrLn stderr $ "checkThenRelease: the release failed too: " <> displayException re
+                throwIO e
 
 -- | 'acquireTestChainStorage' as a resource. In sqlite mode the storage is
 -- on the given SQLite resource, as before.
@@ -310,3 +349,50 @@ acquireCps with = do
         Right x -> return (x, putMVar done () >> wait t)
         Left (Left e) -> throwIO e
         Left (Right ()) -> throwIO (userError "acquireCps: the bracket returned without a value")
+
+-- -------------------------------------------------------------------------- --
+-- Layouts for the guard of the sqlite-only tools
+
+-- | A database directory with a split or shadow Pact history layout, for the
+-- tests of 'Chainweb.Pact.Backend.Store.Layout.refuseNonSqliteLayout'.
+data NonSqliteFixture = NonSqliteFixture
+    { _nsfName :: String
+    , _nsfDbDir :: FilePath
+        -- ^ @<db-dir>@: holds @0/rocksDb@ (empty) and the layout under @0@
+    , _nsfSqliteDir :: FilePath
+        -- ^ the directory that holds the SQLite files: @0/sqlite@ or
+        -- @0/sqlite-split@
+    , _nsfFile :: FilePath
+        -- ^ a SQLite file of chain 0 in '_nsfSqliteDir' (empty)
+    }
+
+-- | Under @base@, the three layouts the sqlite-only tools refuse:
+--
+-- * @split-untrimmed@: @0/sqlite@ and @0/pactCold@, split before its first
+--   trim;
+-- * @split-trimmed@: @0/sqlite-split@ with its marker and @0/pactCold@;
+-- * @shadow@: @0/sqlite@ (the legacy copy), @0/sqlite-split@ with its marker
+--   and @0/pactCold@.
+--
+makeNonSqliteFixtures :: FilePath -> IO [NonSqliteFixture]
+makeNonSqliteFixtures base = mapM mk
+    [ ("split-untrimmed", [sqliteDirName], False, sqliteDirName)
+    , ("split-trimmed", [splitDirName], True, splitDirName)
+    , ("shadow", [sqliteDirName, splitDirName], True, splitDirName)
+    ]
+  where
+    mk (name, dirs, marker, filesIn) = do
+        let db = base </> name
+            root = db </> "0"
+        createDirectoryIfMissing True (root </> "rocksDb")
+        createDirectoryIfMissing True (root </> coldDirName)
+        mapM_ (\d -> do
+            createDirectoryIfMissing True (root </> d)
+            writeFile (root </> d </> chainDbFileName (unsafeChainId 0)) "") dirs
+        when marker $ () <$ writeSplitMarker (root </> splitDirName) (unsafeChainId 0) (BlockHeight 1)
+        return NonSqliteFixture
+            { _nsfName = name
+            , _nsfDbDir = db
+            , _nsfSqliteDir = root </> filesIn
+            , _nsfFile = root </> filesIn </> chainDbFileName (unsafeChainId 0)
+            }

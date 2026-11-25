@@ -69,6 +69,7 @@ import qualified Chainweb.Test.Pact.Store.SQLite (tests)
 import qualified Chainweb.Test.Payload.Store (tests)
 import qualified Chainweb.Test.Pact.Store.Config (tests)
 import qualified Chainweb.Test.Pact.Store.Layout (tests)
+import qualified Chainweb.Test.Pact.Store.ToolGuard (tests)
 import qualified Chainweb.Test.Pact4.Checkpointer (tests)
 import qualified Chainweb.Test.Pact4.DbCacheTest (tests)
 import qualified Chainweb.Test.Pact4.GrandHash (tests)
@@ -210,6 +211,7 @@ suite rdb =
         , Chainweb.Test.Version.tests
         , Chainweb.Test.Pact.Store.Config.tests
         , Chainweb.Test.Pact.Store.Layout.tests
+        , Chainweb.Test.Pact.Store.ToolGuard.tests
         , testProperties "Chainweb.Test.Chainweb.Utils.Paging" Chainweb.Test.Chainweb.Utils.Paging.properties
         , testProperties "Chainweb.Test.HostAddress" Chainweb.Test.HostAddress.properties
         , testProperties "Chainweb.Test.Sync.WebBlockHeaderStore" Chainweb.Test.Sync.WebBlockHeaderStore.properties

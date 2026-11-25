@@ -92,7 +92,7 @@ import Chainweb.Chainweb.Configuration
 import Chainweb.Graph
 import Chainweb.Mempool.Mempool
 import Chainweb.Pact.Backend.Compaction qualified as Sigma
-import Chainweb.Pact.Backend.PactState (getLatestBlockHeight)
+import Chainweb.Pact.Backend.PactState (getLatestBlockHeight, withChainDb)
 import Chainweb.Pact.Backend.Utils qualified as Backend
 import Chainweb.Pact.RestAPI.Client
 import Chainweb.Pact.RestAPI.EthSpv
@@ -382,7 +382,8 @@ invalidCommandTest rdb = runResourceT $ do
 --       appear in the `txLogs` anymore, and the two should be equivalent.
 txlogsCompactionTest :: RocksDb -> IO ()
 txlogsCompactionTest rdb = runResourceT $ do
-    nodeDbDirs <- withNodeDbDirs rdb nNodes
+    -- sqlite mode in every mode: compaction is sqlite-only until P5
+    nodeDbDirs <- pinSqliteNodes <$> withNodeDbDirs rdb nNodes
     -- This looks up the pactDbDir for node 0. This is
     -- kind of a hack, because there is only one node in
     -- this test. However, it doesn't matter much, because
@@ -467,8 +468,8 @@ txlogsCompactionTest rdb = runResourceT $ do
     -- phase 2: compact
     targetPactDir <- withPactDir 0
     liftIO $ Sigma.withDefaultLogger Error $ \logger -> do
-      Backend.withSqliteDb cid logger srcPactDir False $ \srcDb -> do
-        Backend.withSqliteDb cid logger targetPactDir False $ \targetDb -> do
+      withChainDb cid logger srcPactDir $ \_ srcDb -> do
+        withChainDb cid logger targetPactDir $ \_ targetDb -> do
           sigmaCompact srcDb targetDb =<< getLatestBlockHeight srcDb
 
     let newNodeDbDirs = (head nodeDbDirs) { nodePactDbDir = targetPactDir } : tail nodeDbDirs

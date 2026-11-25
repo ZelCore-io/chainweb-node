@@ -23,12 +23,14 @@ module Chainweb.Pact.Backend.Compaction
   (
     -- * Compaction executable implementation
     main
+  , compact
 
   -- * Exported for testing
   , doCompactPactState
   , doCompactRocksDb
   , doCompactRocksDbWith
   , Config(..)
+  , ConcurrentChains(..)
   , configParserInfo
   , compactPayloadDbConfig
   , Retainment(..)
@@ -40,6 +42,7 @@ module Chainweb.Pact.Backend.Compaction
   )
   where
 
+import Chainweb.Pact.Backend.Store.Layout (refuseNonSqliteLayout)
 import "base" Control.Exception hiding (Handler)
 import "base" Control.Monad (forM, forM_, unless, void, when)
 import "base" Control.Monad.IO.Class (MonadIO(liftIO))
@@ -374,8 +377,12 @@ doCompactPactState logger rt targetBlockHeight srcDb targetDb = do
 blockHeightKeepDepth :: BlockHeight
 blockHeightKeepDepth = 2_000
 
+-- | The compaction tool. It refuses a source database with a split or shadow
+-- Pact history layout before it reads anything ('refuseNonSqliteLayout'):
+-- compaction is sqlite-only until P5.
 compact :: Config -> IO ()
 compact cfg = do
+  refuseNonSqliteLayout "compact" (pactDir cfg.fromDir)
   let cids = allChains cfg.chainwebVersion
 
   let _compactThese = case (cfg.compactRocksDb, cfg.compactPactState) of

@@ -55,6 +55,7 @@ module Chainweb.Pact.Backend.PactState
 
 import Chainweb.BlockHeight (BlockHeight(..))
 import Chainweb.Logger (Logger, addLabel)
+import Chainweb.Pact.Backend.Store.Layout (refuseNonSqliteLayout)
 import Chainweb.Pact.Backend.Utils (fromUtf8, withSqliteDb)
 import Chainweb.Utils (T2(..), int)
 import Chainweb.Version (ChainId, ChainwebVersion, chainIdToText)
@@ -145,6 +146,10 @@ getEarliestCommonBlockHeight logger path cids = do
 
 -- | Wrapper around 'withSqliteDb' that adds the chainId label to the logger
 --   and sets resetDb to False.
+--
+--   It is the opener of the tools (compaction, @pact-diff@), which read the
+--   SQLite files as legacy files, so it refuses a split or shadow layout
+--   ('refuseNonSqliteLayout') before it opens anything.
 withChainDb :: (Logger logger)
   => ChainId
   -> logger
@@ -154,6 +159,7 @@ withChainDb :: (Logger logger)
 withChainDb cid logger' path f = do
   let logger = addChainIdLabel cid logger'
   let resetDb = False
+  refuseNonSqliteLayout "This Pact database tool" path
   withSqliteDb cid logger path resetDb (f logger)
 
 -- | Get all Pact table names in the database.

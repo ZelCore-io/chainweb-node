@@ -76,6 +76,7 @@ import Chainweb.CutDB
 import Chainweb.Logger
 import Chainweb.Mempool.Consensus (mkMempoolConsensus)
 import Chainweb.Mempool.Mempool (MempoolBackend, noopMempool)
+import Chainweb.Pact.Backend.Store.Layout (refuseNonSqliteLayout)
 import Chainweb.Pact.Backend.Store.Node (sqliteOnlyStorage)
 import Chainweb.Pact.Backend.Store.Config (PactHistoryConfig(..))
 import Chainweb.Pact.Backend.Types (IntraBlockPersistence(..))
@@ -261,6 +262,9 @@ inProcessCutDbParams v = (defaultCutDbParams v (_cutFetchTimeout (_configCuts co
 withInProcessSide :: Logger l => l -> InProcessSpec -> (Side -> IO a) -> IO a
 withInProcessSide logger0 spec act = do
     dir <- resolveDbDir (_ipDbDir spec)
+    -- the in-process side opens <dir>/sqlite as legacy files (sqlite-only
+    -- until P5): refuse a split or shadow layout
+    refuseNonSqliteLayout "cw-compare (in-process side)" dir
     forM_ pactChains $ \cid -> do
         unless (HS.member cid (chainIds v)) $ throwIO $ userError $
             "in-process side: chain " <> T.unpack (toText cid) <> " is not a chain of " <> show (_versionName v)

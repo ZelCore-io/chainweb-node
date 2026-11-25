@@ -659,6 +659,7 @@ test-suite chainweb-tests
         Chainweb.Test.Pact.Store.SQLite
         Chainweb.Test.Pact.Store.Config
         Chainweb.Test.Pact.Store.Layout
+        Chainweb.Test.Pact.Store.ToolGuard
         Chainweb.Test.Pact4.Checkpointer
         Chainweb.Test.Pact4.DbCacheTest
         Chainweb.Test.Pact4.GrandHash

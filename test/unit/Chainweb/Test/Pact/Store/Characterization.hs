@@ -478,7 +478,21 @@ withCpOn ScriptSqlite p v k = withTempSQLiteConnection chainwebPragmas $ \sql ->
     cp <- Checkpointer.initCheckpointerResourcesWith
         defaultModuleCacheLimit sql (_cstStore cst) p quietLogger v cid
     k cp cst
-withCpOn s p v k = withSystemTempDirectory "pact-script" $ \tmp ->
+withCpOn (ScriptSplit d) p v k = withCpOnLayout HistorySplit d quietLogger p v k
+withCpOn (ScriptShadow d l) p v k = withCpOnLayout HistoryShadow d l p v k
+
+-- | 'withCpOn' on a split or shadow layout: the mode, the freeze depth and
+-- the storage logger are explicit arguments, so the match on the script
+-- storage stays total (M-6).
+withCpOnLayout
+    :: PactHistoryStore
+    -> BlockHeight
+    -> GenericLogger
+    -> IntraBlockPersistence
+    -> ChainwebVersion
+    -> (Checkpointer GenericLogger -> ChainStorage -> IO a)
+    -> IO a
+withCpOnLayout mode depth logger p v k = withSystemTempDirectory "pact-script" $ \tmp ->
     withPactStorage quietLogger v cfg (tmp </> "0") False $ \st ->
         withChainStorage logger st cid False $ \cst -> do
             lock <- newMVar ()
@@ -493,9 +507,6 @@ withCpOn s p v k = withSystemTempDirectory "pact-script" $ \tmp ->
                         return r
                 k cp0 { cpStore = store { _psWithBatch = drained } } cst
   where
-    (mode, depth, logger) = case s of
-        ScriptSplit d -> (HistorySplit, d, quietLogger)
-        ScriptShadow d l -> (HistoryShadow, d, l)
     cfg = defaultPactHistoryConfig
         { _phStore = mode
         , _phFreezeDepth = depth

@@ -136,6 +136,7 @@ module Chainweb.Test.Utils
 , withNodeDbDirs
 , withPactDir
 , NodeDbDirs(..)
+, pinSqliteNodes
 , withTempDir
 ) where
 
@@ -232,7 +233,7 @@ import Chainweb.Test.Pact5.Utils (getTestLogLevel)
 import Chainweb.Test.P2P.Peer.BootstrapConfig
     (testBootstrapCertificate, testBootstrapKey, testBootstrapPeerConfig)
 import Chainweb.Test.Utils.BlockHeader
-import Chainweb.Test.Utils.Storage (testPayloadDbConfig, testStorageTuning, withTestPactStorage)
+import Chainweb.Test.Utils.Storage (testPayloadDbConfig, testStorageTuning, withSqlitePactStorage, withTestPactStorage)
 import Chainweb.Time
 import Chainweb.TreeDB
 import Chainweb.Utils
@@ -1075,7 +1076,7 @@ runTestNodes logger ver confChange portMVar nodesDbDirs = do
             , _nowServingServiceAPI = False
             }
         _ <- withAsyncR
-            (node nodeRocksDb logger nowServingRef portMVar conf nodePactDbDir nodeBackupsDbDir nid)
+            (node nodeRocksDb logger nowServingRef portMVar conf nodePactDbDir nodeSqliteOnly nodeBackupsDbDir nid)
         liftIO $ atomically $ do
             nowServing <- readTVar nowServingRef
             guard $ nowServing ==
@@ -1090,13 +1091,15 @@ node
     -> ChainwebConfiguration
     -> FilePath
        -- ^ pact db dir
+    -> Bool
+       -- ^ sqlite mode whatever @CHAINWEB_TEST_STORAGE@ says
     -> FilePath
        -- ^ dir for db backups
     -> Word
         -- ^ Unique Node Id. The node id 0 is used for the bootstrap node
     -> IO ()
-node rdb rawLogger nowServingRef peerInfoVar conf pactDbDir backupDir nid = do
-    withTestPactStorage (_configChainwebVersion conf) pactDbDir $ \pactStorage ->
+node rdb rawLogger nowServingRef peerInfoVar conf pactDbDir sqliteOnly backupDir nid = do
+    storage pactDbDir $ \pactStorage ->
      withChainweb conf logger rdb pactStorage backupDir False $ \case
         StartedChainweb cw -> do
             -- If this is the bootstrap node we extract the port number and publish via an MVar.
@@ -1114,6 +1117,10 @@ node rdb rawLogger nowServingRef peerInfoVar conf pactDbDir backupDir nid = do
   where
     logger = addLabel ("node", sshow nid) rawLogger
 
+    storage
+        | sqliteOnly = withSqlitePactStorage
+        | otherwise = withTestPactStorage (_configChainwebVersion conf)
+
     poisonDeadBeef cw = mapM_ poison crs
       where
         crs = map snd $ HashMap.toList $ view chainwebChains cw
@@ -1123,7 +1130,16 @@ data NodeDbDirs = NodeDbDirs
     { nodePactDbDir :: FilePath
     , nodeBackupsDbDir :: FilePath
     , nodeRocksDb :: RocksDb
+    , nodeSqliteOnly :: Bool
+        -- ^ run the node in sqlite mode whatever @CHAINWEB_TEST_STORAGE@
+        -- says ('pinSqliteNodes')
     }
+
+-- | Runs the nodes in sqlite mode whatever @CHAINWEB_TEST_STORAGE@ says: for
+-- the tests that compact a node's SQLite files, which is sqlite-only until P5
+-- (see "Chainweb.Test.Utils.Storage").
+pinSqliteNodes :: [NodeDbDirs] -> [NodeDbDirs]
+pinSqliteNodes = map (\d -> d { nodeSqliteOnly = True })
 
 withPactDir :: Word -> ResourceT IO FilePath
 withPactDir nid = withTempDir $ "pactdb-dir-" ++ show nid
@@ -1142,6 +1158,7 @@ withNodeDbDirs rdb n = do
     nodePactDbDir <- withTempDir ("pactdb-dir-" ++ show nid)
     nodeBackupsDbDir <- withTempDir ("backups-dir-" ++ show nid)
     nodeRocksDb <- withTestRocksDb (sshow nid) rdb
+    let nodeSqliteOnly = False
     pure NodeDbDirs { .. }
 
 deadbeef :: TransactionHash

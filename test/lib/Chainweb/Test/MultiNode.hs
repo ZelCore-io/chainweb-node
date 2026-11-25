@@ -104,19 +104,18 @@ import Chainweb.Chainweb.CutResources
 import Chainweb.Chainweb.PeerResources
 import Chainweb.ForkState
 import Chainweb.Pact.Backend.Compaction qualified as Sigma
-import Chainweb.Pact.Backend.Utils (withSqliteDb)
 import Chainweb.Cut
 import Chainweb.CutDB
 import Chainweb.Graph
 import Chainweb.Logger
 import Chainweb.Miner.Config
 import Chainweb.Miner.Pact
-import Chainweb.Pact.Backend.PactState (allChains, getLatestBlockHeight, getLatestPactStateAtDiffable, TableDiffable(..), addChainIdLabel)
+import Chainweb.Pact.Backend.PactState (allChains, getLatestBlockHeight, withChainDb, getLatestPactStateAtDiffable, TableDiffable(..), addChainIdLabel)
 import Chainweb.Pact.Backend.PactState.GrandHash.Algorithm (ChainGrandHash(..))
 import Chainweb.Pact.Backend.PactState.GrandHash.Calc qualified as GrandHash.Calc
 import Chainweb.Pact.Backend.PactState.GrandHash.Import qualified as GrandHash.Import
 import Chainweb.Pact.Backend.PactState.GrandHash.Utils qualified as GrandHash.Utils
-import Chainweb.Test.Utils.Storage (withTestPactStorage)
+import Chainweb.Test.Utils.Storage (withSqlitePactStorage, withTestPactStorage)
 import Chainweb.Test.P2P.Peer.BootstrapConfig
 import Chainweb.Test.Pact4.Utils (sigmaCompact)
 import Chainweb.Test.TestVersions
@@ -255,7 +254,9 @@ harvestConsensusState logger stateVar nid (StartedChainweb cw) = do
         logFunctionText logger Info "shutdown node"
 
 multiNode
-    :: LogLevel
+    :: Bool
+        -- ^ sqlite mode whatever @CHAINWEB_TEST_STORAGE@ says
+    -> LogLevel
     -> (T.Text -> IO ())
     -> MVar PeerInfo
     -> ChainwebConfiguration
@@ -265,9 +266,9 @@ multiNode
         -- ^ Unique node id. Node id 0 is used for the bootstrap node
     -> (forall logger. NodeId -> StartedChainweb logger -> IO ())
     -> IO ()
-multiNode loglevel write bootstrapPeerInfoVar conf rdb pactDbDir nid inner = do
+multiNode sqliteOnly loglevel write bootstrapPeerInfoVar conf rdb pactDbDir nid inner = do
     withSystemTempDirectory "multiNode-backup-dir" $ \backupTmpDir ->
-            withTestPactStorage (_configChainwebVersion conf) (pactDbDir </> show nid) $ \pactStorage ->
+            storage (pactDbDir </> show nid) $ \pactStorage ->
              withChainweb conf logger namespacedNodeRocksDb pactStorage backupTmpDir False $ \cw -> do
                 case cw of
                     StartedChainweb cw' ->
@@ -278,6 +279,10 @@ multiNode loglevel write bootstrapPeerInfoVar conf rdb pactDbDir nid inner = do
   where
     logger :: GenericLogger
     logger = addLabel ("node", toText nid) $ genericLogger loglevel write
+
+    storage
+        | sqliteOnly = withSqlitePactStorage
+        | otherwise = withTestPactStorage (_configChainwebVersion conf)
 
     namespacedNodeRocksDb = rdb { _rocksDbNamespace = T.encodeUtf8 $ toText nid }
 
@@ -294,7 +299,23 @@ runNodes
     -> FilePath
     -> (forall logger. NodeId -> StartedChainweb logger -> IO ())
     -> IO ()
-runNodes loglevel write v confBuilders rdb pactDbDir inner = do
+runNodes = runNodesWith False
+
+-- | 'runNodes', in sqlite mode whatever @CHAINWEB_TEST_STORAGE@ says when the
+-- first argument is 'True': for the tests that compact the nodes' SQLite
+-- files, which is sqlite-only until P5 (see "Chainweb.Test.Utils.Storage").
+runNodesWith
+    :: Bool
+    -> LogLevel
+    -> (T.Text -> IO ())
+    -> ChainwebVersion
+    -> [ChainwebConfiguration -> ChainwebConfiguration]
+        -- ^ number of nodes
+    -> RocksDb
+    -> FilePath
+    -> (forall logger. NodeId -> StartedChainweb logger -> IO ())
+    -> IO ()
+runNodesWith sqliteOnly loglevel write v confBuilders rdb pactDbDir inner = do
     -- NOTE: pact is enabled until we have a good way to disable it globally in
     -- "Chainweb.Chainweb".
     --
@@ -317,7 +338,7 @@ runNodes loglevel write v confBuilders rdb pactDbDir inner = do
             | otherwise ->
                 setBootstrapPeerInfo <$> readMVar bootstrapPortVar <*> pure baseConf
 
-        multiNode loglevel write bootstrapPortVar (confBuilder conf) rdb pactDbDir (NodeId i) inner
+        multiNode sqliteOnly loglevel write bootstrapPortVar (confBuilder conf) rdb pactDbDir (NodeId i) inner
 
 runNodesForSeconds
     :: LogLevel
@@ -332,9 +353,23 @@ runNodesForSeconds
     -> FilePath
     -> (forall logger. NodeId -> StartedChainweb logger -> IO ())
     -> IO ()
-runNodesForSeconds loglevel write v confBuilders (Seconds seconds) rdb pactDbDir inner = do
+runNodesForSeconds = runNodesForSecondsWith False
+
+-- | 'runNodesForSeconds' with the sqlite pin of 'runNodesWith'.
+runNodesForSecondsWith
+    :: Bool
+    -> LogLevel
+    -> (T.Text -> IO ())
+    -> ChainwebVersion
+    -> [ChainwebConfiguration -> ChainwebConfiguration]
+    -> Seconds
+    -> RocksDb
+    -> FilePath
+    -> (forall logger. NodeId -> StartedChainweb logger -> IO ())
+    -> IO ()
+runNodesForSecondsWith sqliteOnly loglevel write v confBuilders (Seconds seconds) rdb pactDbDir inner = do
     void $ timeout (int seconds * 1_000_000)
-        $ runNodes loglevel write v confBuilders rdb pactDbDir inner
+        $ runNodesWith sqliteOnly loglevel write v confBuilders rdb pactDbDir inner
 
 -- | Ensure that we can compact a live node(s).
 --
@@ -369,7 +404,7 @@ compactLiveNodeTest logLevel v n rocksDb srcPactDir targetPactDir step = do
   let ct :: NodeId -> StartedChainweb logger -> IO ()
       ct = harvestConsensusState logger stateVar
   do
-    runNodesForSeconds logLevel logFun v (replicate n $ multiConfig n) 10 rocksDb srcPactDir ct
+    runNodesForSecondsWith True logLevel logFun v (replicate n $ multiConfig n) 10 rocksDb srcPactDir ct
     Just stats1 <- consensusStateSummary <$> swapMVar stateVar (emptyConsensusState v)
     assertGe "average block count before proceeding" (Actual $ _statBlockCount stats1) (Expected 50)
     logFun $ sshow stats1
@@ -383,8 +418,8 @@ compactLiveNodeTest logLevel v n rocksDb srcPactDir targetPactDir step = do
             createDirectoryIfMissing False (targetPactDir </> show nid)
             forM_ (allChains v) $ \cid -> do
               let logger' = addLabel ("nodeId", sshow nid) $ addLabel ("chainId", chainIdToText cid) lgr
-              withSqliteDb cid logger' (srcPactDir </> show nid) False $ \srcDb -> do
-                withSqliteDb cid logger' (targetPactDir </> show nid) False $ \targetDb -> do
+              withChainDb cid logger' (srcPactDir </> show nid) $ \_ srcDb -> do
+                withChainDb cid logger' (targetPactDir </> show nid) $ \_ targetDb -> do
                   sigmaCompact srcDb targetDb (BlockHeight 25)
 
   let run = Chronos.stopwatch_ $ do
@@ -392,7 +427,7 @@ compactLiveNodeTest logLevel v n rocksDb srcPactDir targetPactDir step = do
         -- compacted state (see that we are using 'srcPactDir' here). This is
         -- because we are only trying to see that compacting a node as it is,
         -- does not disrupt it.
-        runNodesForSeconds logLevel logFun v (replicate n $ multiConfig n) 60 rocksDb srcPactDir ct
+        runNodesForSecondsWith True logLevel logFun v (replicate n $ multiConfig n) 60 rocksDb srcPactDir ct
         Just stats2 <- consensusStateSummary <$> swapMVar stateVar (emptyConsensusState v)
         assertGe "average block count before proceeding" (Actual $ _statBlockCount stats2) (Expected 100)
         logFun $ sshow stats2
@@ -440,7 +475,7 @@ pactImportTest logLevel v n rocksDb pactDir step = do
   stateVar <- newMVar (emptyConsensusState v)
   let ct :: NodeId -> StartedChainweb logger -> IO ()
       ct = harvestConsensusState logger stateVar
-  runNodesForSeconds logLevel logFun v (replicate n $ multiConfig n) 10 rocksDb pactDir ct
+  runNodesForSecondsWith True logLevel logFun v (replicate n $ multiConfig n) 10 rocksDb pactDir ct
   consensusState <- swapMVar stateVar (emptyConsensusState v)
   Just stats1 <- pure $ consensusStateSummary consensusState
   assertGe "average block count before proceeding" (Actual $ _statBlockCount stats1) (Expected 50)
@@ -556,7 +591,7 @@ compactAndResumeTest logLevel v n srcRocksDb targetRocksDb srcPactDir targetPact
     stateVar <- newMVar (emptyConsensusState v)
     let ct :: NodeId -> StartedChainweb logger -> IO ()
         ct = harvestConsensusState logger stateVar
-    runNodesForSeconds logLevel logFun v (replicate n $ multiConfig n) 10 srcRocksDb srcPactDir ct
+    runNodesForSecondsWith True logLevel logFun v (replicate n $ multiConfig n) 10 srcRocksDb srcPactDir ct
     Just stats1 <- consensusStateSummary <$> swapMVar stateVar (emptyConsensusState v)
     assertGe "average block count before compaction" (Actual $ _statBlockCount stats1) (Expected 50)
     logFun $ sshow stats1
@@ -567,8 +602,8 @@ compactAndResumeTest logLevel v n srcRocksDb targetRocksDb srcPactDir targetPact
     forM_ [0 .. int @_ @Word n - 1] $ \nid -> do
       forM_ (allChains v) $ \cid -> do
         let logger' = addLabel ("nodeId", sshow nid) $ addLabel ("chainId", chainIdToText cid) logger
-        withSqliteDb cid logger' (srcPactDir </> show nid) False $ \srcDb -> do
-          withSqliteDb cid logger' (targetPactDir </> show nid) False $ \targetDb -> do
+        withChainDb cid logger' (srcPactDir </> show nid) $ \_ srcDb -> do
+          withChainDb cid logger' (targetPactDir </> show nid) $ \_ targetDb -> do
             sigmaCompact srcDb targetDb (BlockHeight 25)
 
     logFun "phase 2.2...compacting RocksDB"
@@ -578,7 +613,7 @@ compactAndResumeTest logLevel v n srcRocksDb targetRocksDb srcPactDir targetPact
       Sigma.doCompactRocksDb (addLabel ("nodeId", sshow nid) logger) v (allChains v) 25 srcRdb tgtRdb
 
     logFun "phase 3... restarting nodes and ensuring progress"
-    runNodesForSeconds logLevel logFun v
+    runNodesForSecondsWith True logLevel logFun v
         (replicate n $
             multiConfig n
                 & mapped . configFullHistoricPactState .~ False)
