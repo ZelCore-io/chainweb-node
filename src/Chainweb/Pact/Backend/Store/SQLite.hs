@@ -27,6 +27,7 @@ module Chainweb.Pact.Backend.Store.SQLite
     , sqliteMutatedTables
     , sqliteMutatedTablesBetween
     , sqliteBlockRows
+, sqliteBaseRowsPage
     , sqliteKeyRowCount
     , TrimRule(..)
     , sqliteTrimChunk
@@ -46,6 +47,7 @@ module Chainweb.Pact.Backend.Store.SQLite
     , sqliteHasBlockHistory
     ) where
 
+import Data.Int (Int64)
 import Control.Exception (IOException, SomeAsyncException, evaluate)
 import Control.Lens (over, view, _Left)
 import Control.Monad
@@ -911,6 +913,24 @@ sqliteBlockRows db t from to = do
         [Pact4.RInt, Pact4.RText, Pact4.RInt, Pact4.RBlob]
     forM rows $ \case
         [_, Pact4.SText (Utf8 k), Pact4.SInt x, Pact4.SBlob v] -> return (StepRow k (fromIntegral x) v)
+        r -> internalError $ "freezer: bad row of " <> t <> ": " <> sshow r
+
+-- | A page of the base read of the freezer's first step: at most @n@ rows of
+-- a table with @txid < to@ after the position @(txid, rowid)@ (from the
+-- start for 'Nothing'), in @(txid, rowid)@ order, each with its rowid. The
+-- rows of one txid keep rowid order, as in 'sqliteBlockRows'.
+sqliteBaseRowsPage :: SQLiteEnv -> Text -> TxId -> Maybe (TxId, Int64) -> Int -> IO [(Int64, StepRow)]
+sqliteBaseRowsPage db t to after n = do
+    let (cond, ps) = case after of
+            Nothing -> ("", [])
+            Just (x, r) -> (" AND (txid, rowid) > (?, ?)", [txIdParam x, Pact4.SInt r])
+    rows <- freezerQry db
+        ("SELECT rowid, rowkey, txid, rowdata FROM " <> tbl (toUtf8 t) <> " WHERE txid < ?" <> cond
+            <> " ORDER BY txid, rowid LIMIT ?")
+        ([txIdParam to] ++ ps ++ [Pact4.SInt (fromIntegral n)])
+        [Pact4.RInt, Pact4.RText, Pact4.RInt, Pact4.RBlob]
+    forM rows $ \case
+        [Pact4.SInt i, Pact4.SText (Utf8 k), Pact4.SInt x, Pact4.SBlob v] -> return (i, StepRow k (fromIntegral x) v)
         r -> internalError $ "freezer: bad row of " <> t <> ": " <> sshow r
 
 -- | The number of rows of a key with @from <= txid < to@.

@@ -74,6 +74,7 @@ import Control.Concurrent.QSem
 import Control.Concurrent.STM
 import Control.Exception
 import Control.Monad
+import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Except
 
@@ -127,10 +128,13 @@ data FreezerHooks = FreezerHooks
     , _fhAfterVerify :: !(IO ())
     , _fhAfterPublish :: !(IO ())
     , _fhAfterTrimChunk :: !(IO ())
+    , _fhAfterBaseChunk :: !(Text -> Int -> Int -> IO ())
+        -- ^ after each chunk of the first step's base is written, before it
+        -- is verified: the table, its rows and its bytes ('rowBytes')
     }
 
 noHooks :: FreezerHooks
-noHooks = FreezerHooks (return ()) (return ()) (return ()) (return ()) (return ())
+noHooks = FreezerHooks (return ()) (return ()) (return ()) (return ()) (return ()) (\_ _ _ -> return ())
 
 -- | What the freezer of a chain has done since it started. 'runFreezer'
 -- logs it as JSON ('freezerStatsJson') every 10 minutes and when it stops.
@@ -338,11 +342,9 @@ planStep env db = sqliteTip db >>= \case
             then return Nothing
             else do
                 let to = min (vh + stepHeights) (t - depth)
+                -- not empty: @first <= to@ by the guard, and @first@ is a
+                -- block of BlockHistory
                 blocks <- sqliteBlocks db (_frHeight <$> ver) (fromIntegral to)
-                when (null blocks) $ logg env Warn $
-                    "planned a step to height " <> T.pack (show to) <> " but BlockHistory has no block in it, although the tip "
-                    <> T.pack (show tip) <> " is more than the freeze depth above the frontier "
-                    <> T.pack (show (_frHeight <$> ver)) <> "; the freezer makes no progress"
                 return $ if null blocks then Nothing else Just (StepPlan blocks)
 
 -- | Reads a step (spec 6.2 step 1) in one read transaction, block by block:
@@ -351,22 +353,38 @@ planStep env db = sqliteTip db >>= \case
 -- block at which it reaches '_phFreezeStepBytes'; a single block larger than
 -- that is a step of its own.
 --
+-- The first step (no written frontier) starts with the base: the rows below
+-- the end of the first block of every table of the schema ('forBaseChunks'),
+-- which count towards the cap like a first block. 'readStep' holds the whole
+-- step, base included, in memory: it is for tests. The freezer writes the
+-- base chunk by chunk ('freezeOnce').
+--
 readStep :: FreezerEnv -> SQLiteEnv -> StepPlan -> IO ColdStep
 readStep env db (StepPlan blocks) = do
     start <- frontierTxId <$> _ccWritten (_feCold env)
-    readBlocks db start (Just (_phFreezeStepBytes (_feConfig env))) blocks
+    let cap = _phFreezeStepBytes (_feConfig env)
+    case blocks of
+        (h1, hash1, end1) : rest | start == 0 -> sqliteReadTransaction db $ do
+            ref <- newIORef []
+            forBaseChunks db cap h1 end1 $ \c -> modifyIORef' ref (c :)
+            chunks <- reverse <$> readIORef ref
+            let base = foldl (\acc c -> mergeTables acc [(_bkTable c, _bkRows c)]) [] chunks
+                bytes = sum [ rowBytes r | c <- chunks, r <- _bkRows c ]
+            tl <- readTail db (Frontier h1 hash1 end1) bytes (Just cap) rest
+            return tl { _stpTables = mergeTables base (_stpTables tl) }
+        _ -> sqliteReadTransaction db $ readBlocksIn db start 0 (Just cap) blocks
 
--- | The tables the first step (no frontier yet, txids from 0) reads and
--- trims besides those of @VersionedTableMutation@: every Pact table of the
--- SQLite schema at that moment ('sqliteSchemaTables'). A history that does
--- not start at genesis (a compacted database) holds rows below its first
--- block that no @VersionedTableMutation@ row of a planned height names, and
--- the compaction may keep no @VersionedTableCreation@ row for their table.
--- The first step's txid range starts at 0, so it covers those rows; a table
--- first changed after the first step would otherwise join the cold catalog
--- in a later step whose range misses them, and reads below F would go to
--- cold and miss them. On a history from genesis this adds nothing: every
--- genesis row is named.
+-- | The tables the first step's base reads ('forBaseChunks') and trims
+-- besides those of @VersionedTableMutation@: every Pact table of the SQLite
+-- schema at that moment ('sqliteSchemaTables'). A history that does not
+-- start at genesis (a compacted database) holds rows below its first block
+-- that no @VersionedTableMutation@ row of a planned height names, and the
+-- compaction may keep no @VersionedTableCreation@ row for their table. The
+-- base covers the txids below the end of the first block, so it covers those
+-- rows; a table first changed after the first step would otherwise join the
+-- cold catalog in a later step whose range misses them, and reads below F
+-- would go to cold and miss them. On a history from genesis this adds
+-- nothing: every genesis row is named.
 firstStepTables :: SQLiteEnv -> IO [Text]
 firstStepTables = sqliteSchemaTables
 
@@ -374,17 +392,94 @@ firstStepTables = sqliteSchemaTables
 rowBytes :: StepRow -> Int
 rowBytes r = B.length (_srRowKey r) + B.length (_srRowData r) + 8
 
-readBlocks :: SQLiteEnv -> TxId -> Maybe Int -> [(BlockHeight, BlockHash, TxId)] -> IO ColdStep
-readBlocks _ _ _ [] = throwIO $ ColdStoreException "Chainweb.Pact.Backend.Store.Freezer: a step without blocks"
-readBlocks db start0 cap blocks0 = sqliteReadTransaction db $ go start0 0 HM.empty [] blocks0
+-- | A chunk of the first step's base: the rows of one table with
+-- @_bkFrom <= txid < _bkTo@, in @(txid, rowid)@ order. A chunk holds whole
+-- txids, so a user table's @T@ list of a txid is written in one batch.
+data BaseChunk = BaseChunk
+    { _bkTable :: !Text
+    , _bkFrom :: !TxId
+    , _bkTo :: !TxId
+    , _bkRows :: ![StepRow]
+    }
+
+-- | The rows of a page of the base read.
+basePageRows :: Int
+basePageRows = 1024
+
+-- | Streams the base of the first step (spec 6.2 step 1 on a history that
+-- does not start at genesis, I4): for each table of the schema and of
+-- @VersionedTableMutation@ at the first block that 'frozenTable' admits, the
+-- rows with @txid < end@ (the end txid of the first block), in pages, cut
+-- into chunks of about @cap@ bytes. A chunk ends at the first txid boundary
+-- at or after the cap, so it holds less than @cap@ plus the rows of one
+-- txid. The memory is a chunk and a page, whatever the size of the base.
+--
+-- The chunks of a table cover @[0, end)@ without gaps; a table without rows
+-- below @end@ gives none. Runs inside the caller's read transaction.
+--
+forBaseChunks :: MonadIO m => SQLiteEnv -> Int -> BlockHeight -> TxId -> (BaseChunk -> m ()) -> m ()
+forBaseChunks db cap h1 end k = do
+    tables <- liftIO $ do
+        mutated <- sqliteMutatedTables db h1
+        schema <- firstStepTables db
+        return (dedupTables (filter frozenTable (mutated ++ schema)))
+    forM_ tables $ \t -> table t Nothing 0 0 []
+  where
+    -- after: the page position; lo: the start of the chunk; n: its bytes;
+    -- acc: its rows, reversed
+    table t after lo !n acc = do
+        page <- liftIO $ sqliteBaseRowsPage db t end after basePageRows
+        (lo', n', acc') <- foldM (add t) (lo, n, acc) (snd <$> page)
+        case page of
+            _ | length page < basePageRows ->
+                unless (null acc') $ k (BaseChunk t lo' end (reverse acc'))
+            _ -> let (i, r) = last page in table t (Just (_srTxId r, i)) lo' n' acc'
+    add t (lo, n, acc) r = case acc of
+        p : _ | n >= cap && _srTxId r /= _srTxId p -> do
+            k (BaseChunk t lo (_srTxId r) (reverse acc))
+            return (_srTxId r, rowBytes r, [r])
+        _ -> return (lo, n + rowBytes r, r : acc)
+
+-- | The tables in first-seen order, each once by its folded name.
+dedupTables :: [Text] -> [Text]
+dedupTables = go' S.empty
+  where
+    go' _ [] = []
+    go' seen (t : ts)
+        | S.member (foldTableName t) seen = go' seen ts
+        | otherwise = t : go' (S.insert (foldTableName t) seen) ts
+
+-- | Appends the rows of the second list to the first, table by table (folded
+-- names); new tables go at the end.
+mergeTables :: [(Text, [StepRow])] -> [(Text, [StepRow])] -> [(Text, [StepRow])]
+mergeTables = foldl add
+  where
+    add acc (t, rows)
+        | any ((== foldTableName t) . foldTableName . fst) acc =
+            [ if foldTableName n == foldTableName t then (n, old ++ rows) else (n, old) | (n, old) <- acc ]
+        | otherwise = acc ++ [(t, rows)]
+
+-- | The blocks of the first step after its base: the step ends at the first
+-- block when there are no more blocks or the base reached the cap.
+readTail :: SQLiteEnv -> Frontier -> Int -> Maybe Int -> [(BlockHeight, BlockHash, TxId)] -> IO ColdStep
+readTail db first bytes cap rest
+    | null rest || maybe False (bytes >=) cap = return (ColdStep first [])
+    | otherwise = readBlocksIn db (_frEndTxId first) bytes cap rest
+
+-- | The blocks of a step from @start@, inside the caller's read transaction,
+-- with @bytes0@ bytes already in the step. The tables of each block are those
+-- of @VersionedTableMutation@ at its height (the base of the first step is
+-- read by 'forBaseChunks').
+readBlocksIn :: SQLiteEnv -> TxId -> Int -> Maybe Int -> [(BlockHeight, BlockHash, TxId)] -> IO ColdStep
+readBlocksIn _ _ _ _ [] = throwIO $ ColdStoreException "Chainweb.Pact.Backend.Store.Freezer: a step without blocks"
+readBlocksIn db start0 bytes0 cap blocks0 = go start0 bytes0 HM.empty [] blocks0
   where
     -- acc: folded name to (name as first seen, rows in reverse); order: the
     -- folded names in first-seen order, reversed
-    go _ _ _ _ [] = error "readBlocks: impossible"
+    go _ _ _ _ [] = error "readBlocksIn: impossible"
     go start !bytes acc order ((h, hash, end) : rest) = do
         mutated <- sqliteMutatedTables db h
-        base <- if start == 0 then firstStepTables db else return []
-        let tables = dedup (filter frozenTable (mutated ++ base))
+        let tables = dedupTables (filter frozenTable mutated)
         (acc', order', bytes') <- foldM (\(a, o, n) t -> do
             rows <- sqliteBlockRows db t start end
             let k = foldTableName t
@@ -405,13 +500,6 @@ readBlocks db start0 cap blocks0 = sqliteReadTransaction db $ go start0 0 HM.emp
                 ]
             }
         else go end bytes' acc' order' rest
-
-    dedup = go' S.empty
-      where
-        go' _ [] = []
-        go' seen (t : ts)
-            | S.member (foldTableName t) seen = go' seen ts
-            | otherwise = t : go' (S.insert (foldTableName t) seen) ts
 
 -- -------------------------------------------------------------------------- --
 -- Verify
@@ -438,33 +526,44 @@ data VerifyFailure = VerifyFailure
 verifyStep :: FreezerEnv -> SQLiteEnv -> ColdStep -> IO (Either VerifyFailure ())
 verifyStep env db (ColdStep to tables) = do
     lo <- frontierTxId <$> _ccVerified (_feCold env)
-    let hi = _frEndTxId to
-        fv = _ccFreezerView (_feCold env)
-        ps = sqlitePactStore db
-    runExceptT $ forM_ tables $ \(t, rows) -> do
-        forM_ rows $ \r -> do
-            v <- lift $ _fvRowAt fv t (_srRowKey r) (_srTxId r)
-            case v of
-                Just d | d == _srRowData r -> return ()
-                Just _ -> throwE $ VerifyFailure t (Just (_srTxId r)) $
-                    "the R entry of key " <> showKey (_srRowKey r) <> " differs from SQLite's row"
-                Nothing -> throwE $ VerifyFailure t (Just (_srTxId r)) $
-                    "no R entry for key " <> showKey (_srRowKey r)
-        unless (isSysTable t) $ forM_ (distinct (_srTxId <$> rows)) $ \x -> do
-            c <- lift $ _fvRowsAtTxId fv t x
-            s <- lift $ _psRowsAtTxId ps t x
-            case s of
-                Left e -> throwE $ VerifyFailure t (Just x) $ "SQLite rowsAtTxId failed: " <> T.pack (show e)
-                Right sr -> unless (c == Just sr) $ throwE $ VerifyFailure t (Just x)
-                    "the cold by-txid answer differs from SQLite's (rows or order)"
-        forM_ (distinct (_srRowKey <$> rows)) $ \k -> do
-            c <- lift $ _fvKeyVersions fv t k lo hi
-            s <- lift $ sqliteKeyRowCount db t k lo hi
-            unless (c == s) $ throwE $ VerifyFailure t Nothing $
-                "key " <> showKey k <> ": " <> T.pack (show c) <> " cold versions, "
-                    <> T.pack (show s) <> " SQLite rows"
+    runExceptT $ forM_ tables $ \(t, rows) ->
+        verifyRows (_ccFreezerView (_feCold env)) db t rows lo (_frEndTxId to)
+
+-- | Verifies a chunk of the first step's base ('BaseChunk') as 'verifyStep'
+-- verifies a step, through the freezer view clamped to @hi@ (the end txid of
+-- the first block), with the key counts over the chunk's txids: the chunks of
+-- the base are written before the step's frontier, and a key's later chunks
+-- may not be written yet.
+verifyChunk :: FreezerEnv -> SQLiteEnv -> TxId -> BaseChunk -> IO (Either VerifyFailure ())
+verifyChunk env db hi c = runExceptT $
+    verifyRows (_ccFreezerViewBelow (_feCold env) hi) db (_bkTable c) (_bkRows c) (_bkFrom c) (_bkTo c)
+
+verifyRows :: ColdFreezerView -> SQLiteEnv -> Text -> [StepRow] -> TxId -> TxId -> ExceptT VerifyFailure IO ()
+verifyRows fv db t rows lo hi = do
+    let ps = sqlitePactStore db
+    forM_ rows $ \r -> do
+        v <- lift $ _fvRowAt fv t (_srRowKey r) (_srTxId r)
+        case v of
+            Just d | d == _srRowData r -> return ()
+            Just _ -> throwE $ VerifyFailure t (Just (_srTxId r)) $
+                "the R entry of key " <> showKey (_srRowKey r) <> " differs from SQLite's row"
+            Nothing -> throwE $ VerifyFailure t (Just (_srTxId r)) $
+                "no R entry for key " <> showKey (_srRowKey r)
+    unless (isSysTable t) $ forM_ (distinct (_srTxId <$> rows)) $ \x -> do
+        c <- lift $ _fvRowsAtTxId fv t x
+        s <- lift $ _psRowsAtTxId ps t x
+        case s of
+            Left e -> throwE $ VerifyFailure t (Just x) $ "SQLite rowsAtTxId failed: " <> T.pack (show e)
+            Right sr -> unless (c == Just sr) $ throwE $ VerifyFailure t (Just x)
+                "the cold by-txid answer differs from SQLite's (rows or order)"
+    forM_ (distinct (_srRowKey <$> rows)) $ \k -> do
+        c <- lift $ _fvKeyVersions fv t k lo hi
+        s <- lift $ sqliteKeyRowCount db t k lo hi
+        unless (c == s) $ throwE $ VerifyFailure t Nothing $
+            "key " <> showKey k <> ": " <> T.pack (show c) <> " cold versions, "
+                <> T.pack (show s) <> " SQLite rows"
   where
-    showKey = T.pack . show
+    showKey = T.pack . show :: B.ByteString -> Text
 
 distinct :: Ord a => [a] -> [a]
 distinct = go S.empty
@@ -481,7 +580,9 @@ data TrimOutcome = Trimmed !Int | TrimHashMismatch
     deriving (Eq, Show)
 
 -- | Trims SQLite below the frontier @F@ (spec 6.2 step 5) for the rows
--- written in @[from, F)@: for the tables mutated in those blocks, every row
+-- written in @[from, F)@: for the tables mutated in those blocks, and for
+-- the tables of the first step's base over the txids below the end of the
+-- first block ('forBaseChunks'), every row
 -- below @F@ that is not the newest below @F@ of its key ('KeepAnchors'), and
 -- every row below @F@ of @SYS:Pacts@ ('DropAll', 'keepsNoAnchors').
 --
@@ -504,11 +605,19 @@ trimStep env f from = do
     tables <- _feWithPactDb env $ \db -> do
         prev <- sqliteBlockAtOrBelow db (_frHeight f) from
         mutated <- sqliteMutatedTablesBetween db prev (_frHeight f)
-        base <- if prev == Nothing then firstStepTables db else return []
-        return (mutated ++ base)
+        -- the base of the first step: the tables of the schema over the
+        -- txids below the end of the first block, the range its read covers
+        -- ('forBaseChunks')
+        first <- sqliteFirstBlockAbove db Nothing >>= \case
+            Nothing -> return []
+            Just h -> sqliteBlocks db Nothing h
+        base <- case first of
+            (_, _, end1) : _ | from < end1 -> fmap (, Just end1) <$> firstStepTables db
+            _ -> return []
+        return (fmap (, Nothing) mutated ++ base)
     let work = distinctOn foldTableName
-            [ (t, if keepsNoAnchors t then DropAll else KeepAnchors)
-            | t <- tables, frozenTable t
+            [ (t, if keepsNoAnchors t then DropAll else KeepAnchors, lim)
+            | (t, lim) <- tables, frozenTable t
             ]
     go work from 0
   where
@@ -518,7 +627,7 @@ trimStep env f from = do
     distinctOn g = go' S.empty
       where
         go' _ [] = []
-        go' seen (x@(t, _) : xs)
+        go' seen (x@(t, _, _) : xs)
             | S.member (g t) seen = go' seen xs
             | otherwise = x : go' (S.insert (g t) seen) xs
 
@@ -532,7 +641,9 @@ trimStep env f from = do
                 t0 <- getMonotonicTime
                 r <- sqliteWithTrimSavepoint db $ sqliteBlockHashAt db (_frHeight f) >>= \case
                     Just h | h == _frHash f -> Just . sum <$>
-                        forM work (\(t, rule) -> sqliteTrimChunk db t rule lo hi fe)
+                        forM work (\(t, rule, lim) -> case lim of
+                            Just l | lo >= l -> return 0
+                            _ -> sqliteTrimChunk db t rule lo (maybe hi (min hi) lim) fe)
                     _ -> return Nothing
                 t1 <- getMonotonicTime
                 return ((, t1 - t0) <$> r)
@@ -579,6 +690,24 @@ data StepOutcome
         -- ('RewindGuard')
     deriving (Eq, Show)
 
+-- | The rows and bytes of the base chunks of a first step, for the stats.
+data BaseCounts = BaseCounts
+    { _bcUser :: !Int
+    , _bcSys :: !Int
+    , _bcBytes :: !Int
+    }
+
+noCounts :: BaseCounts
+noCounts = BaseCounts 0 0 0
+
+addCounts :: BaseChunk -> BaseCounts -> BaseCounts
+addCounts ch (BaseCounts u y b)
+    | isSysTable (_bkTable ch) = BaseCounts u (y + n) b'
+    | otherwise = BaseCounts (u + n) y b'
+  where
+    n = length (_bkRows ch)
+    b' = b + sum (rowBytes <$> _bkRows ch)
+
 -- | One freezer step (spec 6.2, 6.3):
 --
 -- 1. if the written frontier is ahead of the verified one, re-read that range
@@ -618,73 +747,138 @@ freezeOnceWith slot env = do
     cold = _feCold env
     hooks = _feHooks env
     rg = _ccRewindGuard cold
+    cap = _phFreezeStepBytes (_feConfig env)
 
     -- (1) a written but unverified step: verify it again and publish it. A
     -- rewind below the written frontier is refused, so the guard is not
-    -- needed here.
+    -- needed here. The first step's base is read and verified again chunk by
+    -- chunk ('forBaseChunks'), so memory stays bounded by the cap.
     recover meta = case _cmWritten meta of
         Nothing -> throwIO $ ColdStoreException
             "Chainweb.Pact.Backend.Store.Freezer: a verified frontier without a written one"
         Just w -> do
             let v = _cmVerified meta
             logg env Info $ "verifying the written but unpublished step to " <> T.pack (show w)
-            r <- slot $ withFreezerReadConnection env $ \db ->
+            r <- slot $ withFreezerReadConnection env $ \db -> sqliteReadTransaction db $
                 sqliteBlockHashAt db (_frHeight w) >>= \case
                     Just h | h == _frHash w -> do
                         blocks <- sqliteBlocks db (_frHeight <$> v) (_frHeight w)
-                        s <- readBlocks db (frontierTxId v) Nothing blocks
+                        rb <- case blocks of
+                            (h1, hash1, end1) : rest | frontierTxId v == 0 -> do
+                                c <- newIORef noCounts
+                                e <- runExceptT $ forBaseChunks db cap h1 end1 $ \ch -> do
+                                    ExceptT (verifyChunk env db end1 ch)
+                                    liftIO $ modifyIORef' c (addCounts ch)
+                                cs <- readIORef c
+                                fmap (, cs) <$> traverse (\_ -> readTail db (Frontier h1 hash1 end1) 0 Nothing rest) e
+                            [] -> return $ Left $ VerifyFailure "" Nothing "SQLite has no block up to the written frontier"
+                            _ -> Right . (, noCounts) <$> readBlocksIn db (frontierTxId v) 0 Nothing blocks
                         _fhAfterRead hooks
-                        if _stpTo s /= w
-                        then return $ Left $ HaltedVerify $ VerifyFailure "" Nothing $
-                            "SQLite's blocks end at " <> T.pack (show (_stpTo s))
-                                <> ", not at the written frontier"
-                        else timed (verifyStep env db s) >>= \case
-                            (Left e, _) -> return (Left (HaltedVerify e))
-                            (Right (), vt) -> do
-                                addStats $ \st -> st { _fsVerifyMs = _fsVerifyMs st + vt }
-                                return (Right s)
+                        case rb of
+                            Left e -> return (Left (HaltedVerify e))
+                            Right (s, cs)
+                                | _stpTo s /= w -> return $ Left $ HaltedVerify $ VerifyFailure "" Nothing $
+                                    "SQLite's blocks end at " <> T.pack (show (_stpTo s))
+                                        <> ", not at the written frontier"
+                                | otherwise -> timed (verifyStep env db s) >>= \case
+                                    (Left e, _) -> return (Left (HaltedVerify e))
+                                    (Right (), vt) -> do
+                                        addStats $ \st -> st { _fsVerifyMs = _fsVerifyMs st + vt }
+                                        return (Right (s, cs))
                     _ -> return (Left (HaltedHash w))
             case r of
                 Left o -> halted o
-                Right s -> do
+                Right sc -> do
                     _fhAfterVerify hooks
                     _ccPublish cold
                     _fhAfterPublish hooks
-                    trimAndReport w (frontierTxId v) (Just s)
+                    trimAndReport w (frontierTxId v) (Just sc)
 
     -- (3) a new step
     step = do
         r <- slot $ do
             gen <- guardGeneration rg
+            start <- frontierTxId <$> _ccWritten cold
             withFreezerReadConnection env $ \db -> planStep env db >>= \case
                 Nothing -> return (Left NothingToDo)
+                Just (StepPlan ((h1, hash1, end1) : rest)) | start == 0 ->
+                    baseStep gen db (Frontier h1 hash1 end1) rest
                 Just plan -> do
                     s <- readStep env db plan
                     _fhAfterRead hooks
                     claimed <- guardClaimStep rg gen (_frEndTxId (_stpTo s))
                     if not claimed
-                    then do
-                        logg env Info $ "a rewind of the hot store overlapped the read of the step to "
-                            <> T.pack (show (_stpTo s)) <> "; the step is dropped and read again"
-                        return (Left StepDropped)
-                    else flip finally (guardReleaseStep rg) $ do
-                        lo <- frontierTxId <$> _ccVerified cold
-                        ((), wt) <- timed (_ccWriteStep cold s)
-                        addStats $ \st -> st { _fsWriteMs = _fsWriteMs st + wt }
-                        _fhAfterWrite hooks
-                        timed (verifyStep env db s) >>= \case
-                            (Left e, _) -> return (Left (HaltedVerify e))
-                            (Right (), vt) -> do
-                                addStats $ \st -> st { _fsVerifyMs = _fsVerifyMs st + vt }
-                                _fhAfterVerify hooks
-                                _ccPublish cold
-                                _fhAfterPublish hooks
-                                return (Right (s, lo))
+                    then dropped (_stpTo s)
+                    else flip finally (guardReleaseStep rg) $
+                        writeVerifyPublish db s noCounts
         case r of
             Left NothingToDo -> return NothingToDo
             Left StepDropped -> return StepDropped
             Left o -> halted o
-            Right (s, lo) -> trimAndReport (_stpTo s) lo (Just s)
+            Right (s, lo, cs) -> trimAndReport (_stpTo s) lo (Just (s, cs))
+
+    dropped to = do
+        logg env Info $ "a rewind of the hot store overlapped the read of the step to "
+            <> T.pack (show to) <> "; the step is dropped and read again"
+        return (Left StepDropped)
+
+    writeVerifyPublish db s cs = do
+        lo <- frontierTxId <$> _ccVerified cold
+        ((), wt) <- timed (_ccWriteStep cold s)
+        addStats $ \st -> st { _fsWriteMs = _fsWriteMs st + wt }
+        _fhAfterWrite hooks
+        timed (verifyStep env db s) >>= \case
+            (Left e, _) -> return (Left (HaltedVerify e))
+            (Right (), vt) -> do
+                addStats $ \st -> st { _fsVerifyMs = _fsVerifyMs st + vt }
+                _fhAfterVerify hooks
+                _ccPublish cold
+                _fhAfterPublish hooks
+                return (Right (s, lo, cs))
+
+    -- (3) the first step (I4): the base, the rows below the end of the first
+    -- block of every table of the schema, is written and verified chunk by
+    -- chunk under the cap ('forBaseChunks', '_ccWriteRows'), all in one read
+    -- transaction. The step's frontier is written after the last chunk, with
+    -- the rows of the step's later blocks, and published after their verify.
+    -- A crash before that leaves the written frontier where it was: the next
+    -- run writes the base again from its start (the same entries).
+    --
+    -- The claim on the first block's end comes before the base read: a
+    -- rewind that began or ended since 'guardGeneration' drops the step, and
+    -- a rewind below that end waits for the step. The later blocks are
+    -- claimed after the base; if a rewind came in the meantime, the step
+    -- ends at the first block.
+    baseStep gen db first rest = sqliteReadTransaction db $ do
+        claimed <- guardClaimStep rg gen (_frEndTxId first)
+        if not claimed
+        then dropped first
+        else flip finally (guardReleaseStep rg) $ do
+            let end1 = _frEndTxId first
+            c <- newIORef noCounts
+            e <- runExceptT $ forBaseChunks db cap (_frHeight first) end1 $ \ch -> do
+                let rows = _bkRows ch
+                ((), wt) <- liftIO $ timed (_ccWriteRows cold end1 [(_bkTable ch, rows)])
+                liftIO $ do
+                    addStats $ \st -> st { _fsWriteMs = _fsWriteMs st + wt }
+                    _fhAfterBaseChunk hooks (_bkTable ch) (length rows) (sum (rowBytes <$> rows))
+                (r, vt) <- liftIO $ timed (verifyChunk env db end1 ch)
+                ExceptT (return r)
+                liftIO $ do
+                    addStats $ \st -> st { _fsVerifyMs = _fsVerifyMs st + vt }
+                    modifyIORef' c (addCounts ch)
+            case e of
+                Left err -> return (Left (HaltedVerify err))
+                Right () -> do
+                    cs <- readIORef c
+                    tailOk <- case rest of
+                        [] -> return False
+                        _ -> guardClaimStep rg gen (maximum [ x | (_, _, x) <- rest ])
+                    s <- if tailOk
+                        then readTail db first (_bcBytes cs) (Just cap) rest
+                        else return (ColdStep first [])
+                    _fhAfterRead hooks
+                    writeVerifyPublish db s cs
 
     addStats = modifyIORef' (_feStats env)
 
@@ -697,17 +891,18 @@ freezeOnceWith slot env = do
                 , _fsHotLiveBytes = _sfsLiveBytes fs
                 , _fsHotPeakBytes = max (_fsHotPeakBytes st) (_sfsFileBytes fs)
                 }
-            forM_ ms $ \s -> do
+            forM_ ms $ \(s, cs) -> do
                 let count p = sum [ length rs | (t, rs) <- _stpTables s, p (isSysTable t) ]
-                    rows = count (const True)
-                    bytes = sum [ rowBytes r | (_, rs) <- _stpTables s, r <- rs ]
+                    user = count not + _bcUser cs
+                    sys = count id + _bcSys cs
+                    bytes = sum [ rowBytes r | (_, rs) <- _stpTables s, r <- rs ] + _bcBytes cs
                 addStats $ \st -> st
                     { _fsSteps = _fsSteps st + 1
-                    , _fsRowsUser = _fsRowsUser st + count not
-                    , _fsRowsSys = _fsRowsSys st + count id
+                    , _fsRowsUser = _fsRowsUser st + user
+                    , _fsRowsSys = _fsRowsSys st + sys
                     , _fsBytes = _fsBytes st + bytes
                     }
-                logg env Info $ "froze " <> T.pack (show rows) <> " rows to " <> T.pack (show f)
+                logg env Info $ "froze " <> T.pack (show (user + sys)) <> " rows to " <> T.pack (show f)
                     <> "; trimmed " <> T.pack (show n) <> " rows"
             return (Froze f)
 

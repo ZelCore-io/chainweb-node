@@ -41,7 +41,7 @@ import Chainweb.BlockHeader.Internal
 import Chainweb.Pact.Backend.Store.Cold
 import Chainweb.Pact.Backend.Store.Freezer
 import Chainweb.Pact.Backend.Store.Layout (PactLayoutError(..), sqliteDirName)
-import Chainweb.Pact.Backend.Store.Config (PactHistoryStore(..))
+import Chainweb.Pact.Backend.Store.Config (PactHistoryConfig(..), PactHistoryStore(..))
 import Chainweb.Pact.Backend.Store.SQLite
 import Chainweb.Pact.Backend.Store.Split
 import Chainweb.Pact.Backend.Store.Types
@@ -75,6 +75,8 @@ tests = testGroup "Split store"
     , testCase "backup is refused" backupTest
     , testCase "a frozen-name table missing from the cold catalog with rows below F: every read op equals the legacy twin" uncataloguedTest
     , testCase "a compacted base whose table is first changed after the first step: every read op below F equals the legacy twin" compactedLateTableTest
+    , testCase "a compacted base larger than several chunks at a small byte cap: chunk sizes stay under the cap, every read op below F equals the legacy twin" compactedChunkedTest
+    , testCase "a compacted base: a crash after any base chunk, or after the step's write, then a restart: the base completes, every read op below F equals the legacy twin" compactedChunkCrashTest
     ]
 
 -- -------------------------------------------------------------------------- --
@@ -583,7 +585,97 @@ compactedLateTableTest = withHistoryFixture hist $ \root -> withTempSQLiteConnec
         | otherwise = b
       where
         h = fromIntegral (_bcHeight b) :: Int
-    compact db = do
-        P4SQL.exec_ db "DELETE FROM BlockHistory WHERE blockheight < 2"
-        P4SQL.exec_ db "DELETE FROM VersionedTableMutation WHERE blockheight < 2"
-        P4SQL.exec_ db "DELETE FROM VersionedTableCreation WHERE createBlockheight < 2"
+
+-- | The compaction of these tests: the history starts at height 2.
+compact :: SQLiteEnv -> IO ()
+compact db = do
+    P4SQL.exec_ db "DELETE FROM BlockHistory WHERE blockheight < 2"
+    P4SQL.exec_ db "DELETE FROM VersionedTableMutation WHERE blockheight < 2"
+    P4SQL.exec_ db "DELETE FROM VersionedTableCreation WHERE createBlockheight < 2"
+
+-- | A compacted base with @Big_Table@: 40 rows at height 1, four per txid,
+-- so that a small byte cap cuts its base read into several chunks.
+bigBase :: [BlockCommit]
+bigBase = big <$> history
+  where
+    big b
+        | _bcHeight b == 1 = b
+            { _bcNewTables = _bcNewTables b ++ ["Big_Table"]
+            , _bcRows = _bcRows b ++ [("Big_Table", [ (k i, fromIntegral (10 + i `div` 4), "{\"b\":" <> B.pack (map (fromIntegral . fromEnum) (show i)) <> "}") | i <- [0 .. 39 :: Int] ])]
+            }
+        | otherwise = b
+    k = B.pack . map (fromIntegral . fromEnum) . ("big" <>) . show
+
+-- | The step byte cap of the chunk tests: about five rows of @Big_Table@.
+smallCap :: Int
+smallCap = 100
+
+-- | The bytes of one txid of @Big_Table@ (four rows), the most a chunk may
+-- hold above the cap: a chunk ends at a txid boundary.
+bigTxIdBytes :: Int
+bigTxIdBytes = 4 * maximum [ 2 * length (show i) + 17 | i <- [0 .. 39 :: Int] ]
+
+withCompacted :: (FilePath -> SQLiteEnv -> IO a) -> IO a
+withCompacted k = withHistoryFixture bigBase $ \root -> withTempSQLiteConnection chainwebPragmas $ \twin -> do
+    _psInitSchema (sqlitePactStore twin)
+    commitAll twin bigBase
+    withSQLiteConnection (root </> sqliteDirName </> chainDbFileName cid) chainwebPragmas $ \db ->
+        forM_ [db, twin] compact
+    k root twin
+
+withCapNode :: FilePath -> (Node -> FreezerHooks) -> (Node -> IO a) -> IO a
+withCapNode root hooks = withNode root testConfig { _phFreezeStepBytes = smallCap } writeBatchSync hooks (const (return ()))
+
+compareCompacted :: Node -> SQLiteEnv -> Assertion
+compareCompacted n twin = do
+    -- every block is a step of its own at this cap: the run ends at height 7
+    _ccVerified (_nCold n) >>= (@?= Just (frontierAt 7))
+    splitOf n twin $ \s -> do
+        forM_ ("Big_Table" : dataTables) $ \t -> compareTable s bounds t t
+        forM_ ["Big_Table", "coin_table", "SYS:Pacts"] $ \t -> compareKeys s bounds t t
+
+compactedChunkedTest :: Assertion
+compactedChunkedTest = withCompacted $ \root twin -> do
+    chunks <- newIORef []
+    let hooks _ = noHooks { _fhAfterBaseChunk = \t rows bytes -> modifyIORef' chunks ((t, rows, bytes) :) }
+    withCapNode root hooks $ \n -> do
+        outcomes <- runToEnd (_nEnv n)
+        last outcomes @?= NothingToDo
+        head outcomes @?= Froze (frontierAt 2)
+        cs <- reverse <$> readIORef chunks
+        let big = [ c | c@(t, _, _) <- cs, t == "Big_Table" ]
+        assertBool ("Big_Table is read in several chunks: " <> show big) (length big >= 4)
+        sum [ r | (_, r, _) <- big ] @?= 40
+        forM_ cs $ \c@(_, rows, bytes) -> do
+            assertBool ("a chunk stays under the cap plus one txid: " <> show c) (bytes < smallCap + bigTxIdBytes)
+            assertBool ("a chunk holds rows: " <> show c) (rows > 0)
+        compareCompacted n twin
+
+compactedChunkCrashTest :: Assertion
+compactedChunkCrashTest = do
+    -- the number of base chunks of a run without a crash
+    total <- withCompacted $ \root _ -> do
+        ref <- newIORef (0 :: Int)
+        withCapNode root (\_ -> noHooks { _fhAfterBaseChunk = \_ _ _ -> modifyIORef' ref (+ 1) }) $ \n ->
+            void $ runToEnd (_nEnv n)
+        readIORef ref
+    assertBool ("several base chunks: " <> show total) (total >= 6)
+    forM_ ([Left k | k <- [1, 2, total `div` 2, total]] ++ [Right ()]) $ \point -> withCompacted $ \root twin -> do
+        counter <- newIORef (0 :: Int)
+        let tick k = do
+                i <- atomicModifyIORef' counter (\i -> (i + 1, i + 1))
+                when (i == k) $ throwIO (Crash i)
+            hooks _ = case point of
+                Left k -> noHooks { _fhAfterBaseChunk = \_ _ _ -> tick k }
+                Right () -> noHooks { _fhAfterWrite = throwIO (Crash 0) }
+        r <- try $ withCapNode root hooks $ runToEnd . _nEnv
+        case r of
+            Left (Crash _) -> return ()
+            Right o -> assertFailure $ "no crash at " <> show point <> ": " <> show o
+        withCapNode root (const noHooks) $ \n -> do
+            case point of
+                Left _ -> _ccVerified (_nCold n) >>= (@?= Nothing)
+                Right () -> _ccWritten (_nCold n) >>= (@?= Just (frontierAt 2))
+            outcomes <- runToEnd (_nEnv n)
+            last outcomes @?= NothingToDo
+            compareCompacted n twin

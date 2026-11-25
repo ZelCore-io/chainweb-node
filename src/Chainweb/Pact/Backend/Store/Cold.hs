@@ -202,8 +202,10 @@ isSysTable = T.isPrefixOf "SYS:"
 
 -- | Whether the freezer moves the history of a table to the cold store.
 -- @SYS:Modules@ and @SYS:ModuleSources@ stay whole in SQLite. The freezer
--- only sees tables named in @VersionedTableMutation@, so @TransactionIndex@
--- and the bookkeeping tables never reach this function.
+-- sees the tables named in @VersionedTableMutation@ and, for the base of its
+-- first step, the Pact tables of the SQLite schema ('sqliteSchemaTables'),
+-- which leaves out @TransactionIndex@ and the bookkeeping tables by name, so
+-- those never reach this function.
 --
 frozenTable :: Text -> Bool
 frozenTable name = name /= "SYS:Modules" && name /= "SYS:ModuleSources"
@@ -362,6 +364,14 @@ data ColdChain = ColdChain
     , _ccWriteStep :: !(ColdStep -> IO ())
         -- ^ writes a step as one synced batch, with the written frontier
         -- '_stpTo'; the verified frontier and '_cmTrimFrom' stay
+    , _ccWriteRows :: !(Pact4.TxId -> [(Text, [StepRow])] -> IO ())
+        -- ^ writes rows below the given txid as one synced batch, without
+        -- moving the written frontier: a chunk of the base of the first step
+        -- (the freezer writes the step's frontier with '_ccWriteStep' after
+        -- its last chunk). The rows must be above the written frontier, and
+        -- a txid's rows of a user table must all be in one call (its @T@
+        -- list is written whole). Writing the same rows again writes the
+        -- same entries, so a base cut short is written again from its start.
     , _ccPublish :: !(IO ())
         -- ^ verified := written, '_cmTrimFrom' := the old verified end txid,
         -- or the trim position if a trim below it is unfinished
@@ -381,6 +391,10 @@ data ColdChain = ColdChain
     , _ccFreezerView :: !ColdFreezerView
         -- ^ for the freezer's verify step only; split routing must never use
         -- it (it is not clamped to the verified frontier)
+    , _ccFreezerViewBelow :: !(Pact4.TxId -> ColdFreezerView)
+        -- ^ the freezer's view clamped to the given txid instead of the
+        -- written frontier: the verify of the base chunks of the first
+        -- step, written before the step's frontier
     , _ccRewindGuard :: !RewindGuard
         -- ^ keeps a hot rewind and a freezer step of the chain apart
     }
@@ -484,6 +498,14 @@ openColdChainHooked writer midPublish cs c = do
                 writer db ops
                 writeIORef metaRef (_wsMeta ws')
                 return ws'
+        , _ccWriteRows = \hi tables -> do
+            checkWritable
+            modifyMVar_ writerVar $ \ws -> do
+                let lo = frontierTxId (_cmWritten (_wsMeta ws))
+                checkRows lo hi tables
+                (ws', opsByTable) <- mapAccumM buildTable ws tables
+                writer db (concat opsByTable)
+                return ws'
         , _ccPublish = do
             checkWritable
             modifyMVar_ writerVar $ \ws -> do
@@ -534,6 +556,13 @@ openColdChainHooked writer midPublish cs c = do
             , _fvRowsAtTxId = rowsAtTxId written
             , _fvKeyVersions = keyVersions written
             }
+        , _ccFreezerViewBelow = \hi ->
+            let below = written { _rdFrontier = return (txIdWord hi) }
+            in ColdFreezerView
+                { _fvRowAt = rowAt below
+                , _fvRowsAtTxId = rowsAtTxId below
+                , _fvKeyVersions = keyVersions below
+                }
         , _ccRewindGuard = guard'
         }
   where
@@ -577,18 +606,19 @@ openColdChainHooked writer midPublish cs c = do
 
     buildStep ws (ColdStep to tables) = do
         checkStep (_wsMeta ws) to tables
-        (ws1, opsByTable) <- mapAccumM (buildTable to) ws tables
+        (ws1, opsByTable) <- mapAccumM buildTable ws tables
         let m' = (_wsMeta ws1) { _cmWritten = Just to }
             ops = concat opsByTable ++ [R.Put (metaKey c) (encodeColdMeta m')]
         return (ops, ws1 { _wsMeta = m' })
 
     checkStep meta to tables = do
-        let lo = frontierTxId (_cmWritten meta)
-            hi = _frEndTxId to
         forM_ (_cmWritten meta) $ \w ->
-            unless (_frHeight to > _frHeight w && hi >= _frEndTxId w) $
+            unless (_frHeight to > _frHeight w && _frEndTxId to >= _frEndTxId w) $
                 coldError $ "chain " <> chainIdToText c <> ": step to " <> T.pack (show to)
                     <> " is not after the written frontier " <> T.pack (show w)
+        checkRows (frontierTxId (_cmWritten meta)) (_frEndTxId to) tables
+
+    checkRows lo hi tables = do
         let names = foldTableName . fst <$> tables
         unless (S.size (S.fromList names) == length names) $
             coldError $ "a step names a table twice: " <> T.pack (show (fst <$> tables))
@@ -599,7 +629,7 @@ openColdChainHooked writer midPublish cs c = do
                 coldError $ "table " <> name <> ": row txid " <> T.pack (show (_srTxId r))
                     <> " outside [" <> T.pack (show lo) <> ", " <> T.pack (show hi) <> ")"
 
-    buildTable _to ws (name, rows) = do
+    buildTable ws (name, rows) = do
         let folded = foldTableName name
         (t, ws1, tableOps) <- case HM.lookup folded (_wsTables ws) of
             Just t -> return (t, ws, [])

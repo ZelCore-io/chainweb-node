@@ -356,6 +356,7 @@ tests = testGroup "Freezer step"
     , testCase "a restart after a finished trim runs no trim chunk" noRetrimTest
     , testCase "a large step trims in ascending txid windows: one chunk per window, none re-walks an earlier one" largeStepWindowTest
     , testCase "corrupt R value between write and verify: HaltedVerify, verified frontier and SQLite unchanged" corruptTest
+    , testCase "corrupt R value of the first step's base between a chunk's write and its verify: HaltedVerify, no frontier written; a restart writes the base again" corruptBaseTest
     , testCase "verify view: a step that creates a new table verifies; a corrupted value in that table fails verify" newTableVerifyTest
     , testCase "cold write failure: freezeOnce throws, frontiers and SQLite unchanged, SQLite still answers" writeFailureTest
     , testCase "crash between write and publish, then a rewind and another block at the written height: HaltedHash, nothing visible" crashRewindTest
@@ -501,7 +502,7 @@ countingHooks ref k = (const hooks, const tick)
     tick = do
         i <- atomicModifyIORef' ref (\i -> (i + 1, i + 1))
         when (i == k) $ throwIO (Crash i)
-    hooks = FreezerHooks tick tick tick tick tick
+    hooks = FreezerHooks tick tick tick tick tick (\_ _ _ -> tick)
 
 -- | The number of hook calls of a run without a crash, and its end state.
 baseline :: IO (Int, ([(Text, [[Text]])], [[Text]], [(B.ByteString, B.ByteString)]))
@@ -726,12 +727,14 @@ corrupt cs t key x = coldTableId cs t >>= \case
 
 corruptTest :: Assertion
 corruptTest = withFixture $ \root twin -> do
-    let hooks n = noHooks { _fhAfterWrite = corrupt (_nStore n) "coin_table" "alice" 2 }
+    -- a row of block 1, after the step's write: the first step's base
+    -- (block 0) is verified chunk by chunk before it ('corruptBaseTest')
+    let hooks n = noHooks { _fhAfterWrite = corrupt (_nStore n) "coin_table" "alice" 12 }
     withNode root testConfig writeBatchSync hooks (const (return ())) $ \n -> do
         freezeOnce (_nEnv n) >>= \case
             HaltedVerify e -> do
                 _vfTable e @?= "coin_table"
-                _vfTxId e @?= Just 2
+                _vfTxId e @?= Just 12
             o -> assertFailure $ "expected HaltedVerify, got " <> show o
         _ccVerified (_nCold n) >>= (@?= Nothing)
         _ccWritten (_nCold n) >>= (@?= Just (frontierAt 2))
@@ -749,6 +752,31 @@ corruptTest = withFixture $ \root twin -> do
         a @?= b
         _psReadNewest (sqlitePactStore (_nPact n)) "coin_table" "alice" (Just 3) >>= (@?= Right (Just "{\"a2\":0}"))
     doesDirectoryExist (root </> splitDirName) >>= (@?= False)
+
+-- | A corrupt R value of the first step's base, between a chunk's write and
+-- its verify: HaltedVerify, and nothing is written as a frontier. A restart
+-- writes the base again from its start, which replaces the corrupt value.
+corruptBaseTest :: Assertion
+corruptBaseTest = withFixture $ \root twin -> do
+    let hooks n = noHooks
+            { _fhAfterBaseChunk = \t _ _ -> when (t == "coin_table") $ corrupt (_nStore n) "coin_table" "alice" 2 }
+    withNode root testConfig writeBatchSync hooks (const (return ())) $ \n -> do
+        freezeOnce (_nEnv n) >>= \case
+            HaltedVerify e -> do
+                _vfTable e @?= "coin_table"
+                _vfTxId e @?= Just 2
+            o -> assertFailure $ "expected HaltedVerify, got " <> show o
+        _ccVerified (_nCold n) >>= (@?= Nothing)
+        _ccWritten (_nCold n) >>= (@?= Nothing)
+        _ccReadNewest (_nCold n) "coin_table" "alice" maxBound >>= (@?= Nothing)
+    withPlainNode root $ \n -> do
+        outcomes <- runToEnd (_nEnv n)
+        last outcomes @?= NothingToDo
+        _ccVerified (_nCold n) >>= (@?= Just finalFrontier)
+        _ccReadNewest (_nCold n) "coin_table" "alice" 3 >>= (@?= Just ("alice", "{\"a2\":0}"))
+        forM_ dataTables $ \t -> do
+            expected <- expectedAfterTrim twin finalFrontier t
+            rowsOf (_nPact n) t >>= assertEqual (T.unpack t) expected
 
 newTableVerifyTest :: Assertion
 newTableVerifyTest = do
