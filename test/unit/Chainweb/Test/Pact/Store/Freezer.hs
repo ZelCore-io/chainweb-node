@@ -358,7 +358,49 @@ tests = testGroup "Freezer step"
     , testCase "step ends at a block boundary at the byte cap; an oversized block is a step of its own" byteCapTest
     , testCase "EXPLAIN QUERY PLAN of both trim statements uses indexes, no full scan" explainTest
     , testCase "the first trim renames sqlite to sqlite-split and writes the marker before any DELETE" splitMarkerTest
+    , testCase "a chain whose genesis is above the step heights freezes from its first block" lateGenesisTest
+    , testCase "a compacted-style BlockHistory that starts at a high height freezes from its first row" compactedHistoryTest
     ]
+
+-- | A fixture whose node SQLite file holds the given history, without a twin.
+withHistoryFixture :: [BlockCommit] -> (FilePath -> IO a) -> IO a
+withHistoryFixture hist k = withSystemTempDirectory "freezer" $ \tmp -> do
+    let root = tmp </> "0"
+    createDirectoryIfMissing True (root </> sqliteDirName)
+    withSQLiteConnection (root </> sqliteDirName </> chainDbFileName cid) chainwebPragmas $ \db -> do
+        _psInitSchema (sqlitePactStore db)
+        commitAll db hist
+    k root
+
+-- | Genesis at height 1000 (mainnet chains 10-19 start at 852,054): the
+-- first step must start at the first @BlockHistory@ row, not at height 0.
+lateGenesisTest :: Assertion
+lateGenesisTest = withHistoryFixture (shift <$> history) $ \root -> withPlainNode root $ \n -> do
+    outcomes <- runToEnd (_nEnv n)
+    outcomes @?= (Froze . at <$> [2, 5, 8]) ++ [NothingToDo]
+    _ccVerified (_nCold n) >>= (@?= Just (at 8))
+  where
+    off = 1000
+    shift b = b { _bcHeight = _bcHeight b + off }
+    at h = (frontierAt h) { _frHeight = fromIntegral h + off }
+
+-- | A compacted database keeps only the @BlockHistory@ and
+-- @VersionedTableMutation@ rows from the compaction target up.
+compactedHistoryTest :: Assertion
+compactedHistoryTest = withHistoryFixture history $ \root -> do
+    withSQLiteConnection (root </> sqliteDirName </> chainDbFileName cid) chainwebPragmas $ \db -> do
+        P4SQL.exec_ db "DELETE FROM BlockHistory WHERE blockheight < 5"
+        P4SQL.exec_ db "DELETE FROM VersionedTableMutation WHERE blockheight < 5"
+    withPlainNode root $ \n -> do
+        outcomes <- runToEnd (_nEnv n)
+        outcomes @?= [Froze (frontierAt 7), NothingToDo]
+        _ccVerified (_nCold n) >>= (@?= Just (frontierAt 7))
+        -- the rows below the first block that no mutation entry of a planned
+        -- height names are in the first step too: ks at heights 0, 3 and 6
+        cold <- coldRowsByTable (_nStore n)
+        sort [ x | (_, x, _) <- M.findWithDefault [] "SYS:KeySets" cold ] @?= [6, 36, 66]
+        assertBool "coin_table rows of the compacted heights are cold" $
+            any (\(_, x, _) -> x < 50) (M.findWithDefault [] "coin_table" cold)
 
 -- | Every SQLite row of a frozen table with @txid < F@ has exactly one R
 -- entry with the same bytes, and cold holds nothing else.

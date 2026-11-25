@@ -21,6 +21,7 @@ module Chainweb.Pact.Backend.Store.SQLite
     , sqliteReadTransaction
     , sqliteTip
     , sqliteBlocks
+    , sqliteFirstBlockAbove
     , sqliteBlockHashAt
     , sqliteBlockAtOrBelow
     , sqliteMutatedTables
@@ -827,6 +828,21 @@ sqliteTip db = freezerQry db
     >>= traverse blockRow . take 1 >>= \case
         [] -> return Nothing
         (x : _) -> return (Just x)
+
+-- | The lowest @BlockHistory@ height above @from@ (@Nothing@: the lowest
+-- height). A chain's history need not start at height 0: a late genesis
+-- (mainnet chains 10-19) or a compacted database starts higher.
+sqliteFirstBlockAbove :: SQLiteEnv -> Maybe BlockHeight -> IO (Maybe BlockHeight)
+sqliteFirstBlockAbove db from = do
+    rs <- case from of
+        Nothing -> freezerQry db
+            "SELECT blockheight FROM BlockHistory ORDER BY blockheight ASC LIMIT 1" [] [Pact4.RInt]
+        Just f -> freezerQry db
+            "SELECT blockheight FROM BlockHistory WHERE blockheight > ? ORDER BY blockheight ASC LIMIT 1" [height f] [Pact4.RInt]
+    case rs of
+        [[Pact4.SInt h]] -> return (Just (fromIntegral h))
+        [] -> return Nothing
+        r -> throwM $ userError $ "sqliteFirstBlockAbove: unexpected row " <> show r
 
 -- | The @BlockHistory@ rows with @from < height <= to@, ascending;
 -- @Nothing@ for @from@ starts at the first block.

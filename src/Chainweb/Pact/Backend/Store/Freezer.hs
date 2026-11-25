@@ -313,17 +313,28 @@ planStep env db = sqliteTip db >>= \case
     Nothing -> return Nothing
     Just (tip, _, _) -> do
         ver <- _ccVerified (_feCold env)
-        let cfg = _feConfig env
-            depth = toInteger (_phFreezeDepth cfg)
-            stepHeights = max 1 (toInteger (_phFreezeStepHeights cfg))
-            vh = maybe (-1) (toInteger . _frHeight) ver
-            t = toInteger tip
-        if t - vh <= depth + stepHeights
-        then return Nothing
-        else do
-            let to = min (vh + stepHeights) (t - depth)
-            blocks <- sqliteBlocks db (_frHeight <$> ver) (fromIntegral to)
-            return $ if null blocks then Nothing else Just (StepPlan blocks)
+        -- The step starts at the first block above the frontier, not at the
+        -- frontier's height + 1: a chain's history can start far above
+        -- height 0 (a late genesis or a compacted database), and nothing
+        -- would ever be planned if the step counted from height 0.
+        sqliteFirstBlockAbove db (_frHeight <$> ver) >>= \case
+          Nothing -> return Nothing
+          Just first -> do
+            let cfg = _feConfig env
+                depth = toInteger (_phFreezeDepth cfg)
+                stepHeights = max 1 (toInteger (_phFreezeStepHeights cfg))
+                vh = toInteger first - 1
+                t = toInteger tip
+            if t - vh <= depth + stepHeights
+            then return Nothing
+            else do
+                let to = min (vh + stepHeights) (t - depth)
+                blocks <- sqliteBlocks db (_frHeight <$> ver) (fromIntegral to)
+                when (null blocks) $ logg env Warn $
+                    "planned a step to height " <> T.pack (show to) <> " but BlockHistory has no block in it, although the tip "
+                    <> T.pack (show tip) <> " is more than the freeze depth above the frontier "
+                    <> T.pack (show (_frHeight <$> ver)) <> "; the freezer makes no progress"
+                return $ if null blocks then Nothing else Just (StepPlan blocks)
 
 -- | Reads a step (spec 6.2 step 1) in one read transaction, block by block:
 -- for each block, the rows of the tables of @VersionedTableMutation@ at its
@@ -335,6 +346,17 @@ readStep :: FreezerEnv -> SQLiteEnv -> StepPlan -> IO ColdStep
 readStep env db (StepPlan blocks) = do
     start <- frontierTxId <$> _ccWritten (_feCold env)
     readBlocks db start (Just (_phFreezeStepBytes (_feConfig env))) blocks
+
+-- | The tables the first step (no frontier yet, txids from 0) reads and
+-- trims besides those of @VersionedTableMutation@: every table. A history
+-- that does not start at genesis (a compacted database) holds rows below
+-- its first block that no @VersionedTableMutation@ row of a planned height
+-- names; the first step's txid range starts at 0, so it covers them. On a
+-- history from genesis this adds nothing: every genesis row is named.
+firstStepTables :: SQLiteEnv -> IO [Text]
+firstStepTables db = (sysTables ++) <$> sqliteUserTables db
+  where
+    sysTables = ["SYS:KeySets", "SYS:Modules", "SYS:Namespaces", "SYS:Pacts", "SYS:ModuleSources"]
 
 -- | The bytes a row counts for in the step cap.
 rowBytes :: StepRow -> Int
@@ -348,7 +370,9 @@ readBlocks db start0 cap blocks0 = sqliteReadTransaction db $ go start0 0 HM.emp
     -- folded names in first-seen order, reversed
     go _ _ _ _ [] = error "readBlocks: impossible"
     go start !bytes acc order ((h, hash, end) : rest) = do
-        tables <- dedup . filter frozenTable <$> sqliteMutatedTables db h
+        mutated <- sqliteMutatedTables db h
+        base <- if start == 0 then firstStepTables db else return []
+        let tables = dedup (filter frozenTable (mutated ++ base))
         (acc', order', bytes') <- foldM (\(a, o, n) t -> do
             rows <- sqliteBlockRows db t start end
             let k = foldTableName t
@@ -467,7 +491,9 @@ trimStep env f from = do
     ensureSplitDir (_feLogger env) (_feLayout env) (_feChain env) (_frHeight f)
     tables <- _feWithPactDb env $ \db -> do
         prev <- sqliteBlockAtOrBelow db (_frHeight f) from
-        sqliteMutatedTablesBetween db prev (_frHeight f)
+        mutated <- sqliteMutatedTablesBetween db prev (_frHeight f)
+        base <- if prev == Nothing then firstStepTables db else return []
+        return (mutated ++ base)
     let work = distinctOn foldTableName
             [ (t, if keepsNoAnchors t then DropAll else KeepAnchors)
             | t <- tables, frozenTable t
