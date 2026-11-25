@@ -13,6 +13,24 @@
 --
 module Chainweb.Pact.Backend.Store.SQLite
     ( sqlitePactStore
+
+      -- * Freezer (storage redesign P3, spec 6.2)
+    , withSqliteReadOnly
+    , openSqliteReadOnly
+    , closeSqliteReadOnly
+    , sqliteReadTransaction
+    , sqliteTip
+    , sqliteBlocks
+    , sqliteBlockHashAt
+    , sqliteBlockAtOrBelow
+    , sqliteMutatedTables
+    , sqliteMutatedTablesBetween
+    , sqliteBlockRows
+    , sqliteKeyRowCount
+    , TrimRule(..)
+    , sqliteTrimChunk
+    , sqliteWithTrimSavepoint
+    , sqliteExplainTrim
     ) where
 
 import Control.Exception (SomeAsyncException, evaluate)
@@ -30,6 +48,7 @@ import qualified Data.HashSet as HashSet
 import Data.String (fromString)
 import Data.Text (Text)
 import qualified Data.Text as T
+import qualified Data.Text.Encoding as T
 import qualified Data.Vector as V
 import Database.SQLite3.Direct (Utf8(..))
 import qualified Database.SQLite3.Direct as SQ3
@@ -38,6 +57,8 @@ import GHC.Stack
 import Chainweb.BlockHash
 import Chainweb.BlockHeader
 import Chainweb.BlockHeight
+import Chainweb.Pact.Backend.SQLite.DirectV2 (SQLiteFlag(..), open_v2, close_v2)
+import Chainweb.Pact.Backend.Store.Cold (StepRow(..))
 import Chainweb.Pact.Backend.Store.Types
 import Chainweb.Pact.Backend.Types (SQLiteEnv)
 import Chainweb.Pact.Backend.Utils
@@ -730,3 +751,197 @@ initSchema sql =
       exec_ sql
         "CREATE INDEX IF NOT EXISTS \
          \ transactionIndexByBH ON TransactionIndex(blockheight)";
+
+-- -------------------------------------------------------------------------- --
+-- Freezer (storage redesign P3, spec 6.2)
+--
+-- The freezer's statements. Reads run on a read-only connection of their
+-- own; the trim statements run on the Pact connection.
+
+freezerQry :: SQLiteEnv -> SQ3.Utf8 -> [Pact4.SType] -> [Pact4.RType] -> IO [[Pact4.SType]]
+freezerQry db q as rts = throwOnDbError (qry db q as rts)
+
+-- | A read-only connection (@SQLITE_OPEN_READONLY@) with a busy timeout of
+-- 10 s, as @cw-measure cold@ opens it.
+withSqliteReadOnly :: FilePath -> (SQLiteEnv -> IO a) -> IO a
+withSqliteReadOnly path = bracket (openSqliteReadOnly path) closeSqliteReadOnly
+
+-- | The open of 'withSqliteReadOnly', for callers that open under a lock
+-- and use the connection outside it.
+openSqliteReadOnly :: FilePath -> IO SQLiteEnv
+openSqliteReadOnly path = open
+  where
+    sqliteOpenReadOnly = SQLiteFlag 0x00000001
+    open = open_v2 (fromString path) sqliteOpenReadOnly Nothing >>= \case
+        Left (err, msg) -> internalError $
+            "withSqliteReadOnly: can't open " <> T.pack path <> ": " <> sshow err <> ": " <> sshow msg
+        Right db -> do
+            -- wait instead of failing with SQLITE_BUSY while another
+            -- connection holds a lock
+            Pact4.exec_ db "PRAGMA busy_timeout = 10000" `onException` close_v2 db
+            return db
+
+closeSqliteReadOnly :: SQLiteEnv -> IO ()
+closeSqliteReadOnly = void . close_v2
+
+-- | One read transaction: @BEGIN@, then @COMMIT@ (@ROLLBACK@ on an
+-- exception).
+sqliteReadTransaction :: SQLiteEnv -> IO a -> IO a
+sqliteReadTransaction db act = mask $ \restore -> do
+    Pact4.exec_ db "BEGIN"
+    r <- restore act `onException` Pact4.exec_ db "ROLLBACK"
+    Pact4.exec_ db "COMMIT"
+    return r
+
+blockRow :: [Pact4.SType] -> IO (BlockHeight, BlockHash, TxId)
+blockRow = \case
+    [Pact4.SInt h, Pact4.SBlob hash, Pact4.SInt e] -> do
+        bh <- either (internalError . T.pack) return $ runGetEitherS decodeBlockHash hash
+        return (fromIntegral h, bh, fromIntegral e)
+    r -> internalError $ "freezer: bad BlockHistory row: " <> sshow r
+
+-- | The newest @BlockHistory@ row.
+sqliteTip :: SQLiteEnv -> IO (Maybe (BlockHeight, BlockHash, TxId))
+sqliteTip db = freezerQry db
+    "SELECT blockheight, hash, endingtxid FROM BlockHistory ORDER BY blockheight DESC LIMIT 1"
+    [] [Pact4.RInt, Pact4.RBlob, Pact4.RInt]
+    >>= traverse blockRow . take 1 >>= \case
+        [] -> return Nothing
+        (x : _) -> return (Just x)
+
+-- | The @BlockHistory@ rows with @from < height <= to@, ascending;
+-- @Nothing@ for @from@ starts at the first block.
+sqliteBlocks :: SQLiteEnv -> Maybe BlockHeight -> BlockHeight -> IO [(BlockHeight, BlockHash, TxId)]
+sqliteBlocks db from to = case from of
+    Nothing -> freezerQry db
+        "SELECT blockheight, hash, endingtxid FROM BlockHistory WHERE blockheight <= ? ORDER BY blockheight ASC"
+        [height to] cols >>= traverse blockRow
+    Just f -> freezerQry db
+        "SELECT blockheight, hash, endingtxid FROM BlockHistory WHERE blockheight > ? AND blockheight <= ? ORDER BY blockheight ASC"
+        [height f, height to] cols >>= traverse blockRow
+  where
+    cols = [Pact4.RInt, Pact4.RBlob, Pact4.RInt]
+
+height :: BlockHeight -> Pact4.SType
+height = Pact4.SInt . fromIntegral
+
+-- | The block hash of @BlockHistory@ at a height.
+sqliteBlockHashAt :: SQLiteEnv -> BlockHeight -> IO (Maybe BlockHash)
+sqliteBlockHashAt db h = freezerQry db
+    "SELECT blockheight, hash, endingtxid FROM BlockHistory WHERE blockheight = ?"
+    [height h] [Pact4.RInt, Pact4.RBlob, Pact4.RInt] >>= \case
+        [] -> return Nothing
+        (r : _) -> (\(_, hash, _) -> Just hash) <$> blockRow r
+
+-- | The newest height at or below @h@ whose @endingtxid@ is at or below the
+-- txid: the last block before a txid range that ends in block @h@. A
+-- backwards walk of the height index that stops at the first match.
+sqliteBlockAtOrBelow :: SQLiteEnv -> BlockHeight -> TxId -> IO (Maybe BlockHeight)
+sqliteBlockAtOrBelow db h txid = freezerQry db
+    "SELECT blockheight FROM BlockHistory WHERE blockheight <= ? AND endingtxid <= ? ORDER BY blockheight DESC LIMIT 1"
+    [height h, txIdParam txid] [Pact4.RInt] >>= \case
+        [[Pact4.SInt x]] -> return (Just (fromIntegral x))
+        _ -> return Nothing
+
+-- | The tables of @VersionedTableMutation@ at one height, named as stored.
+sqliteMutatedTables :: SQLiteEnv -> BlockHeight -> IO [Text]
+sqliteMutatedTables db h = freezerQry db
+    "SELECT tablename FROM VersionedTableMutation WHERE blockheight = ? ORDER BY rowid"
+    [height h] [Pact4.RText] >>= traverse freezerTableName
+
+-- | The distinct tables of @VersionedTableMutation@ with
+-- @from < height <= to@ (@Nothing@: from the first block), named as stored.
+sqliteMutatedTablesBetween :: SQLiteEnv -> Maybe BlockHeight -> BlockHeight -> IO [Text]
+sqliteMutatedTablesBetween db from to = case from of
+    Nothing -> freezerQry db
+        "SELECT DISTINCT tablename FROM VersionedTableMutation WHERE blockheight <= ?"
+        [height to] [Pact4.RText] >>= traverse freezerTableName
+    Just f -> freezerQry db
+        "SELECT DISTINCT tablename FROM VersionedTableMutation WHERE blockheight > ? AND blockheight <= ?"
+        [height f, height to] [Pact4.RText] >>= traverse freezerTableName
+
+freezerTableName :: [Pact4.SType] -> IO Text
+freezerTableName = \case
+    [Pact4.SText (Utf8 t)] -> either (internalError . sshow) return (T.decodeUtf8' t)
+    r -> internalError $ "freezer: bad table name row: " <> sshow r
+
+-- | The rows of a table with @from <= txid < to@, in rowid order (spec 6.2
+-- step 1). Row keys and row data are the stored bytes.
+sqliteBlockRows :: SQLiteEnv -> Text -> TxId -> TxId -> IO [StepRow]
+sqliteBlockRows db t from to = do
+    rows <- freezerQry db
+        ("SELECT rowid, rowkey, txid, rowdata FROM " <> tbl (toUtf8 t) <> " WHERE txid >= ? AND txid < ? ORDER BY rowid")
+        [txIdParam from, txIdParam to]
+        [Pact4.RInt, Pact4.RText, Pact4.RInt, Pact4.RBlob]
+    forM rows $ \case
+        [_, Pact4.SText (Utf8 k), Pact4.SInt x, Pact4.SBlob v] -> return (StepRow k (fromIntegral x) v)
+        r -> internalError $ "freezer: bad row of " <> t <> ": " <> sshow r
+
+-- | The number of rows of a key with @from <= txid < to@.
+sqliteKeyRowCount :: SQLiteEnv -> Text -> ByteString -> TxId -> TxId -> IO Int
+sqliteKeyRowCount db t k from to = freezerQry db
+    ("SELECT count(*) FROM " <> tbl (toUtf8 t) <> " WHERE rowkey = ? AND txid >= ? AND txid < ?")
+    [Pact4.SText (Utf8 k), txIdParam from, txIdParam to] [Pact4.RInt] >>= \case
+        [[Pact4.SInt n]] -> return (fromIntegral n)
+        r -> internalError $ "freezer: bad count: " <> sshow r
+
+-- | How a table is trimmed (spec 4.3, 6.2 step 5).
+data TrimRule
+    = KeepAnchors
+    -- ^ delete a row with @txid < F@ when a newer row of the same key with
+    -- @txid < F@ exists
+    | DropAll
+    -- ^ @SYS:Pacts@: delete every row with @txid < F@
+    deriving (Eq, Show)
+
+-- | The trim statement of a table and its parameters: step start, @F@ and
+-- the limit. Both delete through @rowid IN (SELECT ... LIMIT ?)@ because
+-- this SQLite may lack @DELETE ... LIMIT@. 'KeepAnchors' walks the rows @n@
+-- of the step (@[start, F)@, the txid index) and, for each, the older rows
+-- @o@ of its key (the @(rowkey, txid)@ index); @CROSS JOIN@ fixes that
+-- loop order.
+trimStatement :: Text -> TrimRule -> TxId -> TxId -> Int -> (SQ3.Utf8, [Pact4.SType])
+trimStatement t rule start f limit = case rule of
+    KeepAnchors ->
+        ( "DELETE FROM " <> tn <> " WHERE rowid IN (SELECT DISTINCT o.rowid FROM "
+            <> tn <> " AS n CROSS JOIN " <> tn <> " AS o"
+            <> " WHERE n.txid >= ? AND n.txid < ? AND o.rowkey = n.rowkey AND o.txid < n.txid LIMIT ?)"
+        , [txIdParam start, txIdParam f, Pact4.SInt (fromIntegral limit)]
+        )
+    DropAll ->
+        ( "DELETE FROM " <> tn <> " WHERE rowid IN (SELECT rowid FROM " <> tn <> " WHERE txid < ? LIMIT ?)"
+        , [txIdParam f, Pact4.SInt (fromIntegral limit)]
+        )
+  where
+    tn = tbl (toUtf8 t)
+
+-- | Deletes at most @limit@ rows of one trim chunk; returns the number of
+-- rows deleted.
+sqliteTrimChunk :: SQLiteEnv -> Text -> TrimRule -> TxId -> TxId -> Int -> IO Int
+sqliteTrimChunk db t rule start f limit = do
+    let (q, ps) = trimStatement t rule start f limit
+    throwOnDbError $ bracket (prepStmt db q) (ExceptT . SQ3.finalize) $ \stmt -> do
+        bindParams stmt ps
+        void $ ExceptT (SQ3.step stmt)
+    SQ3.changes db
+
+-- | @EXPLAIN QUERY PLAN@ of a trim statement: the @detail@ column, in order.
+sqliteExplainTrim :: SQLiteEnv -> Text -> TrimRule -> IO [Text]
+sqliteExplainTrim db t rule = do
+    let (q, ps) = trimStatement t rule 1 2 3
+    rows <- freezerQry db ("EXPLAIN QUERY PLAN " <> q) ps [Pact4.RInt, Pact4.RInt, Pact4.RInt, Pact4.RText]
+    forM rows $ \case
+        [_, _, _, Pact4.SText (Utf8 d)] -> return (T.decodeUtf8 d)
+        r -> internalError $ "freezer: bad plan row: " <> sshow r
+
+-- | Runs a trim chunk in the savepoint @trim@: released on success, rolled
+-- back on any exception.
+sqliteWithTrimSavepoint :: SQLiteEnv -> IO a -> IO a
+sqliteWithTrimSavepoint db act = fmap fst $ generalBracket
+    (Pact4.exec_ db "SAVEPOINT [trim];")
+    (\_ -> \case
+        ExitCaseSuccess {} -> Pact4.exec_ db "RELEASE SAVEPOINT [trim];"
+        _ -> do
+            Pact4.exec_ db "ROLLBACK TRANSACTION TO SAVEPOINT [trim];"
+            Pact4.exec_ db "RELEASE SAVEPOINT [trim];"
+    ) $ \_ -> act

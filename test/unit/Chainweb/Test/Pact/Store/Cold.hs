@@ -108,7 +108,31 @@ tests = testGroup "Cold store"
     , testCase "a write that throws leaves table ids, key ids and meta unchanged" failedWriteTest
     , testCase "table name helpers" tableNameTest
     , testCase "a step that is not after the written frontier is refused" stepOrderTest
+    , testCase "publish makes a step's new tables visible before it moves the frontier" publishOrderTest
     ]
+
+-- | Review finding M1 of Task 22: a reader that sees the new frontier must
+-- also see the step's tables. The hook runs between the two updates.
+publishOrderTest :: IO ()
+publishOrderTest = withDir $ \dir -> withStore dir $ \cs -> do
+    ref <- newIORef Nothing
+    seen <- newIORef []
+    let mid = readIORef ref >>= \case
+            Nothing -> assertFailure "no chain"
+            Just cc -> do
+                v <- _ccVerified cc
+                t <- _ccTableId cc "New_Table"
+                rows <- _ccRowsAtTxId cc "New_Table" 1
+                writeIORef seen [show v, show (t /= Nothing), show rows]
+    cc <- openColdChainHooked writeBatchSync mid cs cid
+    writeIORef ref (Just cc)
+    _ccWriteStep cc $ stp (fr 1 2) [("New_Table", [row "k" 1 "v"])]
+    _ccPublish cc
+    -- between the updates: the catalog already has the table, the frontier
+    -- is still the old one, so the step's rows stay invisible
+    readIORef seen >>= (@?= [show (Nothing :: Maybe Frontier), show True, show (Nothing :: Maybe [(B.ByteString, B.ByteString)])])
+    _ccVerified cc >>= (@?= Just (fr 1 2))
+    _ccRowsAtTxId cc "New_Table" 1 >>= (@?= Just [("k", "v")])
 
 metaRejectTest :: IO ()
 metaRejectTest = do

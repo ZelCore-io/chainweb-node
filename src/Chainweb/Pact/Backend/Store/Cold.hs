@@ -47,8 +47,10 @@ module Chainweb.Pact.Backend.Store.Cold
 , StepRow(..)
 , ColdStep(..)
 , ColdChain(..)
+, ColdFreezerView(..)
 , openColdChain
 , openColdChainWith
+, openColdChainHooked
 
   -- * Reads
 , coldReadNewest
@@ -318,6 +320,25 @@ data ColdChain = ColdChain
     , _ccTxIdsBetween :: !(Text -> Pact4.TxId -> Pact4.TxId -> IO [Pact4.TxId])
     , _ccRowsAtTxId :: !(Text -> Pact4.TxId -> IO (Maybe [(B.ByteString, B.ByteString)]))
     , _ccRowsInTxIdRange :: !(Text -> Pact4.TxId -> Pact4.TxId -> IO [(Pact4.TxId, B.ByteString, B.ByteString)])
+    , _ccFreezerView :: !ColdFreezerView
+        -- ^ for the freezer's verify step only; split routing must never use
+        -- it (it is not clamped to the verified frontier)
+    }
+
+-- | The freezer's view of a chain, for the verify step (spec 6.2 step 3).
+-- Unlike the reads above it is clamped to the __written__ frontier, and its
+-- catalog includes the table ids of a written but unpublished step, so it
+-- sees the rows of the step that was just written. Split routing must not use
+-- it: below the written frontier and above the verified one, rows are not yet
+-- verified.
+--
+data ColdFreezerView = ColdFreezerView
+    { _fvRowAt :: !(Text -> B.ByteString -> Pact4.TxId -> IO (Maybe B.ByteString))
+        -- ^ the exact @R@ entry of (table, row key, txid)
+    , _fvRowsAtTxId :: !(Text -> Pact4.TxId -> IO (Maybe [(B.ByteString, B.ByteString)]))
+        -- ^ as '_ccRowsAtTxId'
+    , _fvKeyVersions :: !(Text -> B.ByteString -> Pact4.TxId -> Pact4.TxId -> IO Int)
+        -- ^ the number of @R@ entries of a key with @from <= txid < to@
     }
 
 -- | The writer state of a chain. It changes only after a batch is written.
@@ -343,7 +364,19 @@ openColdChainWith
     -> ColdStore
     -> ChainId
     -> IO ColdChain
-openColdChainWith writer cs c = do
+openColdChainWith writer = openColdChainHooked writer (return ())
+
+-- | 'openColdChainWith' with an action that '_ccPublish' runs between making
+-- the new catalog entries visible and moving the in-memory frontier. For
+-- tests of the publish order.
+--
+openColdChainHooked
+    :: (RocksDb -> [R.BatchOp] -> IO ())
+    -> IO ()
+    -> ColdStore
+    -> ChainId
+    -> IO ColdChain
+openColdChainHooked writer midPublish cs c = do
     modifyMVar_ (_csOpenChains cs) $ \open -> do
         when (S.member c open) $
             coldError $ "chain " <> chainIdToText c <> " is already open"
@@ -370,6 +403,14 @@ openColdChainWith writer cs c = do
         , _wsNextKey = mempty
         , _wsUnpublished = []
         }
+    -- the freezer's view: the written frontier and the writer's catalog,
+    -- which includes the tables of an unpublished step
+    let written = Readers
+            { _rdDb = db
+            , _rdChain = c
+            , _rdFrontier = txIdWord . frontierTxId . _cmWritten <$> readIORef metaRef
+            , _rdTable = \name -> HM.lookup (foldTableName name) . _wsTables <$> readMVar writerVar
+            }
     return ColdChain
         { _ccChain = c
         , _ccMeta = readIORef metaRef
@@ -394,9 +435,15 @@ openColdChainWith writer cs c = do
                             , _cmTrimFrom = frontierTxId (_cmVerified m)
                             }
                     writer db [R.Put (metaKey c) (encodeColdMeta m')]
-                    writeIORef metaRef m'
+                    -- the catalog first, then the frontier: a reader that
+                    -- sees the new frontier also sees the step's tables, and
+                    -- one that sees the new catalog with the old frontier is
+                    -- still clamped to the old frontier (readers read the
+                    -- catalog first, then the frontier)
                     atomicModifyIORef' catalogRef $ \cat ->
                         (foldl' (\acc (n, t) -> HM.insert n t acc) cat (_wsUnpublished ws), ())
+                    midPublish
+                    atomicWriteIORef metaRef m'
                     return ws { _wsMeta = m', _wsUnpublished = [] }
         , _ccTableId = \name -> HM.lookup (foldTableName name) <$> readIORef catalogRef
         , _ccReadNewest = readNewest readers
@@ -404,6 +451,11 @@ openColdChainWith writer cs c = do
         , _ccTxIdsBetween = txIdsBetween readers
         , _ccRowsAtTxId = rowsAtTxId readers
         , _ccRowsInTxIdRange = rowsInTxIdRange readers
+        , _ccFreezerView = ColdFreezerView
+            { _fvRowAt = rowAt written
+            , _fvRowsAtTxId = rowsAtTxId written
+            , _fvKeyVersions = keyVersions written
+            }
         }
   where
     db = _csDb cs
@@ -621,6 +673,33 @@ rowsAtTxId rd name txid = withTable rd name Nothing $ \t f -> do
     else R.get (_rocksDbHandle (_rdDb rd)) mempty (txidKey (_rdChain rd) t x) >>= \case
         Nothing -> return Nothing
         Just ids -> Just <$> resolveTxId rd t x ids
+
+-- | The exact @R@ entry of (table, row key, txid), when @txid < F@.
+rowAt :: Readers -> Text -> B.ByteString -> Pact4.TxId -> IO (Maybe B.ByteString)
+rowAt rd name key txid = withTable rd name Nothing $ \t f -> do
+    let x = txIdWord txid
+    if x >= f
+    then return Nothing
+    else R.get (_rocksDbHandle (_rdDb rd)) mempty (rowKey (_rdChain rd) t key x)
+
+-- | The number of @R@ entries of a key with @from <= txid < min to F@.
+keyVersions :: Readers -> Text -> B.ByteString -> Pact4.TxId -> Pact4.TxId -> IO Int
+keyVersions rd name key from to = withTable rd name 0 $ \t f -> do
+    let lo = txIdWord from
+        hi = min (txIdWord to) f
+        c = _rdChain rd
+        prefix = rowKeyPrefix c t key
+    if lo >= hi
+    then return 0
+    else withIterator (_rdDb rd) $ \it -> do
+        I.iterSeek it (rowKey c t key lo)
+        let go !n = I.iterKey it >>= \case
+                Just k | prefix `B.isPrefixOf` k -> case be64 (B.drop (B.length prefix) k) of
+                    Just x | x < hi -> I.iterNext it >> go (n + 1)
+                    Just _ -> return n
+                    Nothing -> coldError $ "bad R key: " <> T.pack (show k)
+                _ -> return n
+        go 0
 
 -- | Resolves a @T@ list: each key id through @I@, then the exact @R@ entry.
 resolveTxId :: Readers -> TableId -> Word64 -> B.ByteString -> IO [(B.ByteString, B.ByteString)]

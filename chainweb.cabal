@@ -318,6 +318,7 @@ library
         , Chainweb.Pact.Backend.SQLite.V2
         , Chainweb.Pact.Backend.Store.Cold
         , Chainweb.Pact.Backend.Store.Cold.Key
+        , Chainweb.Pact.Backend.Store.Freezer
         , Chainweb.Pact.Backend.InMemDb
         , Chainweb.Pact.Backend.Store.SQLite
         , Chainweb.Pact.Backend.Store.Types
@@ -683,6 +684,7 @@ test-suite chainweb-tests
         Chainweb.Test.Pact.Store.Cold
         Chainweb.Test.Pact.Store.ColdKey
         Chainweb.Test.Pact.Store.ColdRead
+        Chainweb.Test.Pact.Store.Freezer
         Chainweb.Test.Payload.Store
         Chainweb.Test.ResponseSizeLimiter
         Chainweb.Test.RestAPI
