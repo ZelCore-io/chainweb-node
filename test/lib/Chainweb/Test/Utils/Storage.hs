@@ -58,6 +58,13 @@
 -- @compactAndResumeTest@ and the unregistered @pactImportTest@ of
 -- "Chainweb.Test.MultiNode" (@compaction-tests@).
 --
+-- These run in sqlite mode in shadow mode only, and in split mode in split
+-- ('acquireTestChainStorageSqliteInShadow',
+-- 'Chainweb.Test.Pact4.Utils.withPactTestBlockDbSqliteInShadow'):
+-- @Chainweb.Test.Pact4.PactReplay@, because it rewinds deep below the freeze
+-- frontier ('RewindLimit' 100_000), which the split side refuses by design
+-- while the legacy side rewinds, so shadow would count that as a difference.
+--
 module Chainweb.Test.Utils.Storage
 ( TestStorageOption(..)
 , testStorageOptions
@@ -72,6 +79,7 @@ module Chainweb.Test.Utils.Storage
 , NonSqliteFixture(..)
 , makeNonSqliteFixtures
 , acquireTestChainStorage
+, acquireTestChainStorageSqliteInShadow
 , acquireSplitChainStorageFor
 , testChainStorageResource
 , withTestChainStorage
@@ -241,11 +249,28 @@ acquireTestChainStorage
     -> (SQLiteEnv -> IO ())
     -> IO (ChainStorage, IO ())
 acquireTestChainStorage v cid openSqlite closeSqlite = testSplitStorage >>= \case
-    False -> do
-        sql <- openSqlite
-        st <- sqliteChainStorage sql `onException` closeSqlite sql
-        return (st, closeSqlite sql)
+    False -> acquireSqliteChainStorage openSqlite closeSqlite
     True -> acquireSplitChainStorage v cid
+
+-- | 'acquireTestChainStorage' that stays in sqlite mode in shadow mode (and
+-- in sqlite mode), and is split in split mode. For the tests that rewind
+-- deeper than the freeze frontier, which shadow does not cover by design.
+acquireTestChainStorageSqliteInShadow
+    :: ChainwebVersion
+    -> ChainId
+    -> IO SQLiteEnv
+    -> (SQLiteEnv -> IO ())
+    -> IO (ChainStorage, IO ())
+acquireTestChainStorageSqliteInShadow v cid openSqlite closeSqlite =
+    (_phStore <$> testPactHistoryConfig) >>= \case
+        HistorySplit -> acquireSplitChainStorage v cid
+        _ -> acquireSqliteChainStorage openSqlite closeSqlite
+
+acquireSqliteChainStorage :: IO SQLiteEnv -> (SQLiteEnv -> IO ()) -> IO (ChainStorage, IO ())
+acquireSqliteChainStorage openSqlite closeSqlite = do
+    sql <- openSqlite
+    st <- sqliteChainStorage sql `onException` closeSqlite sql
+    return (st, closeSqlite sql)
 
 acquireSplitChainStorage :: ChainwebVersion -> ChainId -> IO (ChainStorage, IO ())
 acquireSplitChainStorage v cid = do

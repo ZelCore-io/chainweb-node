@@ -90,6 +90,7 @@ module Chainweb.Test.Pact4.Utils
 -- * Pact Service creation
 , withPactTestBlockDb
 , withPactTestBlockDb'
+, withPactTestBlockDbSqliteInShadow
 , withWebPactExecutionService
 , withWebPactExecutionServiceCompaction
 , withPactCtxSQLite
@@ -202,7 +203,7 @@ import Chainweb.Pact.Backend.PactState qualified as PactState
 import Chainweb.Pact.Backend.PactState (TableDiffable(..), Table(..), PactRow(..))
 import Chainweb.Pact.PactService.Checkpointer.Internal (initCheckpointerResourcesWith)
 import Chainweb.Pact.Backend.Store.Node (ChainStorage(..), ChainStore(..))
-import Chainweb.Test.Utils.Storage (acquireTestChainStorage, withTestChainStorage)
+import Chainweb.Test.Utils.Storage (acquireTestChainStorage, acquireTestChainStorageSqliteInShadow, withTestChainStorage)
 import Chainweb.Pact.Backend.SQLite.DirectV2
 
 import Chainweb.Pact.Backend.Utils hiding (tbl, withSqliteDb)
@@ -1020,7 +1021,32 @@ withPactTestBlockDb
     -> PactServiceConfig
     -> (IO (SQLiteEnv,PactQueue,TestBlockDb) -> TestTree)
     -> TestTree
-withPactTestBlockDb version cid rdb mempoolIO pactConfig f =
+withPactTestBlockDb = withPactTestBlockDbWith acquireTestChainStorage
+
+-- | 'withPactTestBlockDb' that runs in sqlite mode when
+-- @CHAINWEB_TEST_STORAGE@ selects shadow (split mode stays split). For the
+-- tests that rewind deeper than the freeze frontier, which the split side
+-- refuses by design, so that shadow would count it as a difference.
+withPactTestBlockDbSqliteInShadow
+    :: ChainwebVersion
+    -> ChainId
+    -> RocksDb
+    -> IO MemPoolAccess
+    -> PactServiceConfig
+    -> (IO (SQLiteEnv,PactQueue,TestBlockDb) -> TestTree)
+    -> TestTree
+withPactTestBlockDbSqliteInShadow = withPactTestBlockDbWith acquireTestChainStorageSqliteInShadow
+
+withPactTestBlockDbWith
+    :: (ChainwebVersion -> ChainId -> IO SQLiteEnv -> (SQLiteEnv -> IO ()) -> IO (ChainStorage, IO ()))
+    -> ChainwebVersion
+    -> ChainId
+    -> RocksDb
+    -> IO MemPoolAccess
+    -> PactServiceConfig
+    -> (IO (SQLiteEnv,PactQueue,TestBlockDb) -> TestTree)
+    -> TestTree
+withPactTestBlockDbWith acquire version cid rdb mempoolIO pactConfig f =
   withResourceT (withTempDir "pact-dir") $ \iodir ->
   withResourceT (mkTestBlockDb version rdb) $ \bdbio ->
   withResource (startPact bdbio iodir) stopPact $ f . fmap (view _2)
@@ -1034,7 +1060,7 @@ withPactTestBlockDb version cid rdb mempoolIO pactConfig f =
         let pdb = _bdbPayloadDb bdb
         -- sqlite mode: the SQLite file in dir, as before; split and shadow
         -- (CHAINWEB_TEST_STORAGE): a temporary split or shadow layout
-        (st, release) <- acquireTestChainStorage version cid (startSqliteDb cid logger dir False) stopSqliteDb
+        (st, release) <- acquire version cid (startSqliteDb cid logger dir False) stopSqliteDb
         a <- async $ runForever (\_ _ -> return ()) "Chainweb.Test.Pact4.Utils.withPactTestBlockDb" $
             runPactServiceStorage version cid logger Nothing reqQ mempool bhdb pdb st pactConfig
         return ((a, release), (_cstSql st,reqQ,bdb))

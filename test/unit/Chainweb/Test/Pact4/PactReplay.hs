@@ -71,16 +71,16 @@ tests rdb =
         mpio = fst <$> dmp
     in
     independentSequentialTestGroup label
-        [ withPactTestBlockDb testVer cid rdb mp (forkLimit $ RewindLimit 100_000)
+        [ withPactTestBlockDbSqliteInShadow testVer cid rdb mp (forkLimit $ RewindLimit 100_000)
             (testCase "initial-playthrough" . firstPlayThrough mpio genblock)
-        , withPactTestBlockDb testVer cid rdb mp (forkLimit $ RewindLimit 100_000)
+        , withPactTestBlockDbSqliteInShadow testVer cid rdb mp (forkLimit $ RewindLimit 100_000)
             (testCase "service-init-after-fork" . serviceInitializationAfterFork mpio genblock)
-        , withPactTestBlockDb testVer cid rdb mp (forkLimit $ RewindLimit 100_000)
+        , withPactTestBlockDbSqliteInShadow testVer cid rdb mp (forkLimit $ RewindLimit 100_000)
             (testCaseSteps "on-restart" . onRestart mpio)
-        , withPactTestBlockDb testVer cid rdb mp (forkLimit $ RewindLimit 100_000)
+        , withPactTestBlockDbSqliteInShadow testVer cid rdb mp (forkLimit $ RewindLimit 100_000)
             (testCase "reject-dupes" . testDupes mpio genblock)
         , let deepForkLimit = RewindLimit 4
-          in withPactTestBlockDb testVer cid rdb mp (forkLimit deepForkLimit)
+          in withPactTestBlockDbSqliteInShadow testVer cid rdb mp (forkLimit deepForkLimit)
             (testCaseSteps "deep-fork-limit" . testDeepForkLimit mpio deepForkLimit)
         ]
   where
