@@ -274,9 +274,13 @@ coldRawGet :: ColdStore -> B.ByteString -> IO (Maybe B.ByteString)
 coldRawGet cs = R.get (_rocksDbHandle (_csDb cs)) mempty
 
 -- | The key of the node-wide store id. Not in a keyspace (no capital
--- letter first), so no prefix scan of the chains' entries meets it.
+-- letter first), so no prefix scan of the chains' entries meets it. It sorts
+-- before every keyspace, so it is never the last key of a data block that
+-- also holds keyspace entries, and @cw-measure split-size@, which counts a
+-- block in the range of its index key, keeps attributing such blocks to
+-- their keyspace.
 storeIdKey :: B.ByteString
-storeIdKey = "pact-split-store-id"
+storeIdKey = "!pact-split-store-id"
 
 -- | The store id that binds the cold store to its @sqlite-split@ directory,
 -- whose format marker holds the same id; 'Nothing' if none is written.
