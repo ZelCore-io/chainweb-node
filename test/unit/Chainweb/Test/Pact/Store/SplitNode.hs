@@ -783,6 +783,15 @@ emptyColdTest = do
         Just m <- readSplitMarker (root </> splitDirName)
         writeMarkerFile (root </> splitDirName) m { _smStoreId = Just "another-store" }
         startSplit root >>= assertRefused "other store" ["store id", "another-store"]
+    -- a trimmed split dir from before the store id, next to a cold store
+    -- that has one (P3a concern 2): refused, the marker is not adopted
+    withFixture $ \root _twin -> do
+        withPlainNode root $ \n -> void $ runToEnd (_nEnv n)
+        withColdStore (root </> coldDirName) ColdReadWrite 8388608 $ \cs -> setColdStoreId cs "foreign-store"
+        startSplit root >>= assertRefused "id in cold only" ["has no store id", "foreign-store", "not adopted"]
+        readSplitMarker (root </> splitDirName) >>= \case
+            Just m -> _smStoreId m @?= Nothing
+            Nothing -> assertFailure "no marker"
 
 -- | A mixed restore: the cold store of an older snapshot, the SQLite files of
 -- a newer one. The rows between the two frontiers are in neither store.

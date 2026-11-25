@@ -202,10 +202,14 @@ withPactStorageMode mode logger v cfg root reset k = do
 -- * A marker that has no first trim yet (shadow mode) and its cold store
 --   take a new id, or the one of the side that has it.
 -- * Migration: a trimmed @sqlite-split@ whose marker predates store ids gets
---   one once, when the cold store is consistent with it: its verified
---   frontier on the marker's first-trim chain is at or above the first-trim
---   height. The id goes into the cold store first, then into the marker; a
---   crash between the two is completed at the next start.
+--   one once, when the cold store has no id either and is consistent with
+--   it: its verified frontier on the marker's first-trim chain is at or
+--   above the first-trim height. The id goes into the cold store first, then
+--   into the marker.
+-- * A trimmed @sqlite-split@ without an id next to a cold store with one is
+--   refused, not adopted: a foreign cold store with deeper history would
+--   pass the frontier check. A crash between the two writes of the
+--   migration leaves this state too, and the refusal names it.
 --
 -- A read-only open (tools) checks but writes nothing.
 --
@@ -236,10 +240,17 @@ bindSplitStore omode layout cs = do
                     , "so the history below the frontier is missing."
                     ]
                 | otherwise -> whenWritable (setColdStoreId cs a) >> bind a
-            (Nothing, Just b) -> do
-                consistent m
-                whenWritable (writeMarkerFile dir m { _smStoreId = Just b })
-                bind b
+            (Nothing, Just b)
+                | trimmed m -> refuse
+                    [ "the SQLite files in", T.pack dir, "are trimmed and their format marker has no store id,"
+                    , "but the cold store", T.pack coldDir, "has the store id", b <> "."
+                    , "A cold store with an id is not adopted by trimmed files without one: it may belong to another node"
+                    , "(or a start stopped inside the one-time store id migration)."
+                    ]
+                | otherwise -> do
+                    -- nothing trimmed: the SQLite files hold the whole history
+                    whenWritable (writeMarkerFile dir m { _smStoreId = Just b })
+                    bind b
             (Nothing, Nothing) -> do
                 consistent m
                 whenWritable $ do
