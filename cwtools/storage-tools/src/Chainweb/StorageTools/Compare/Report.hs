@@ -1034,7 +1034,6 @@ instance ToJSON Report where
             ]
         , "frontiers" .= object
             [ K.fromText (toText cid) .= h | (cid, h) <- M.toList (_repFrontiers rep) ]
-        , "frontierCounts" .= ("perClass belowFrontier and aboveFrontier count the requests the test side answered, by target height against the chain's frontier" :: T.Text)
         , "orderOnly" .= object
             [ "total" .= reportClassTotal rep KindOrderOnly
             , "txids" .= reportOrderOnlyTxids rep

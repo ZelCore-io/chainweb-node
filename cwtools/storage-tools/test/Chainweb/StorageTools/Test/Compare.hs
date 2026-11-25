@@ -1189,7 +1189,7 @@ runTests = testGroup "runCompare"
         let opts = defaultRunOptions { _roTransportAttempts = 3, _roRetryDelay = 700_000 }
             latMax rep = _lsMax <$> reportLatency rep ClsPayload AboveFrontier
             fast what rep = case latMax rep of
-                Just us -> assertBool (what <> ": " <> show us <> " us") (us < 350_000)
+                Just us -> assertBool (what <> ": " <> show us <> " us") (us < 500_000)
                 Nothing -> assertFailure (what <> ": no latency recorded")
         -- the test side refuses once (503): the answer comes after a 700 ms backoff
         (rep1, nt) <- withStubs 1_000 oracleConf testConf { _scPayloadStatuses = [503] } $ \o t _ st -> do

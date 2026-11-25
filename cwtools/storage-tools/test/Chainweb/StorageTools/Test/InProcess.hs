@@ -738,6 +738,8 @@ endToEnd getFx = testGroup "EndToEnd"
             parseMaybe (withObject "report" $ \o -> o .: "settings" >>= (.: "allowReadsInLocal")) j @?= Just ("true" :: T.Text)
             assertBool "the summary names the settings" $
                 "allowReadsInLocal=true" `T.isInfixOf` reportSummary rep
+            assertBool "no frontierCounts prose key in the report JSON" $
+                not ("frontierCounts" `T.isInfixOf` T.pack (show j))
     ]
 
 -- -------------------------------------------------------------------------- --
