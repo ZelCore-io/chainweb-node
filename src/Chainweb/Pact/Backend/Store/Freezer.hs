@@ -348,15 +348,18 @@ readStep env db (StepPlan blocks) = do
     readBlocks db start (Just (_phFreezeStepBytes (_feConfig env))) blocks
 
 -- | The tables the first step (no frontier yet, txids from 0) reads and
--- trims besides those of @VersionedTableMutation@: every table. A history
--- that does not start at genesis (a compacted database) holds rows below
--- its first block that no @VersionedTableMutation@ row of a planned height
--- names; the first step's txid range starts at 0, so it covers them. On a
--- history from genesis this adds nothing: every genesis row is named.
+-- trims besides those of @VersionedTableMutation@: every Pact table of the
+-- SQLite schema at that moment ('sqliteSchemaTables'). A history that does
+-- not start at genesis (a compacted database) holds rows below its first
+-- block that no @VersionedTableMutation@ row of a planned height names, and
+-- the compaction may keep no @VersionedTableCreation@ row for their table.
+-- The first step's txid range starts at 0, so it covers those rows; a table
+-- first changed after the first step would otherwise join the cold catalog
+-- in a later step whose range misses them, and reads below F would go to
+-- cold and miss them. On a history from genesis this adds nothing: every
+-- genesis row is named.
 firstStepTables :: SQLiteEnv -> IO [Text]
-firstStepTables db = (sysTables ++) <$> sqliteUserTables db
-  where
-    sysTables = ["SYS:KeySets", "SYS:Modules", "SYS:Namespaces", "SYS:Pacts", "SYS:ModuleSources"]
+firstStepTables = sqliteSchemaTables
 
 -- | The bytes a row counts for in the step cap.
 rowBytes :: StepRow -> Int

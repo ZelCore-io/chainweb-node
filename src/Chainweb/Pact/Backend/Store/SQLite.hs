@@ -35,6 +35,7 @@ module Chainweb.Pact.Backend.Store.SQLite
     , SqliteFileStats(..)
     , sqliteFileStats
     , sqliteUserTables
+    , sqliteSchemaTables
 
       -- * Split routing (storage redesign P3, spec 4.3)
     , LegacyRead(..)
@@ -1038,6 +1039,21 @@ sqliteFileStats db = do
 sqliteUserTables :: SQLiteEnv -> IO [Text]
 sqliteUserTables db = freezerQry db
     "SELECT tablename FROM VersionedTableCreation ORDER BY tablename"
+    [] [Pact4.RText] >>= traverse freezerTableName
+
+-- | Every Pact table in the SQLite schema (@sqlite_master@), user and
+-- @SYS:*@, named as stored, in name order: every table with the columns
+-- @rowkey@, @txid@ and @rowdata@, other than SQLite's own tables and the
+-- checkpointer's bookkeeping tables. The freezer's first step catalogs these;
+-- unlike @VersionedTableCreation@ or @VersionedTableMutation@, the schema
+-- names every table that holds rows, also on a compacted database.
+sqliteSchemaTables :: SQLiteEnv -> IO [Text]
+sqliteSchemaTables db = freezerQry db
+    "SELECT m.name FROM sqlite_master AS m WHERE m.type = 'table' \
+    \AND m.name NOT LIKE 'sqlite\\_%' ESCAPE '\\' \
+    \AND m.name NOT IN ('BlockHistory', 'VersionedTableCreation', 'VersionedTableMutation', 'TransactionIndex') \
+    \AND (SELECT count(*) FROM pragma_table_info(m.name) AS c WHERE c.name IN ('rowkey', 'txid', 'rowdata')) = 3 \
+    \ORDER BY m.name"
     [] [Pact4.RText] >>= traverse freezerTableName
 
 -- -------------------------------------------------------------------------- --

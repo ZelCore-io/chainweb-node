@@ -40,16 +40,17 @@ import qualified Pact.Types.Persistence as Pact4
 import Chainweb.BlockHeader.Internal
 import Chainweb.Pact.Backend.Store.Cold
 import Chainweb.Pact.Backend.Store.Freezer
-import Chainweb.Pact.Backend.Store.Layout (PactLayoutError(..))
+import Chainweb.Pact.Backend.Store.Layout (PactLayoutError(..), sqliteDirName)
 import Chainweb.Pact.Backend.Store.Config (PactHistoryStore(..))
 import Chainweb.Pact.Backend.Store.SQLite
 import Chainweb.Pact.Backend.Store.Split
 import Chainweb.Pact.Backend.Store.Types
 import Chainweb.Pact.Backend.Types (SQLiteEnv)
+import Chainweb.Pact.Backend.Utils (chainDbFileName, chainwebPragmas, withSQLiteConnection, withTempSQLiteConnection)
 import qualified Pact.Types.SQLite as P4SQL
 import Chainweb.Storage.Table.RocksDB (writeBatchSync)
 import Chainweb.Test.Pact.Store.Freezer
-    ( cid, mkHash, block, commitAll, dataTables, withFixture, Node(..), Crash(..)
+    ( cid, mkHash, block, commitAll, dataTables, withFixture, withHistoryFixture, history, Node(..), Crash(..)
     , testConfig, withNode, withNodeW, withPlainNode, runToEnd, finalFrontier, frontierAt
     , dumpTables, bookkeeping, masterOf
     )
@@ -73,6 +74,7 @@ tests = testGroup "Split store"
     , testCase "a trim cut short at one frontier resumes, and the next step's trim removes stale anchors, inside a read's hot statement: every read op equals the legacy twin (n2)" trimResumeRaceTest
     , testCase "backup is refused" backupTest
     , testCase "a frozen-name table missing from the cold catalog with rows below F: every read op equals the legacy twin" uncataloguedTest
+    , testCase "a compacted base whose table is first changed after the first step: every read op below F equals the legacy twin" compactedLateTableTest
     ]
 
 -- -------------------------------------------------------------------------- --
@@ -549,3 +551,39 @@ uncataloguedTest = withSplit $ \s -> do
     _ccTableId (_nCold (_sNode s)) "Orphan_Table" >>= (@?= Nothing)
     compareTable s (bounds ++ [132 .. 141]) "Orphan_Table" "Orphan_Table"
     compareKeys s (bounds ++ [132 .. 141]) "Orphan_Table" "Orphan_Table"
+
+-- | A compacted base (P3a concern 1): the history starts at height 2, and
+-- the compaction kept no @VersionedTableCreation@ row below it, so only the
+-- SQLite schema names @Gap_Table@. Its rows at heights 0 and 1 are below the
+-- first block; the table is next changed at height 6, in the second step.
+-- The first step must catalog and freeze every table of the schema, or the
+-- second step catalogs @Gap_Table@ with only its own rows, and reads below
+-- F go to cold and miss the compacted rows.
+compactedLateTableTest :: Assertion
+compactedLateTableTest = withHistoryFixture hist $ \root -> withTempSQLiteConnection chainwebPragmas $ \twin -> do
+    _psInitSchema (sqlitePactStore twin)
+    commitAll twin hist
+    withSQLiteConnection (root </> sqliteDirName </> chainDbFileName cid) chainwebPragmas $ \db ->
+        forM_ [db, twin] compact
+    withPlainNode root $ \n -> do
+        outcomes <- runToEnd (_nEnv n)
+        outcomes @?= [Froze (frontierAt 4), Froze (frontierAt 7), NothingToDo]
+        splitOf n twin $ \s -> do
+            forM_ ("Gap_Table" : dataTables) $ \t -> compareTable s bounds t t
+            compareKeys s bounds "Gap_Table" "Gap_Table"
+  where
+    hist = gap <$> history
+    gap b
+        | h == 1 = b
+            { _bcNewTables = _bcNewTables b ++ ["Gap_Table"]
+            , _bcRows = _bcRows b ++ [("Gap_Table", [("g", 19, "{\"g\":1}"), ("h", 19, "{\"h\":1}")])]
+            }
+        | h == 6 = b
+            { _bcRows = _bcRows b ++ [("Gap_Table", [("g", 69, "{\"g\":6}")])] }
+        | otherwise = b
+      where
+        h = fromIntegral (_bcHeight b) :: Int
+    compact db = do
+        P4SQL.exec_ db "DELETE FROM BlockHistory WHERE blockheight < 2"
+        P4SQL.exec_ db "DELETE FROM VersionedTableMutation WHERE blockheight < 2"
+        P4SQL.exec_ db "DELETE FROM VersionedTableCreation WHERE createBlockheight < 2"
