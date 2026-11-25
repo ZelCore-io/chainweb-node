@@ -153,6 +153,9 @@ splitPactStore env = hot
     , _psRowsAtTxId = rowsAtTxId env
     , _psRowsInTxIdRange = rowsInTxIdRange env
     , _psRewindDbTo = rewindDbTo env
+    -- the rewind guard ends when any batch ends. There are no nested batch
+    -- callers, and the guard assumes none: a nested batch would release it
+    -- before the outer one commits.
     , _psWithBatch = \act -> _psWithBatch hot act `finally` guardEndRewind (rewindGuard env)
     , _psBackupTo = \_ -> throwIO (BackupRefused HistorySplit)
     }

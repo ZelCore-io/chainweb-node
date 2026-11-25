@@ -231,7 +231,7 @@ pPactHistoryConfig = id
     <$< phStore .:: option pactHistoryStoreReader
         % long "pact-history-store"
         <> metavar "sqlite|split|shadow"
-        <> help "Where the Pact history is kept: sqlite (the SQLite files only), split (recent history in SQLite, older row versions in a cold RocksDB store), or shadow (split next to an untouched legacy SQLite file, comparing every read). split and shadow are refused on testnet04, testnet06 and recap-development; they are allowed on mainnet01, development and the test versions."
+        <> help "Where the Pact history is kept: sqlite (the SQLite files only), split (recent history in SQLite, older row versions in a cold RocksDB store), or shadow (split next to an untouched legacy SQLite file, comparing every read; on a populated legacy directory, shadow needs a split side built from the same history). split and shadow are refused on testnet04, testnet06 and recap-development; they are allowed on mainnet01, development and the test versions."
     <*< phFreezeDepth .:: option (BlockHeight <$> positiveReader @Word64 "--pact-freeze-depth")
         % long "pact-freeze-depth"
         <> metavar "HEIGHTS"
