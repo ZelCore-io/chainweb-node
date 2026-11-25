@@ -31,6 +31,10 @@ module Chainweb.Pact.Backend.Store.SQLite
     , sqliteTrimChunk
     , sqliteWithTrimSavepoint
     , sqliteExplainTrim
+
+      -- * Split routing (storage redesign P3, spec 4.3)
+    , LegacyRead(..)
+    , sqliteExplainLegacyRead
     ) where
 
 import Control.Exception (SomeAsyncException, evaluate)
@@ -211,40 +215,45 @@ readHistorical db tableName k e = runExceptT $ do
 -- | Pact 4 @doKeys@ ('KeysAsStored') and Pact 5 @doKeys@ ('KeysOrderedByKey').
 distinctKeys :: SQLiteEnv -> KeysQuery -> Text -> IO (Either SQ3.Error [ByteString])
 distinctKeys db q tn = runExceptT $ do
-    ks <- case q of
-        KeysAsStored mlim -> do
-            let blockLimitStmt = maybe "" (const " WHERE txid < ?;") mlim
-            let blockLimitParam = maybe [] (\txid -> [txIdParam txid]) mlim
-            qry db ("SELECT DISTINCT rowkey FROM " <> tbl (toUtf8 tn) <> blockLimitStmt) blockLimitParam [Pact4.RText]
-        KeysOrderedByKey txid ->
-            qry db
-                ("SELECT DISTINCT rowkey FROM " <> tbl (toUtf8 tn) <> "WHERE txid < ? ORDER BY rowkey;")
-                [txIdParam txid] [Pact4.RText]
+    let (stmt, params) = distinctKeysStmt q tn
+    ks <- qry db stmt params [Pact4.RText]
     forM ks $ \case
         [Pact4.SText (Utf8 k)] -> return k
         _ -> internalError "doKeys: The impossible happened."
 
+-- | The statement of 'distinctKeys' and its parameters.
+distinctKeysStmt :: KeysQuery -> Text -> (SQ3.Utf8, [Pact4.SType])
+distinctKeysStmt q tn = case q of
+    KeysAsStored mlim ->
+        let blockLimitStmt = maybe "" (const " WHERE txid < ?;") mlim
+            blockLimitParam = maybe [] (\txid -> [txIdParam txid]) mlim
+        in ("SELECT DISTINCT rowkey FROM " <> tbl (toUtf8 tn) <> blockLimitStmt, blockLimitParam)
+    KeysOrderedByKey txid ->
+        ("SELECT DISTINCT rowkey FROM " <> tbl (toUtf8 tn) <> "WHERE txid < ? ORDER BY rowkey;", [txIdParam txid])
+
 -- | Pact 4 @doTxIds@.
 txIdsAfter :: SQLiteEnv -> Text -> TxId -> IO (Either SQ3.Error [TxId])
 txIdsAfter db tn tid = runExceptT $ do
-    rows <- qry db stmt [txIdParam tid] [Pact4.RInt]
+    rows <- qry db (txIdsAfterStmt tn) [txIdParam tid] [Pact4.RInt]
     forM rows $ \case
         [Pact4.SInt tid'] -> return $ Pact4.TxId (fromIntegral tid')
         _ -> internalError "doTxIds: the impossible happened"
-  where
-    stmt = "SELECT DISTINCT txid FROM " <> tbl (toUtf8 tn) <> " WHERE txid > ?"
+
+txIdsAfterStmt :: Text -> SQ3.Utf8
+txIdsAfterStmt tn = "SELECT DISTINCT txid FROM " <> tbl (toUtf8 tn) <> " WHERE txid > ?"
 
 -- | @readFromDb@ of Pact 4 @doGetTxLog@.
 rowsAtTxId :: SQLiteEnv -> Text -> TxId -> IO (Either SQ3.Error [(ByteString, ByteString)])
 rowsAtTxId db tableName txid = runExceptT $ do
-    rows <- qry db stmt [txIdParam txid] [Pact4.RText, Pact4.RBlob]
+    rows <- qry db (rowsAtTxIdStmt tableName) [txIdParam txid] [Pact4.RText, Pact4.RBlob]
     forM rows $ \case
         [Pact4.SText (Utf8 key), Pact4.SBlob value] -> return (key, value)
         err -> internalError $
           "readHistoryResult: Expected single row with two columns as the \
           \result, got: " <> T.pack (show err)
-  where
-    stmt = "SELECT rowkey, rowdata FROM " <> tbl (toUtf8 tableName) <> " WHERE txid = ?"
+
+rowsAtTxIdStmt :: Text -> SQ3.Utf8
+rowsAtTxIdStmt tableName = "SELECT rowkey, rowdata FROM " <> tbl (toUtf8 tableName) <> " WHERE txid = ?"
 
 -- | Pact 4 @tableExistsInDbAtHeight@ and Pact 5 @checkTableExistsInDb@.
 tableExistsAt :: SQLiteEnv -> Text -> BlockHeight -> IO (Either SQ3.Error Bool)
@@ -964,3 +973,30 @@ sqliteWithTrimSavepoint db act = fmap fst $ generalBracket
             Pact4.exec_ db "ROLLBACK TRANSACTION TO SAVEPOINT [trim];"
             Pact4.exec_ db "RELEASE SAVEPOINT [trim];"
     ) $ \_ -> act
+
+-- -------------------------------------------------------------------------- --
+-- Split routing (storage redesign P3, spec 4.3)
+
+-- | The legacy read statements whose row order split routing reproduces.
+data LegacyRead
+    = LegacyKeys !KeysQuery
+    -- ^ '_psDistinctKeys'
+    | LegacyTxIdsAfter
+    -- ^ '_psTxIdsAfter'
+    | LegacyRowsAtTxId
+    -- ^ '_psRowsAtTxId'
+    deriving (Eq, Show)
+
+-- | @EXPLAIN QUERY PLAN@ of a legacy read statement, the very text the
+-- 'PactStore' operation runs, on the given table: the @detail@ column, in
+-- order.
+sqliteExplainLegacyRead :: SQLiteEnv -> LegacyRead -> Text -> IO [Text]
+sqliteExplainLegacyRead db r t = do
+    let (q, ps) = case r of
+            LegacyKeys k -> distinctKeysStmt k t
+            LegacyTxIdsAfter -> (txIdsAfterStmt t, [txIdParam 0])
+            LegacyRowsAtTxId -> (rowsAtTxIdStmt t, [txIdParam 0])
+    rows <- freezerQry db ("EXPLAIN QUERY PLAN " <> q) ps [Pact4.RInt, Pact4.RInt, Pact4.RInt, Pact4.RText]
+    forM rows $ \case
+        [_, _, _, Pact4.SText (Utf8 d)] -> return (T.decodeUtf8 d)
+        row -> internalError $ "split: bad plan row: " <> sshow row

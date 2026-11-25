@@ -14,6 +14,27 @@
 --
 module Chainweb.Test.Pact.Store.Freezer
 ( tests
+
+  -- * Fixture, shared with "Chainweb.Test.Pact.Store.Split"
+, cid
+, tipHeight
+, mkHash
+, block
+, commitAll
+, dataTables
+, withFixture
+, Node(..)
+, Crash(..)
+, quietLogger
+, testConfig
+, withNode
+, withPlainNode
+, runToEnd
+, finalFrontier
+, frontierAt
+, dumpTables
+, bookkeeping
+, masterOf
 ) where
 
 import Control.Concurrent.MVar
