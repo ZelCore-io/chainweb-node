@@ -66,7 +66,7 @@ import Chainweb.Version
 import Chainweb.WebBlockHeaderDB
 import Chainweb.WebPactExecutionService
 import Control.Concurrent hiding (throwTo)
-import Control.Exception (AsyncException (..), throwTo)
+import qualified Control.Concurrent.Async as Async
 import Control.Lens hiding (elements, only)
 import Control.Monad
 import Control.Monad.IO.Class
@@ -151,9 +151,12 @@ withRunPactService logger v cid pactQueue mempool webBHDb payloadDb pactServiceC
     mempoolConsensus <- liftIO $ mkMempoolConsensus mempool blockHeaderDb (Just payloadDb)
     let mempoolAccess = pactMemPoolAccess mempoolConsensus logger
 
+    -- 'Async.cancel' waits for the service to stop: its storage (released after
+    -- this, in ResourceT order) must not close under it. In split and
+    -- shadow the freezer touches the cold store while it stops.
     void $ Resource.allocate
-        (forkIO $ runPactServiceStorage v cid logger Nothing pactQueue mempoolAccess blockHeaderDb payloadDb storage pactServiceConfig)
-        (\tid -> throwTo tid ThreadKilled)
+        (Async.async $ runPactServiceStorage v cid logger Nothing pactQueue mempoolAccess blockHeaderDb payloadDb storage pactServiceConfig)
+        Async.cancel
 
 -- | Insert a 'Pact5.Transaction' into the mempool. The mempool currently operates by default on
 --   'Pact4.UnparsedTransaction's, so the txs have to be converted.

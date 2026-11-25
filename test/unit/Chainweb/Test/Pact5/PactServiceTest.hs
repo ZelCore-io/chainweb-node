@@ -58,9 +58,8 @@ import Chainweb.Version
 import Chainweb.WebBlockHeaderDB (getWebBlockHeaderDb)
 import Chainweb.WebPactExecutionService
 import Control.Concurrent hiding (throwTo)
+import qualified Control.Concurrent.Async as Async
 import Control.Concurrent.Async (forConcurrently)
-import Control.Exception (AsyncException (..))
-import Control.Exception.Safe
 import Control.Lens hiding (only)
 import Control.Monad
 import Control.Monad.IO.Class
@@ -116,9 +115,13 @@ mkFixtureWith pactServiceConfig v' baseRdb = do
         mempool <- liftIO $ startInMemoryMempoolTest mempoolCfg
         mempoolConsensus <- liftIO $ mkMempoolConsensus mempool bhdb (Just (_bdbPayloadDb tdb))
         let mempoolAccess = pactMemPoolAccess mempoolConsensus logger
+        -- 'Async.cancel' waits for the service to stop: its storage
+        -- (released after this, in ResourceT order) must not close under it.
+        -- In split and shadow the freezer touches the cold store while it
+        -- stops.
         _ <- Resource.allocate
-            (forkIO $ runPactServiceStorage v' chain logger Nothing pactQueue mempoolAccess bhdb (_bdbPayloadDb tdb) storage pactServiceConfig)
-            (\tid -> throwTo tid ThreadKilled)
+            (Async.async $ runPactServiceStorage v' chain logger Nothing pactQueue mempoolAccess bhdb (_bdbPayloadDb tdb) storage pactServiceConfig)
+            Async.cancel
         return (mempool, pactQueue)
     let fixture = Fixture
             { _fixtureChains = HashSet.toList $ chainIds v'
