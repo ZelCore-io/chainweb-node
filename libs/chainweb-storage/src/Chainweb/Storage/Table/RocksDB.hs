@@ -94,6 +94,12 @@ module Chainweb.Storage.Table.RocksDB
   , flushRocksDb
   , rocksDbProperty
   , approximateSize
+
+    -- * Statistics, synced writes and seek-for-prev
+  , rocksDbStatistics
+  , statisticsTicker
+  , writeBatchSync
+  , iterSeekForPrev
   ) where
 
 import Control.Exception(evaluate)
@@ -133,6 +139,8 @@ import GHC.Stack
 import NoThunks.Class
 
 import qualified Streaming.Prelude as S
+
+import Unsafe.Coerce (unsafeCoerce)
 
 import System.Directory
 import System.IO.Temp
@@ -177,10 +185,14 @@ sshow = fromString . show
 data RocksDb = RocksDb
     { _rocksDbHandle :: !R.DB
     , _rocksDbNamespace :: !B.ByteString
+    , _rocksDbOptions :: !(Maybe C.OptionsPtr)
+        -- ^ the options the database was opened with, when they stay alive as
+        -- long as the handle ('withRocksDbTuned' and
+        -- 'withReadOnlyRocksDbTuned'); used by 'rocksDbStatistics'
     }
 
 instance NoThunks RocksDb where
-    wNoThunks ctx (RocksDb a b) = allNoThunks
+    wNoThunks ctx (RocksDb a b _) = allNoThunks
         [ noThunks ctx (InspectHeapNamed @"Data.RocksDB.Base.DB" a)
         , noThunks ctx b
         ]
@@ -207,7 +219,7 @@ openRocksDb path opts_ptr = do
         fmap R.DB
         $ R.throwIfErr "open"
         $ C.c_rocksdb_open opts_ptr path_ptr
-    let rdb = RocksDb db mempty
+    let rdb = RocksDb db mempty Nothing
     initializeRocksDb rdb
     return rdb
 
@@ -219,7 +231,7 @@ openReadOnlyRocksDb path opts_ptr = do
         fmap R.DB
         $ R.throwIfErr "open"
         $ C.c_rocksdb_open_for_read_only opts_ptr path_ptr (0 :: CChar) -- ignore extant wal file
-    let rdb = RocksDb db mempty
+    let rdb = RocksDb db mempty Nothing
     -- can't initialize read-only rocksdb
     return rdb
 
@@ -244,7 +256,7 @@ initializeRocksDb db = R.put
 resetOpenRocksDb :: FilePath -> IO RocksDb
 resetOpenRocksDb path = do
     destroyRocksDb path
-    db <- RocksDb <$> R.open path opts <*> mempty
+    db <- RocksDb <$> R.open path opts <*> mempty <*> pure Nothing
     initializeRocksDb db
     return db
   where
@@ -253,7 +265,7 @@ resetOpenRocksDb path = do
 -- | Close a 'RocksDb' instance.
 --
 closeRocksDb :: RocksDb -> IO ()
-closeRocksDb (RocksDb (R.DB db_ptr) _) = C.c_rocksdb_close db_ptr
+closeRocksDb (RocksDb (R.DB db_ptr) _ _) = C.c_rocksdb_close db_ptr
 
 -- | Provide a computation with a 'RocksDb' instance. If no rocks db exists at
 -- the provided directory path, a new database is created.
@@ -268,7 +280,8 @@ withRocksDbTuned :: FilePath -> R.Options -> RocksDbTuning -> (RocksDb -> IO a) 
 withRocksDbTuned path opts tuning act =
     withOpts opts $ \(R.Options' opts_ptr _ _) -> do
         applyTuning tuning opts_ptr
-        bracket (openRocksDb path opts_ptr) closeRocksDb act
+        bracket (openRocksDb path opts_ptr) closeRocksDb $ \db ->
+            act db { _rocksDbOptions = Just opts_ptr }
 
 -- | Provide a computation with a read-only 'RocksDb' instance. If no rocks db exists at
 -- the provided directory path, a new database is created(?) TODO
@@ -283,7 +296,8 @@ withReadOnlyRocksDbTuned :: FilePath -> R.Options -> RocksDbTuning -> (RocksDb -
 withReadOnlyRocksDbTuned path opts tuning act =
     withOpts opts $ \(R.Options' opts_ptr _ _) -> do
         applyTuning tuning opts_ptr
-        bracket (openReadOnlyRocksDb path opts_ptr) closeRocksDb act
+        bracket (openReadOnlyRocksDb path opts_ptr) closeRocksDb $ \db ->
+            act db { _rocksDbOptions = Just opts_ptr }
 
 -- | Provide a computation with a temporary 'RocksDb'. The database is deleted
 -- when the computation exits.
@@ -837,6 +851,57 @@ approximateSize db start limit =
         peek sizes
   where
     R.DB dbPtr = _rocksDbHandle db
+
+-- | The text of the database's RocksDB statistics
+-- (@Statistics::ToString@), or 'Nothing' when statistics are off
+-- ('_tuningStatistics') or the database was not opened with
+-- 'withRocksDbTuned' or 'withReadOnlyRocksDbTuned'.
+--
+rocksDbStatistics :: RocksDb -> IO (Maybe ByteString)
+rocksDbStatistics db = case _rocksDbOptions db of
+    Nothing -> return Nothing
+    Just opts -> do
+        valPtr <- c_rocksdb_options_statistics_get_string opts
+        if valPtr == nullPtr
+            then return Nothing
+            else Just <$> B.packCString valPtr `finally` C.c_rocksdb_free valPtr
+
+-- | The count of a ticker in the text of 'rocksDbStatistics', for instance
+-- @statisticsTicker "rocksdb.block.cache.hit"@. A ticker line reads
+-- @rocksdb.block.cache.hit COUNT : 12@.
+--
+statisticsTicker :: ByteString -> ByteString -> Maybe Word64
+statisticsTicker name stats = listToMaybe
+    [ n
+    | l <- B8.lines stats
+    , Just rest <- [B.stripPrefix (name <> " COUNT : ") l]
+    , Just (n, r) <- [B8.readInteger rest]
+    , B.null (B8.strip r)
+    , n >= 0
+    , n <= toInteger (maxBound :: Word64)
+    ]
+    & fmap fromInteger
+
+-- | Writes the operations as one atomic batch with @sync = true@: the call
+-- returns after the write-ahead log is synced to disk. The binding's
+-- @rocksdb_write@ import is @safe@.
+--
+writeBatchSync :: RocksDb -> [R.BatchOp] -> IO ()
+writeBatchSync db = R.write (_rocksDbHandle db) R.defaultWriteOptions { R.sync = True }
+
+-- | Positions the iterator at the last key that is at or before the target
+-- (@SeekForPrev@). The iterator is invalid afterwards iff no such key exists.
+--
+iterSeekForPrev :: I.Iterator -> ByteString -> IO ()
+iterSeekForPrev it key =
+    BU.unsafeUseAsCStringLen key $ \(keyPtr, keyLen) ->
+        c_rocksdb_iter_seek_for_prev (iteratorPtr it) keyPtr (fromIntegral keyLen)
+  where
+    -- The binding does not export the constructor of @newtype Iterator =
+    -- Iterator IteratorPtr@ and the binding is not forked, so the pointer is
+    -- taken by coercing the newtype, which has the pointer's representation.
+    iteratorPtr :: I.Iterator -> C.IteratorPtr
+    iteratorPtr = unsafeCoerce
 
 -- | Read a value by key.
 -- One less copy than the version in rocksdb-haskell by using unsafePackCStringFinalizer.

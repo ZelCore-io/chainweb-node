@@ -1,4 +1,5 @@
 {-# LANGUAGE ImportQualifiedPost #-}
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TypeApplications #-}
 
@@ -45,6 +46,8 @@ import Text.Read (readMaybe)
 import Database.RocksDB.Internal qualified as R
 import Database.RocksDB.Base qualified as R
 import Database.RocksDB.C qualified as C
+import Database.RocksDB.Iterator qualified as I
+import Database.RocksDB.ReadOptions qualified as R
 
 -- -------------------------------------------------------------------------- --
 -- Utils
@@ -203,6 +206,10 @@ tuningTests = forM_ tests $ \(name, test) -> do
         , ("directReadsReachOptionsTest", directReadsReachOptionsTest)
         , ("maxSubcompactionsReachOptionsTest", maxSubcompactionsReachOptionsTest)
         , ("sstFileCompressionTest", sstFileCompressionTest)
+        , ("coldTuningTest", coldTuningTest)
+        , ("newFieldsOffTest", newFieldsOffTest)
+        , ("bottommostZstdTest", bottommostZstdTest)
+        , ("iterSeekForPrevTest", iterSeekForPrevTest)
         ]
 
 -- | Every foreign import of "Chainweb.Storage.Table.RocksDB.Tuning" resolves
@@ -217,6 +224,14 @@ tuningLinkTest = do
         c_rocksdb_options_set_compression_options_zstd_max_train_bytes opts 6553600
         c_rocksdb_options_set_use_direct_reads opts 0
         c_rocksdb_options_set_max_subcompactions opts 2
+        c_rocksdb_options_enable_statistics opts
+        stats <- c_rocksdb_options_statistics_get_string opts
+        assertBool "statistics string after enabling statistics" (stats /= nullPtr)
+        C.c_rocksdb_free stats
+        c_rocksdb_options_set_level_compaction_dynamic_level_bytes opts 1
+        c_rocksdb_options_set_bottommost_compression opts 7
+        c_rocksdb_options_set_bottommost_compression_options opts (-14) 9 0 65536 1
+        c_rocksdb_options_set_bottommost_compression_options_zstd_max_train_bytes opts 6553600 1
         bracket c_rocksdb_block_based_options_create c_rocksdb_block_based_options_destroy $ \tbl ->
             bracket (c_rocksdb_cache_create_lru (1 `shiftL` 20)) c_rocksdb_cache_destroy $ \cache -> do
                 c_rocksdb_block_based_options_set_block_size tbl 32768
@@ -224,6 +239,8 @@ tuningLinkTest = do
                 c_rocksdb_filterpolicy_create_bloom_full 10
                     >>= c_rocksdb_block_based_options_set_filter_policy tbl
                 c_rocksdb_block_based_options_set_block_cache tbl cache
+                c_rocksdb_block_based_options_set_cache_index_and_filter_blocks tbl 1
+                c_rocksdb_block_based_options_set_pin_l0_filter_and_index_blocks_in_cache tbl 1
                 c_rocksdb_options_set_block_based_table_factory opts tbl
 
     -- compact and flush options
@@ -268,6 +285,10 @@ tuningValuesTest = do
         , _tuningBlockCacheBytes = Nothing
         , _tuningDirectReads = False
         , _tuningMaxSubcompactions = Nothing
+        , _tuningStatistics = False
+        , _tuningCacheIndexAndFilter = False
+        , _tuningDynamicLevelBytes = False
+        , _tuningBottommostZstdLevel = Nothing
         }
     assertBool "payloadZstdTuning" $ payloadZstdTuning == defaultTuning
         { _tuningCompression = Zstd
@@ -282,6 +303,10 @@ tuningValuesTest = do
     assertBool "coldStoreTuning" $ coldStoreTuning == payloadZstdTuning
         { _tuningBloomBitsPerKey = Just 10
         , _tuningBlockCacheBytes = Just 1073741824
+        , _tuningStatistics = True
+        , _tuningCacheIndexAndFilter = True
+        , _tuningDynamicLevelBytes = True
+        , _tuningBottommostZstdLevel = Nothing
         }
 
 zstdFilesTest :: IO ()
@@ -535,3 +560,122 @@ sstFileCompressionTest = withTestDir "tuning-file-compression" $ \dir -> do
     forM_ (M.toList info) $ \(path, expected) -> do
         c <- sstFileCompression path
         assertBool ("sstFileCompression " <> path <> ": " <> show c <> " /= " <> show expected) (c == expected)
+
+-- | The newest OPTIONS file that RocksDB persisted in the directory.
+--
+latestOptionsFile :: HasCallStack => FilePath -> IO (FilePath, ByteString)
+latestOptionsFile dir = do
+    optionFiles <- L.sort . filter ("OPTIONS-" `L.isPrefixOf`) <$> listDirectory dir
+    assertBool ("no OPTIONS file in " <> dir) (not (null optionFiles))
+    let f = last optionFiles
+    (,) f <$> B.readFile (dir <> "/" <> f)
+
+-- | Block cache hits and misses from the database's statistics.
+--
+cacheCounts :: HasCallStack => RocksDb -> IO (Word64, Word64)
+cacheCounts db = rocksDbStatistics db >>= \case
+    Nothing -> do
+        assertBool "statistics are on" False
+        return (0, 0)
+    Just stats -> case (,)
+        <$> statisticsTicker "rocksdb.block.cache.hit" stats
+        <*> statisticsTicker "rocksdb.block.cache.miss" stats of
+        Nothing -> do
+            assertBool ("no block cache tickers in " <> show stats) False
+            return (0, 0)
+        Just c -> return c
+
+-- | 'coldStoreTuning' turns on statistics, keeps index and filter blocks in
+-- the block cache with level 0 pinned, and turns on dynamic level bytes; the
+-- block cache hit and miss counts move after reads.
+--
+coldTuningTest :: IO ()
+coldTuningTest = withTestDir "tuning-cold" $ \dir -> do
+    withRocksDbTuned dir modernDefaultOptions coldStoreTuning $ \db -> do
+        let t = bytesTable db "t"
+        writeEntries t [0 .. 4999]
+        flushRocksDb db
+        (h0, m0) <- cacheCounts db
+        checkEntries t [0 .. 4999]
+        (h1, m1) <- cacheCounts db
+        assertBool ("misses move after the first reads: " <> show (m0, m1)) (m1 > m0)
+        checkEntries t [0 .. 4999]
+        (h2, _) <- cacheCounts db
+        assertBool ("hits move after the second reads: " <> show (h0, h1, h2)) (h2 > h1)
+    (f, options) <- latestOptionsFile dir
+    forM_
+        [ "cache_index_and_filter_blocks=true"
+        , "pin_l0_filter_and_index_blocks_in_cache=true"
+        , "level_compaction_dynamic_level_bytes=true"
+        , "bottommost_compression=kDisableCompressionOption"
+        ] $ \o -> assertContains f o options
+    _ <- assertAllCompression dir "ZSTD"
+    return ()
+
+-- | 'defaultTuning' and 'payloadZstdTuning' leave the new options at RocksDB's
+-- defaults, collect no statistics, and write the SST files Plan 1 asserts
+-- (Snappy for the default, zstd level 3 with a 64 KB dictionary for payloads).
+--
+newFieldsOffTest :: IO ()
+newFieldsOffTest =
+    forM_ [(defaultTuning, "Snappy"), (payloadZstdTuning, "ZSTD")] $ \(tuning, compression) ->
+    withTestDir "tuning-new-fields-off" $ \dir -> do
+        withRocksDbTuned dir modernDefaultOptions tuning $ \db -> do
+            writeEntries (bytesTable db "t") [0 .. 999]
+            flushRocksDb db
+            stats <- rocksDbStatistics db
+            assertBool ("no statistics for " <> show tuning) (stats == Nothing)
+        (f, options) <- latestOptionsFile dir
+        forM_
+            [ "cache_index_and_filter_blocks=false"
+            , "pin_l0_filter_and_index_blocks_in_cache=false"
+            , "level_compaction_dynamic_level_bytes=false"
+            , "bottommost_compression=kDisableCompressionOption"
+            ] $ \o -> assertContains f o options
+        info <- assertAllCompression dir compression
+        when (compression == "ZSTD") $ forM_ (M.toList info) $ \(p, (_, o)) -> do
+            assertContains p "; level=3;" o
+            assertContains p "max_dict_bytes=65536;" o
+            assertContains p "zstd_max_train_bytes=6553600;" o
+
+-- | A bottommost zstd level reaches the options of the database.
+--
+bottommostZstdTest :: IO ()
+bottommostZstdTest = withTestDir "tuning-bottommost" $ \dir -> do
+    let tuning = payloadZstdTuning { _tuningBottommostZstdLevel = Just 9 }
+    withRocksDbTuned dir modernDefaultOptions tuning $ \db -> do
+        writeEntries (bytesTable db "t") [0 .. 999]
+        flushRocksDb db
+        checkEntries (bytesTable db "t") [0 .. 999]
+    (f, options) <- latestOptionsFile dir
+    assertContains f "bottommost_compression=kZSTD" options
+    let optsLine = filter ("bottommost_compression_opts=" `B.isInfixOf`) (B8.lines options)
+    assertBool ("one bottommost_compression_opts line in " <> f) (length optsLine == 1)
+    forM_ optsLine $ \l -> do
+        assertContains f "level=9;" l
+        assertContains f "enabled=true;" l
+        assertContains f "max_dict_bytes=65536;" l
+
+-- | 'iterSeekForPrev' lands on the last key at or before the target and
+-- leaves the iterator invalid before the first key. The keys are written with
+-- 'writeBatchSync'. They start with @0x01@, below the @"."@ key that
+-- 'openRocksDb' writes.
+--
+iterSeekForPrevTest :: IO ()
+iterSeekForPrevTest = withTempRocksDb "tuning-seek-for-prev" $ \db -> do
+    writeBatchSync db [ R.Put k v | (k, v) <- [("\1b", "1"), ("\1d", "2"), ("\1f", "3")] ]
+    R.withReadOptions mempty $ \ro -> I.withIter (_rocksDbHandle db) ro $ \it -> do
+        forM_
+            [ ("\1d", Just "\1d")
+            , ("\1e", Just "\1d")
+            , ("\1b", Just "\1b")
+            , ("\1c", Just "\1b")
+            , ("\1z", Just "\1f")
+            , ("\1a", Nothing)
+            , ("\1", Nothing)
+            , ("", Nothing)
+            ] $ \(target, expected) -> do
+                iterSeekForPrev it target
+                k <- I.iterKey it
+                assertBool ("seek for prev " <> show target <> ": " <> show k <> " /= " <> show expected)
+                    (k == expected)

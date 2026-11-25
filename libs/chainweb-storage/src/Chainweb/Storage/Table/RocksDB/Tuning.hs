@@ -53,6 +53,12 @@ module Chainweb.Storage.Table.RocksDB.Tuning
   , c_rocksdb_options_set_use_direct_reads
   , c_rocksdb_options_set_max_subcompactions
   , c_rocksdb_options_set_block_based_table_factory
+  , c_rocksdb_options_enable_statistics
+  , c_rocksdb_options_statistics_get_string
+  , c_rocksdb_options_set_level_compaction_dynamic_level_bytes
+  , c_rocksdb_options_set_bottommost_compression
+  , c_rocksdb_options_set_bottommost_compression_options
+  , c_rocksdb_options_set_bottommost_compression_options_zstd_max_train_bytes
 
   -- ** Block-based table options
   , c_rocksdb_block_based_options_create
@@ -60,6 +66,8 @@ module Chainweb.Storage.Table.RocksDB.Tuning
   , c_rocksdb_block_based_options_set_block_size
   , c_rocksdb_block_based_options_set_filter_policy
   , c_rocksdb_block_based_options_set_block_cache
+  , c_rocksdb_block_based_options_set_cache_index_and_filter_blocks
+  , c_rocksdb_block_based_options_set_pin_l0_filter_and_index_blocks_in_cache
   , c_rocksdb_filterpolicy_create_bloom_full
   , c_rocksdb_cache_create_lru
   , c_rocksdb_cache_destroy
@@ -83,6 +91,9 @@ module Chainweb.Storage.Table.RocksDB.Tuning
   , c_rocksdb_livefiles_count
   , c_rocksdb_livefiles_name
   , c_rocksdb_livefiles_destroy
+
+  -- ** Iterators
+  , c_rocksdb_iter_seek_for_prev
   ) where
 
 import Control.Exception (bracket, mask_)
@@ -150,6 +161,20 @@ data RocksDbTuning = RocksDbTuning
     , _tuningMaxSubcompactions :: !(Maybe Int)
         -- ^ @max_subcompactions@: how many threads a compaction, a manual one
         -- included, may split into (RocksDB's default is 1)
+    , _tuningStatistics :: !Bool
+        -- ^ collect RocksDB statistics (tickers such as block cache hits and
+        -- misses); read them with 'Chainweb.Storage.Table.RocksDB.rocksDbStatistics'
+    , _tuningCacheIndexAndFilter :: !Bool
+        -- ^ @cache_index_and_filter_blocks@ and
+        -- @pin_l0_filter_and_index_blocks_in_cache@: index and filter blocks
+        -- live in the block cache, so their memory is bounded by it, and those
+        -- of level 0 files stay pinned there
+    , _tuningDynamicLevelBytes :: !Bool
+        -- ^ @level_compaction_dynamic_level_bytes@
+    , _tuningBottommostZstdLevel :: !(Maybe Int)
+        -- ^ zstd with this level for the bottommost level
+        -- (@bottommost_compression@), with the dictionary sizes of
+        -- '_tuningCompression' when that is 'Zstd' and no dictionary otherwise
     }
     deriving (Show, Eq, Generic)
 
@@ -163,6 +188,10 @@ defaultTuning = RocksDbTuning
     , _tuningBlockCacheBytes = Nothing
     , _tuningDirectReads = False
     , _tuningMaxSubcompactions = Nothing
+    , _tuningStatistics = False
+    , _tuningCacheIndexAndFilter = False
+    , _tuningDynamicLevelBytes = False
+    , _tuningBottommostZstdLevel = Nothing
     }
 
 -- | zstd level 3 with a 64 KB dictionary trained on 6.4 MB of samples (100x
@@ -193,12 +222,20 @@ payloadBlockCacheBytes :: Int
 payloadBlockCacheBytes = 268435456
 
 -- | 'payloadZstdTuning' plus a bloom filter with 10 bits per key and a 1 GB
--- block cache (spec 4.3, 8.2).
+-- block cache (spec 4.3, 8.2), statistics, index and filter blocks in the
+-- block cache with level 0 pinned (so filter memory is bounded by the cache),
+-- and @level_compaction_dynamic_level_bytes@ (the cold store is a new
+-- database, so there is nothing to reshape). The bottommost level keeps the
+-- compression of the other levels.
 --
 coldStoreTuning :: RocksDbTuning
 coldStoreTuning = payloadZstdTuning
     { _tuningBloomBitsPerKey = Just 10
     , _tuningBlockCacheBytes = Just 1073741824
+    , _tuningStatistics = True
+    , _tuningCacheIndexAndFilter = True
+    , _tuningDynamicLevelBytes = True
+    , _tuningBottommostZstdLevel = Nothing
     }
 
 -- | Applies a tuning to an options object, before the database is opened.
@@ -218,7 +255,26 @@ applyTuning t opts = do
         c_rocksdb_options_set_use_direct_reads opts 1
     forM_ (_tuningMaxSubcompactions t) $ \n ->
         c_rocksdb_options_set_max_subcompactions opts =<< toCUInt32 "max subcompactions" n
+    when (_tuningStatistics t) $
+        c_rocksdb_options_enable_statistics opts
+    when (_tuningDynamicLevelBytes t) $
+        c_rocksdb_options_set_level_compaction_dynamic_level_bytes opts 1
+    forM_ (_tuningBottommostZstdLevel t) applyBottommost
   where
+    applyBottommost level = do
+        level' <- toCLevel level
+        let (dictBytes, trainBytes) = case _tuningCompression t of
+                Zstd _ d tr -> (d, tr)
+                KeepBindingCompression -> (0, 0)
+        dictBytes' <- toCInt "zstd max dict bytes" dictBytes
+        trainBytes' <- toCInt "zstd max train bytes" trainBytes
+        c_rocksdb_options_set_bottommost_compression opts zstdCompression
+        -- the last argument enables the bottommost compression options
+        c_rocksdb_options_set_bottommost_compression_options opts
+            defaultWindowBits level' defaultStrategy dictBytes' 1
+        c_rocksdb_options_set_bottommost_compression_options_zstd_max_train_bytes opts
+            trainBytes' 1
+
     applyCompression KeepBindingCompression = return ()
     applyCompression (Zstd level dictBytes trainBytes) = do
         level' <- toCLevel level
@@ -233,6 +289,7 @@ applyTuning t opts = do
     needsTableFactory = isJust (_tuningBlockSize t)
         || isJust (_tuningBloomBitsPerKey t)
         || isJust (_tuningBlockCacheBytes t)
+        || _tuningCacheIndexAndFilter t
 
     setTableFactory =
         bracket c_rocksdb_block_based_options_create c_rocksdb_block_based_options_destroy $ \tbl ->
@@ -245,6 +302,9 @@ applyTuning t opts = do
                 mask_ $ c_rocksdb_filterpolicy_create_bloom_full (realToFrac bits)
                     >>= c_rocksdb_block_based_options_set_filter_policy tbl
             forM_ mcache $ c_rocksdb_block_based_options_set_block_cache tbl
+            when (_tuningCacheIndexAndFilter t) $ do
+                c_rocksdb_block_based_options_set_cache_index_and_filter_blocks tbl 1
+                c_rocksdb_block_based_options_set_pin_l0_filter_and_index_blocks_in_cache tbl 1
             c_rocksdb_options_set_block_based_table_factory opts tbl
 
     withMaybeCache Nothing k = k Nothing
@@ -509,6 +569,46 @@ foreign import ccall safe "rocksdb_options_set_block_based_table_factory"
     c_rocksdb_options_set_block_based_table_factory
         :: C.OptionsPtr -> Ptr BlockBasedOptions -> IO ()
 
+-- | @void rocksdb_options_enable_statistics(rocksdb_options_t*);@
+foreign import ccall safe "rocksdb_options_enable_statistics"
+    c_rocksdb_options_enable_statistics
+        :: C.OptionsPtr -> IO ()
+
+-- | @char* rocksdb_options_statistics_get_string(rocksdb_options_t* opt);@
+--
+-- Returns NULL when statistics are off. A non-NULL result is allocated with
+-- @strdup@ and must be freed with @rocksdb_free@. The statistics object is
+-- shared with every database opened with these options.
+foreign import ccall safe "rocksdb_options_statistics_get_string"
+    c_rocksdb_options_statistics_get_string
+        :: C.OptionsPtr -> IO CString
+
+-- | @void rocksdb_options_set_level_compaction_dynamic_level_bytes(
+-- rocksdb_options_t*, unsigned char);@
+foreign import ccall safe "rocksdb_options_set_level_compaction_dynamic_level_bytes"
+    c_rocksdb_options_set_level_compaction_dynamic_level_bytes
+        :: C.OptionsPtr -> CUChar -> IO ()
+
+-- | @void rocksdb_options_set_bottommost_compression(rocksdb_options_t*,
+-- int);@
+foreign import ccall safe "rocksdb_options_set_bottommost_compression"
+    c_rocksdb_options_set_bottommost_compression
+        :: C.OptionsPtr -> CInt -> IO ()
+
+-- | @void rocksdb_options_set_bottommost_compression_options(
+-- rocksdb_options_t*, int, int, int, int, unsigned char);@ with arguments
+-- @w_bits, level, strategy, max_dict_bytes, enabled@.
+foreign import ccall safe "rocksdb_options_set_bottommost_compression_options"
+    c_rocksdb_options_set_bottommost_compression_options
+        :: C.OptionsPtr -> CInt -> CInt -> CInt -> CInt -> CUChar -> IO ()
+
+-- | @void rocksdb_options_set_bottommost_compression_options_zstd_max_train_bytes(
+-- rocksdb_options_t*, int, unsigned char);@ with arguments
+-- @zstd_max_train_bytes, enabled@.
+foreign import ccall safe "rocksdb_options_set_bottommost_compression_options_zstd_max_train_bytes"
+    c_rocksdb_options_set_bottommost_compression_options_zstd_max_train_bytes
+        :: C.OptionsPtr -> CInt -> CUChar -> IO ()
+
 -- -------------------------------------------------------------------------- --
 -- Block-based table options
 
@@ -549,6 +649,18 @@ foreign import ccall safe "rocksdb_block_based_options_set_filter_policy"
 foreign import ccall safe "rocksdb_block_based_options_set_block_cache"
     c_rocksdb_block_based_options_set_block_cache
         :: Ptr BlockBasedOptions -> Ptr Cache -> IO ()
+
+-- | @void rocksdb_block_based_options_set_cache_index_and_filter_blocks(
+-- rocksdb_block_based_table_options_t*, unsigned char);@
+foreign import ccall safe "rocksdb_block_based_options_set_cache_index_and_filter_blocks"
+    c_rocksdb_block_based_options_set_cache_index_and_filter_blocks
+        :: Ptr BlockBasedOptions -> CUChar -> IO ()
+
+-- | @void rocksdb_block_based_options_set_pin_l0_filter_and_index_blocks_in_cache(
+-- rocksdb_block_based_table_options_t*, unsigned char);@
+foreign import ccall safe "rocksdb_block_based_options_set_pin_l0_filter_and_index_blocks_in_cache"
+    c_rocksdb_block_based_options_set_pin_l0_filter_and_index_blocks_in_cache
+        :: Ptr BlockBasedOptions -> CUChar -> IO ()
 
 -- | @rocksdb_filterpolicy_t* rocksdb_filterpolicy_create_bloom_full(double
 -- bits_per_key);@
@@ -677,3 +789,15 @@ foreign import ccall safe "rocksdb_livefiles_name"
 foreign import ccall safe "rocksdb_livefiles_destroy"
     c_rocksdb_livefiles_destroy
         :: Ptr LiveFiles -> IO ()
+
+-- -------------------------------------------------------------------------- --
+-- Iterators
+
+-- | @void rocksdb_iter_seek_for_prev(rocksdb_iterator_t*, const char* k,
+-- size_t klen);@
+--
+-- Positions the iterator at the last key that is at or before the target. It
+-- can read blocks from disk.
+foreign import ccall safe "rocksdb_iter_seek_for_prev"
+    c_rocksdb_iter_seek_for_prev
+        :: C.IteratorPtr -> CString -> CSize -> IO ()
