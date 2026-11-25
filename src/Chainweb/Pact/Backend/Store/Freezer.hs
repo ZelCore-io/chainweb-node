@@ -37,6 +37,7 @@ module Chainweb.Pact.Backend.Store.Freezer
 , noHooks
 , FreezerStats(..)
 , emptyFreezerStats
+, isTransientSqliteError
 , trimChunkPercentile
 , freezerStatsJson
 , TrimWindow(..)
@@ -182,12 +183,18 @@ data FreezerStats = FreezerStats
         -- ^ @(page_count - freelist_count) * page_size@ after the last step
     , _fsHotPeakBytes :: !Integer
         -- ^ the largest '_fsHotFileBytes' seen
+    , _fsTransientRetries :: !Int
+        -- ^ retries of 'runFreezer' after a transient SQLite error (BUSY or
+        -- LOCKED)
+    , _fsHaltedReason :: !(Maybe Text)
+        -- ^ 'runFreezer' halted the chain's freezer, for this reason; it
+        -- stays halted until the next start
     }
     deriving (Eq, Show)
 
 emptyFreezerStats :: FreezerStats
 emptyFreezerStats = FreezerStats
-    0 0 0 0 0 0 0 0 0 0 Seq.empty 0 Nothing Nothing Nothing Nothing Nothing Nothing 0 0 0
+    0 0 0 0 0 0 0 0 0 0 Seq.empty 0 Nothing Nothing Nothing Nothing Nothing Nothing 0 0 0 0 Nothing
 
 trimSampleCap :: Int
 trimSampleCap = 8192
@@ -223,6 +230,8 @@ freezerStatsJson c st = object
         , "hotFileBytes" .= _fsHotFileBytes st
         , "hotLiveBytes" .= _fsHotLiveBytes st
         , "hotPeakBytes" .= _fsHotPeakBytes st
+        , "transientRetries" .= _fsTransientRetries st
+        , "haltedReason" .= _fsHaltedReason st
         ]
     ]
   where
@@ -871,7 +880,9 @@ logStats env = do
     logJson env Info (freezerStatsJson (_feChain env) st)
 
 logHalted :: FreezerEnv -> Text -> IO ()
-logHalted env reason = logJson env Error $ object
+logHalted env reason = do
+  atomicModifyIORef' (_feStats env) $ \st -> (st { _fsHaltedReason = Just reason }, ())
+  logJson env Error $ object
     [ "FreezerHalted" .= object
         [ "chain" .= chainIdToText (_feChain env)
         , "reason" .= reason
@@ -884,10 +895,15 @@ logHalted env reason = logJson env Error $ object
 -- verify but not its trim; when there is nothing to do, it polls the tip
 -- every '_fePollMicros'.
 --
--- A verify failure, a changed block hash at the frontier or any exception
--- (a failed cold write, a full disk) logs @FreezerHalted@ at 'Error' and
--- returns: the chain keeps running on its stores, and nothing is trimmed
--- below an unverified step. Asynchronous exceptions (cancellation at
+-- A transient SQLite error (BUSY or LOCKED, 'isTransientSqliteError') is
+-- retried up to 'transientRetryLimit' times in a row, with a backoff from
+-- 'transientBackoffMicros' doubling each time, and counted in
+-- '_fsTransientRetries'; 'freezeOnce' is crash safe, so a retry resumes the
+-- step. A verify failure, a changed block hash at the frontier, any other
+-- exception (a failed cold write, a full disk) or a transient error past the
+-- limit logs @FreezerHalted@ at 'Error', sets '_fsHaltedReason' and returns:
+-- the chain keeps running on its stores, and nothing is trimmed below an
+-- unverified step. Asynchronous exceptions (cancellation at
 -- shutdown) propagate; 'freezeOnce' is crash safe. The stats are logged every
 -- 10 minutes and when the freezer stops.
 --
@@ -907,14 +923,14 @@ runFreezer env sem = do
 
     readTip = withFreezerReadConnection env sqliteTip
 
-    loop lastLog = trySync (freezeOnceWith slot env) >>= \case
+    loop lastLog = retryTransient env (freezeOnceWith slot env) >>= \case
         Left e -> logHalted env ("exception: " <> T.pack (displayException e))
         Right o -> do
             lastLog' <- statsDue lastLog
             case o of
                 Froze _ -> loop lastLog'
                 StepDropped -> threadDelay (_fePollMicros env) >> loop lastLog'
-                NothingToDo -> trySync readTip >>= \case
+                NothingToDo -> retryTransient env readTip >>= \case
                     Left e -> logHalted env ("exception: " <> T.pack (displayException e))
                     Right tip0 -> idle tip0 lastLog'
                 HaltedVerify e -> logHalted env ("verification failed: " <> T.pack (show e))
@@ -923,11 +939,42 @@ runFreezer env sem = do
     idle tip0 lastLog = do
         threadDelay (_fePollMicros env)
         lastLog' <- statsDue lastLog
-        trySync readTip >>= \case
+        retryTransient env readTip >>= \case
             Left e -> logHalted env ("exception: " <> T.pack (displayException e))
             Right tip
                 | tip == tip0 -> idle tip0 lastLog'
                 | otherwise -> loop lastLog'
+
+-- | How many transient SQLite errors in a row 'runFreezer' retries.
+transientRetryLimit :: Int
+transientRetryLimit = 5
+
+-- | The first backoff after a transient SQLite error; it doubles with each
+-- retry in a row (50 ms to 800 ms, 1.55 s in all).
+transientBackoffMicros :: Int
+transientBackoffMicros = 50_000
+
+-- | Whether an exception is SQLite's BUSY or LOCKED: the freezer's own
+-- statements raise the 'SQ3.Error' constructor's name, the Pact 4 helpers
+-- @Database error: <constructor>@.
+isTransientSqliteError :: SomeException -> Bool
+isTransientSqliteError e = any (`T.isInfixOf` msg) ["ErrorBusy", "ErrorLocked"]
+  where
+    msg = T.pack (displayException e)
+
+-- | 'trySync' that retries transient SQLite errors ('runFreezer').
+retryTransient :: FreezerEnv -> IO a -> IO (Either SomeException a)
+retryTransient env act = go 0
+  where
+    go n = trySync act >>= \case
+        Left e | isTransientSqliteError e, n < transientRetryLimit -> do
+            atomicModifyIORef' (_feStats env) $ \st ->
+                (st { _fsTransientRetries = _fsTransientRetries st + 1 }, ())
+            logg env Warn $ "transient SQLite error, retry " <> T.pack (show (n + 1)) <> " of "
+                <> T.pack (show transientRetryLimit) <> ": " <> T.pack (displayException e)
+            threadDelay (transientBackoffMicros * 2 ^ n)
+            go (n + 1)
+        r -> return r
 
 -- | 'try' for synchronous exceptions only.
 trySync :: IO a -> IO (Either SomeException a)

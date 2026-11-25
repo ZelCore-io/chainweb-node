@@ -41,7 +41,10 @@ module Chainweb.Test.Pact.Store.Freezer
 , masterOf
 ) where
 
+import Control.Concurrent (threadDelay)
+import Control.Concurrent.Async (cancel, withAsync)
 import Control.Concurrent.MVar
+import Control.Concurrent.QSem (newQSem)
 import Control.Exception
 import Control.Monad
 
@@ -362,6 +365,7 @@ tests = testGroup "Freezer step"
     , testCase "the first trim renames sqlite to sqlite-split and writes the marker before any DELETE" splitMarkerTest
     , testCase "a chain whose genesis is above the step heights freezes from its first block" lateGenesisTest
     , testCase "a compacted-style BlockHistory that starts at a high height freezes from its first row" compactedHistoryTest
+    , testCase "runFreezer retries a transient SQLite error (BUSY/LOCKED) with backoff, halts past the limit and on any other exception, and records the halt in the stats" runFreezerRetryTest
     ]
 
 -- | A fixture whose node SQLite file holds the given history, without a twin.
@@ -931,3 +935,54 @@ splitMarkerTest = withFixture $ \root twin -> do
             _smFirstTrimChain m @?= Just cid
             _smFirstTrimHeight m @?= Just 2
         Nothing -> assertFailure "no marker"
+
+-- | 'runFreezer' on the fixture with a trim-chunk gate that throws: BUSY
+-- twice and then nothing (the run reaches the end), BUSY every time (halts
+-- after the retry limit), and another error (halts at once).
+runFreezerRetryTest :: Assertion
+runFreezerRetryTest = do
+    let busy = userError "Database error: ErrorBusy"
+    -- two transient errors: retried, the run goes on to the end
+    withFixture $ \root _ -> do
+        left <- newIORef (2 :: Int)
+        let gate _ = do
+                k <- atomicModifyIORef' left (\x -> (x - 1, x))
+                when (k > 0) $ throwIO busy
+        withNode root testConfig writeBatchSync (const noHooks) gate $ \n -> do
+            sem <- newQSem 1
+            let env = (_nEnv n) { _fePollMicros = 1_000 }
+            withAsync (runFreezer env sem) $ \a -> do
+                waitFinal (_ccVerified (_nCold n))
+                cancel a
+            st <- readIORef (_feStats env)
+            _fsTransientRetries st @?= 2
+            _fsHaltedReason st @?= Nothing
+    -- transient every time: halts after the limit
+    withFixture $ \root _ -> withNode root testConfig writeBatchSync (const noHooks) (const (throwIO busy)) $ \n -> do
+        sem <- newQSem 1
+        let env = (_nEnv n) { _fePollMicros = 1_000 }
+        runFreezer env sem
+        st <- readIORef (_feStats env)
+        _fsTransientRetries st @?= 5
+        assertBool ("halted on BUSY: " <> show (_fsHaltedReason st)) $
+            maybe False ("ErrorBusy" `T.isInfixOf`) (_fsHaltedReason st)
+    -- another exception: halts at once, no retry
+    withFixture $ \root _ -> withNode root testConfig writeBatchSync (const noHooks) (const (throwIO (userError "disk full"))) $ \n -> do
+        sem <- newQSem 1
+        let env = (_nEnv n) { _fePollMicros = 1_000 }
+        runFreezer env sem
+        st <- readIORef (_feStats env)
+        _fsTransientRetries st @?= 0
+        assertBool ("halted: " <> show (_fsHaltedReason st)) $
+            maybe False ("disk full" `T.isInfixOf`) (_fsHaltedReason st)
+    isTransientSqliteError (toException busy) @?= True
+    isTransientSqliteError (toException (userError "Database error: ErrorLocked")) @?= True
+    isTransientSqliteError (toException (userError "Database error: ErrorIO")) @?= False
+  where
+    -- polls until the verified frontier is the final one (at most 30 s)
+    waitFinal verified = go (3000 :: Int)
+      where
+        go 0 = assertFailure "the freezer did not reach the final frontier"
+        go k = verified >>= \case
+            Just f | f == finalFrontier -> return ()
+            _ -> threadDelay 10_000 >> go (k - 1)
