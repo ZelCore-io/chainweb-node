@@ -319,6 +319,7 @@ library
         , Chainweb.Pact.Backend.Store.Cold
         , Chainweb.Pact.Backend.Store.Cold.Key
         , Chainweb.Pact.Backend.Store.Freezer
+        , Chainweb.Pact.Backend.Store.WalCheckpointer
         , Chainweb.Pact.Backend.Store.Node
         , Chainweb.Pact.Backend.Store.Shadow
         , Chainweb.Pact.Backend.Store.Split
@@ -693,6 +694,7 @@ test-suite chainweb-tests
         Chainweb.Test.Pact.Store.Shadow
         Chainweb.Test.Pact.Store.Split
         Chainweb.Test.Pact.Store.SplitNode
+        Chainweb.Test.Pact.Store.WalCheckpointer
         Chainweb.Test.Payload.Store
         Chainweb.Test.ResponseSizeLimiter
         Chainweb.Test.RestAPI

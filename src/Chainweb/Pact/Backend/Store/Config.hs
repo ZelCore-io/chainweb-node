@@ -38,6 +38,12 @@ module Chainweb.Pact.Backend.Store.Config
 , phCatchUpLagSeconds
 , phFreezerConcurrency
 , phFreezerEnabled
+, phWalCheckpointer
+, phWalCheckpoint
+, WalCheckpointerMode(..)
+, walCheckpointerOn
+, WalCheckpointConfig(..)
+, defaultWalCheckpointConfig
 , defaultPactHistoryConfig
 , pPactHistoryConfig
 , validatePactHistoryConfig
@@ -151,7 +157,108 @@ data PactHistoryConfig = PactHistoryConfig
     , _phFreezerEnabled :: !Bool
         -- ^ whether the freezer runs. Not an option: the in-process harness of
         -- @cw-compare@ sets it to 'False'.
+    , _phWalCheckpointer :: !WalCheckpointerMode
+        -- ^ @--pact-wal-checkpointer@: whether a background thread
+        -- checkpoints the Pact SQLite files instead of their commits (the
+        -- commits keep a backstop autocheckpoint at
+        -- '_wccRestartFrames')
+    , _phWalCheckpoint :: !WalCheckpointConfig
+        -- ^ the background checkpointer's thresholds (config file only)
     } deriving (Show, Eq, Generic)
+
+-- | Whether the Pact SQLite files are checkpointed by a background thread
+-- ("Chainweb.Pact.Backend.Store.WalCheckpointer"), with the connections'
+-- autocheckpoint off. @auto@ (the default) is on in split and shadow mode
+-- and off in sqlite mode, which stays as the @storage/3.2.1@ head.
+data WalCheckpointerMode
+    = WalCheckpointerAuto
+    | WalCheckpointerOn
+    | WalCheckpointerOff
+    deriving (Show, Eq, Ord, Bounded, Enum, Generic)
+
+walCheckpointerModeToText :: WalCheckpointerMode -> Text
+walCheckpointerModeToText = \case
+    WalCheckpointerAuto -> "auto"
+    WalCheckpointerOn -> "on"
+    WalCheckpointerOff -> "off"
+
+walCheckpointerModeFromText :: Text -> Either String WalCheckpointerMode
+walCheckpointerModeFromText t = case T.toLower t of
+    "auto" -> Right WalCheckpointerAuto
+    "on" -> Right WalCheckpointerOn
+    "off" -> Right WalCheckpointerOff
+    _ -> Left $ "the WAL checkpointer mode must be auto, on or off, got " <> show t
+
+instance ToJSON WalCheckpointerMode where
+    toJSON = toJSON . walCheckpointerModeToText
+
+instance FromJSON WalCheckpointerMode where
+    parseJSON = withText "WalCheckpointerMode" $ either fail return . walCheckpointerModeFromText
+
+-- | Whether the background checkpointer runs for this configuration.
+walCheckpointerOn :: PactHistoryConfig -> Bool
+walCheckpointerOn c = case _phWalCheckpointer c of
+    WalCheckpointerOn -> True
+    WalCheckpointerOff -> False
+    WalCheckpointerAuto -> _phStore c /= HistorySqlite
+
+-- | The thresholds of the background checkpointer, in WAL frames (one page
+-- each: 4 KiB on the Pact files, whose @page_size = 1024@ pragma comes after
+-- the switch to WAL and so does not apply) and milliseconds.
+data WalCheckpointConfig = WalCheckpointConfig
+    { _wccPollMs :: !Int
+        -- ^ how often the WAL index is read for the frames not yet
+        -- checkpointed (a read of the @-shm@ header, no lock)
+    , _wccIntervalMs :: !Int
+        -- ^ a PASSIVE checkpoint at least this often while frames are pending
+    , _wccSoftFrames :: !Int
+        -- ^ a PASSIVE checkpoint as soon as this many frames are pending
+        -- (SQLite's autocheckpoint default is 1000)
+    , _wccRestartFrames :: !Int
+        -- ^ the writer's autocheckpoint while the thread serves it: a
+        -- backstop for a WAL that the thread's checkpoints did not let
+        -- restart (frames, checkpointed or not)
+    , _wccFinalBusyMs :: !Int
+        -- ^ the busy timeout of the final TRUNCATE checkpoint when a file's
+        -- registration ends
+    , _wccStatsLogSeconds :: !Int
+        -- ^ how often each file's stats are logged (and at its stop)
+    } deriving (Show, Eq, Generic)
+
+makeLenses ''WalCheckpointConfig
+
+-- | Poll 100 ms, PASSIVE at 1000 pending frames (SQLite's autocheckpoint
+-- threshold) or every second, the writer's backstop at a WAL of 16,384
+-- frames (64 MiB at 4 KiB pages), a final checkpoint that waits up to 1 s;
+-- stats every 10 minutes.
+defaultWalCheckpointConfig :: WalCheckpointConfig
+defaultWalCheckpointConfig = WalCheckpointConfig
+    { _wccPollMs = 100
+    , _wccIntervalMs = 1_000
+    , _wccSoftFrames = 1_000
+    , _wccRestartFrames = 16_384
+    , _wccFinalBusyMs = 1_000
+    , _wccStatsLogSeconds = 600
+    }
+
+instance ToJSON WalCheckpointConfig where
+    toJSON o = object
+        [ "pollMs" .= _wccPollMs o
+        , "intervalMs" .= _wccIntervalMs o
+        , "softFrames" .= _wccSoftFrames o
+        , "restartFrames" .= _wccRestartFrames o
+        , "finalBusyMs" .= _wccFinalBusyMs o
+        , "statsLogSeconds" .= _wccStatsLogSeconds o
+        ]
+
+instance FromJSON (WalCheckpointConfig -> WalCheckpointConfig) where
+    parseJSON = withObject "WalCheckpointConfig" $ \o -> id
+        <$< wccPollMs ..: "pollMs" % o
+        <*< wccIntervalMs ..: "intervalMs" % o
+        <*< wccSoftFrames ..: "softFrames" % o
+        <*< wccRestartFrames ..: "restartFrames" % o
+        <*< wccFinalBusyMs ..: "finalBusyMs" % o
+        <*< wccStatsLogSeconds ..: "statsLogSeconds" % o
 
 makeLenses ''PactHistoryConfig
 
@@ -172,6 +279,8 @@ defaultPactHistoryConfig = PactHistoryConfig
     , _phCatchUpLagSeconds = 600
     , _phFreezerConcurrency = 2
     , _phFreezerEnabled = True
+    , _phWalCheckpointer = WalCheckpointerAuto
+    , _phWalCheckpoint = defaultWalCheckpointConfig
     }
 
 -- | The startup rewind limit (spec 2, fact 10). A freeze depth below it lets
@@ -192,6 +301,8 @@ instance ToJSON PactHistoryConfig where
         , "trimDutyCycle" .= _phTrimDutyCycle o
         , "catchUpLagSeconds" .= _phCatchUpLagSeconds o
         , "freezerConcurrency" .= _phFreezerConcurrency o
+        , "walCheckpointer" .= _phWalCheckpointer o
+        , "walCheckpoint" .= _phWalCheckpoint o
         ]
 
 instance FromJSON (PactHistoryConfig -> PactHistoryConfig) where
@@ -204,6 +315,8 @@ instance FromJSON (PactHistoryConfig -> PactHistoryConfig) where
         <*< phTrimDutyCycle ..: "trimDutyCycle" % o
         <*< phCatchUpLagSeconds ..: "catchUpLagSeconds" % o
         <*< phFreezerConcurrency ..: "freezerConcurrency" % o
+        <*< phWalCheckpointer ..: "walCheckpointer" % o
+        <*< phWalCheckpoint %.: "walCheckpoint" % o
 
 instance FromJSON PactHistoryConfig where
     parseJSON v = parseJSON v <*> pure defaultPactHistoryConfig
@@ -252,6 +365,10 @@ pPactHistoryConfig = id
         % long "pact-trim-duty-cycle"
         <> metavar "X"
         <> help "With split or shadow: the share of time, in (0, 1], that trimming SQLite may take while the node catches up."
+    <*< phWalCheckpointer .:: option (eitherReader (walCheckpointerModeFromText . T.pack))
+        % long "pact-wal-checkpointer"
+        <> metavar "auto|on|off"
+        <> help "Whether a background thread checkpoints the Pact SQLite files (WAL) instead of their commits. auto (the default) is on with split and shadow and off with sqlite."
 
 -- -------------------------------------------------------------------------- --
 -- Validation
@@ -274,6 +391,11 @@ validatePactHistoryConfig c = do
         throwError "pactHistory.coldBlockCacheBytes (--pact-cold-block-cache) must be at least 1"
     when (_phFreezerConcurrency c < 1) $
         throwError "pactHistory.freezerConcurrency must be at least 1"
+    let w = _phWalCheckpoint c
+    when (_wccPollMs w < 1 || _wccIntervalMs w < 1 || _wccFinalBusyMs w < 0 || _wccStatsLogSeconds w < 1) $
+        throwError "pactHistory.walCheckpoint: pollMs, intervalMs and statsLogSeconds must be at least 1, finalBusyMs at least 0"
+    when (_wccSoftFrames w < 1 || _wccRestartFrames w < _wccSoftFrames w) $
+        throwError "pactHistory.walCheckpoint: softFrames must be at least 1 and restartFrames at least softFrames"
     when (_phCatchUpLagSeconds c < 1) $
         throwError "pactHistory.catchUpLagSeconds must be at least 1"
     when (_phStore c /= HistorySqlite && _phFreezeDepth c < startupRewindLimit) $

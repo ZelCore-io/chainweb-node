@@ -91,6 +91,7 @@ import Chainweb.Pact.Backend.Store.Freezer
 import Chainweb.Pact.Backend.Store.Layout
 import Chainweb.Pact.Backend.Store.SQLite
 import Chainweb.Pact.Backend.Store.Types
+import Chainweb.Pact.Backend.Store.WalCheckpointer
 import Chainweb.Pact.Backend.Types (SQLiteEnv)
 import Chainweb.Pact.Backend.Utils (chainDbFileName, chainwebPragmas, withSQLiteConnection, withTempSQLiteConnection)
 import Chainweb.Storage.Table.RocksDB (RocksDb, _rocksDbHandle, writeBatchSync)
@@ -1203,7 +1204,16 @@ trimBench = lookupEnv "CHAINWEB_TRIM_BENCH" >>= \case
         let cfg = testConfig { _phFreezeDepth = 10, _phFreezeStepHeights = 1000 }
         withNodeW defaultTrimWindow root cfg writeBatchSync (const noHooks) (const (return ())) $ \n -> do
             lookupEnv "CHAINWEB_TRIM_BENCH_NOCKPT" >>= mapM_ (\_ -> P4SQL.exec_ (_nPact n) "PRAGMA wal_autocheckpoint = 0")
-            _ <- runToEnd (_nEnv n)
+            -- CHAINWEB_TRIM_BENCH_CKPT: the background checkpointer serves the
+            -- Pact connection, as in split mode
+            withCkpt <- lookupEnv "CHAINWEB_TRIM_BENCH_CKPT"
+            let file :: (FilePath -> IO b) -> IO b
+                file f = withSqliteDirLock (_feLayout (_nEnv n)) $ \d -> f (d </> chainDbFileName cid)
+            case withCkpt of
+                Nothing -> void $ runToEnd (_nEnv n)
+                Just _ -> withWalCheckpointer (\_ _ -> return ()) defaultWalCheckpointConfig $ \cp -> do
+                    withWalCheckpoint cp "bench" (_nPact n) file $ void $ runToEnd (_nEnv n)
+                    walCheckpointStats cp >>= mapM_ (\(_, w) -> putStrLn $ "trim-bench: ckpt " <> show w)
             st <- readIORef (_feStats (_nEnv n))
             let xs = sort (foldr (:) [] (_fsTrimSamples st))
                 pct q = if null xs then 0 else xs !! min (length xs - 1) (floor (q * fromIntegral (length xs) :: Double))

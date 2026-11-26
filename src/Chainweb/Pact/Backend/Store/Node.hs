@@ -88,7 +88,8 @@ import Chainweb.Pact.Backend.Store.Split
 import Chainweb.Pact.Backend.Store.SQLite (sqliteHasBlockHistory, sqlitePactStore, withSqliteErrorDetail)
 import Chainweb.Pact.Backend.Store.Types
 import Chainweb.Pact.Backend.Types (SQLiteEnv)
-import Chainweb.Pact.Backend.Utils (startSqliteDb, stopSqliteDb, withSqliteDb)
+import Chainweb.Pact.Backend.Utils (chainDbFileName, startSqliteDb, stopSqliteDb, withSqliteDb)
+import Chainweb.Pact.Backend.Store.WalCheckpointer
 import Chainweb.Time (Micros, Time)
 import Chainweb.Utils (sshow)
 import Chainweb.Version
@@ -105,6 +106,10 @@ data PactStorage = PactStorage
         -- ^ the node-wide freezer semaphore, '_phFreezerConcurrency' units
     , _pstFreezerPollMicros :: !Int
         -- ^ 'defaultFreezerPollMicros'; the test helpers use 100 ms
+    , _pstWalCheckpointer :: !(Maybe WalCheckpointer)
+        -- ^ the background WAL checkpointer of the Pact SQLite files
+        -- ('walCheckpointerOn'); every chain's writer connections register
+        -- with it in 'withChainStorage'
     }
 
 data PactStorageError
@@ -182,12 +187,17 @@ withPactStorageMode mode logger v cfg root reset k = do
         then readPactLayout logger (_phStore cfg) root
         else resolvePactLayout logger (_phStore cfg) reset root
     sem <- newQSem (_phFreezerConcurrency cfg)
-    let st cold = PactStorage layout cold cfg sem defaultFreezerPollMicros
-    case _plColdDir layout of
-        Nothing -> k (st Nothing)
+    -- a read-only open (tools) writes nothing, so it checkpoints nothing
+    let withCheckpointer act
+            | mode == ColdReadWrite && walCheckpointerOn cfg =
+                withWalCheckpointer (logFunctionText logger) (_phWalCheckpoint cfg) (act . Just)
+            | otherwise = act Nothing
+        st cold cp = PactStorage layout cold cfg sem defaultFreezerPollMicros cp
+    withCheckpointer $ \cp -> case _plColdDir layout of
+        Nothing -> k (st Nothing cp)
         Just d -> withColdStore d mode (_phColdBlockCacheBytes cfg) $ \cs -> do
             bindSplitStore mode layout cs
-            k (st (Just cs))
+            k (st (Just cs) cp)
 
 -- | Binds the cold store to the SQLite files by a store id (spec 7.4, "whole
 -- snapshots only"): a random id in the cold store and the same id in the
@@ -309,6 +319,7 @@ sqliteOnlyStorage dir = do
         , _pstHistory = defaultPactHistoryConfig
         , _pstFreezerSem = sem
         , _pstFreezerPollMicros = defaultFreezerPollMicros
+        , _pstWalCheckpointer = Nothing
         }
 
 -- | The directories the database monitor measures, by name: @pactDb@ (the
@@ -393,11 +404,11 @@ withChainStorage logger st cid reset k = do
     case (_phStore cfg, _pstCold st) of
         (HistorySqlite, _) -> do
             dir <- currentSqliteDir layout
-            withSqliteDb cid logger dir reset $ \sql ->
+            withSqliteDb cid logger dir reset $ \sql -> checkpointed "sqlite" sql currentFile $
                 k (ChainStorage sql ChainStoreSqlite Nothing drain)
         (mode, Nothing) -> throwIO $ HistoryStoreRefused $
             "internal error: no cold store in mode " <> pactHistoryStoreToText mode
-        (HistorySplit, Just cs) -> withHot $ \hot -> do
+        (HistorySplit, Just cs) -> withHot $ \hot -> checkpointed "hot" hot currentFile $ do
             cc <- openColdChain cs cid
             trimmedTo <- do
                 dir <- currentSqliteDir layout
@@ -416,7 +427,10 @@ withChainStorage logger st cid reset k = do
         (HistoryShadow, Just cs) -> do
             legacyDir <- maybe (throwIO $ ShadowNeedsLegacy (_plRoot layout </> sqliteDirName)) return
                 (_plLegacyDir layout)
-            withSqliteDb cid logger legacyDir False $ \legacy -> withHot $ \hot -> do
+            let legacyFile :: (FilePath -> IO b) -> IO b
+                legacyFile f = f (legacyDir </> chainDbFileName cid)
+            withSqliteDb cid logger legacyDir False $ \legacy -> checkpointed "legacy" legacy legacyFile $
+              withHot $ \hot -> checkpointed "hot" hot currentFile $ do
                 cc <- openColdChain cs cid
                 counters <- newIORef emptySplitCounters
                 diffs <- newIORef 0
@@ -466,6 +480,16 @@ withChainStorage logger st cid reset k = do
     layout = _pstLayout st
     logg = logFunctionText logger
     logJson level v = logg level (T.decodeUtf8 (BL.toStrict (A.encode v)))
+
+    -- the writer's file, in the current SQLite directory, under the rename
+    -- lock (the checkpointer's opens and its reads of the WAL index)
+    currentFile :: (FilePath -> IO b) -> IO b
+    currentFile f = withSqliteDirLock layout $ \dir -> f (dir </> chainDbFileName cid)
+
+    checkpointed :: Text -> SQLiteEnv -> (forall b. (FilePath -> IO b) -> IO b) -> IO a -> IO a
+    checkpointed role w file act = case _pstWalCheckpointer st of
+        Nothing -> act
+        Just cp -> withWalCheckpoint cp ("chain " <> chainIdToText cid <> " " <> role) w file act
 
     -- every new connection to the SQLite files opens under the rename lock
     withHot = bracket

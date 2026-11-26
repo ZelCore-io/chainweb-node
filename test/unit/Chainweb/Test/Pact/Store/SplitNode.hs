@@ -31,7 +31,7 @@ import Data.Maybe (isJust, isNothing)
 import qualified Data.Text as T
 
 import System.Directory
-import System.FilePath ((<.>), (</>))
+import System.FilePath ((<.>), (</>), takeFileName)
 import System.IO.Temp (withSystemTempDirectory)
 
 import Test.Tasty
@@ -96,6 +96,7 @@ tests = testGroup "Split store node"
     , testCase "restart at freeze depth 3: the freezer waits for the startup rewind, so a recent rewind is not refused" freezerAfterRewindTest
     , testCase "split start on a fresh directory: the hot file has no schema yet; the chain starts and the store runs" freshSplitTest
     , testCase "shadow start on a fresh directory: the split side does not break" freshShadowTest
+    , testCase "WAL checkpointer: auto is on in split and shadow (every writer: hot, legacy) and off in sqlite; on works in sqlite; off is off; the final checkpoint empties the WAL" walCheckpointerWiringTest
     , testCase "a failed SQLite statement names SQLite's message, not only the error code" errorDetailTest
     , testCase "test storage: a shadow chain whose split side broke fails the test, with the storage log" shadowBrokenFailsTestTest
     , testCase "test storage: the release closes the storage also when the shadow check fails" releaseAfterFailedCheckTest
@@ -355,6 +356,52 @@ freshSplitTest = withSystemTempDirectory "split-node" $ \tmp -> do
             forM_ (block <$> [0 .. 3]) $ \b ->
                 _psCommitBlock store b >>= either (assertFailure . show) return
             _psGetLatestBlock store >>= (@?= Just (3, mkHash 3 0))
+
+-- | Which connections the background WAL checkpointer serves: the
+-- connection's autocheckpoint is the backstop ('_wccRestartFrames') while
+-- it is registered, SQLite's 1000 otherwise. Shadow mode has
+-- two writers, the legacy file and the split side's hot file. After the
+-- storage closes, the WAL files are empty (the final checkpoint).
+walCheckpointerWiringTest :: Assertion
+walCheckpointerWiringTest = forM_ cases $ \(store, mode, expect) ->
+  withSystemTempDirectory "split-node" $ \tmp -> do
+    let root = tmp </> "0"
+        cfg = testConfig { _phStore = store, _phWalCheckpointer = mode }
+        what = show (store, mode)
+    withPactStorage quietLogger v cfg root False $ \st -> do
+        assertEqual (what <> ": a checkpointer") expect (isJust (_pstWalCheckpointer st))
+        withChainStorage quietLogger st cid False $ \cst -> do
+            let store' = chainStorePactStore (_cstSql cst) (_cstStore cst)
+            _psInitSchema store'
+            forM_ (block <$> [0 .. 3]) $ \b ->
+                _psCommitBlock store' b >>= either (assertFailure . show) return
+            ac (_cstSql cst) >>= assertEqual (what <> ": primary autocheckpoint") (if expect then 16384 else 1000)
+            case _cstStore cst of
+                ChainStoreShadow env -> forM_ (_cstFreezer cst) $ \fz ->
+                    ac (_cfHot fz) >>= assertEqual (what <> ": hot autocheckpoint") (if expect then 16384 else 1000)
+                    >> void (return env)
+                ChainStoreSplit _ -> return ()
+                ChainStoreSqlite -> return ()
+    when expect $ do
+        wals <- filter ((== "-wal") . reverse . take 4 . reverse) <$> listDirectoryRec root
+        forM_ wals $ \w -> getFileSize w >>= assertEqual (what <> ": " <> takeFileName w) 0
+  where
+    cases =
+        [ (HistorySqlite, WalCheckpointerAuto, False)
+        , (HistorySqlite, WalCheckpointerOn, True)
+        , (HistorySplit, WalCheckpointerAuto, True)
+        , (HistorySplit, WalCheckpointerOff, False)
+        , (HistoryShadow, WalCheckpointerAuto, True)
+        ]
+    ac db = Pact4.qry_ db "PRAGMA wal_autocheckpoint" [Pact4.RInt] >>= \case
+        [[Pact4.SInt n]] -> return n
+        r -> assertFailure (show r)
+    listDirectoryRec d = do
+        xs <- listDirectory d
+        fmap concat $ forM xs $ \x -> do
+            let p = d </> x
+            isDir <- doesDirectoryExist p
+            if isDir then listDirectoryRec p else return [p]
 
 -- | The same fresh start in shadow mode: the split side must not break, so
 -- that a shadow run compares the split store rather than the legacy one
