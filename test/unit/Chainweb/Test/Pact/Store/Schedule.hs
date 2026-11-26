@@ -76,7 +76,8 @@ tests = testGroup "Freezer schedule"
     , testCase "drainFreezer ends with planStep = Nothing" drainTest
     , testCase "FreezerStats: file bytes >= live bytes; the peak never decreases" statsTest
     , testCase "M3: a rewind below a step being written waits for its publish and is refused; one above it does not wait" rewindWaitsTest
-    , testCase "M3: a rewind during a step's read drops the step; nothing is written" rewindDropsTest
+    , testCase "M3: a rewind during a later step's read drops the step; nothing is written" rewindDropsTest
+    , testCase "M3: a rewind below the first step, during its read, waits for the step and is refused" rewindWaitsForBaseReadTest
     , testCase "N1: a trim chunk inside an outer transaction is refused; nothing deleted, the trim position stays" outerTxnTest
     , testCase "trim benchmark (runs with CHAINWEB_TRIM_BENCH=1)" trimBench
     ]
@@ -310,8 +311,44 @@ rewindWaitsTest = withFixture $ \root _ -> do
         timeout 10_000_000 (wait fr) >>= (@?= Just (Froze (frontierAt 2)))
         fmap (\(h, _, _) -> h) <$> sqliteTip (_nPact n) >>= (@?= Just 10)
 
+-- | A step after the first reads its blocks unclaimed and claims its end
+-- after the read ('freezeOnceWith', step): a rewind that runs during the
+-- read bumps the guard's generation, the claim fails, and the step is
+-- dropped with nothing written. The first step claims before its read
+-- (I4, 'rewindWaitsForBaseReadTest'), so this is checked on the second.
 rewindDropsTest :: Assertion
 rewindDropsTest = withFixture $ \root _ -> do
+    armed <- newIORef False
+    readDone <- newEmptyMVar
+    release <- newEmptyMVar
+    let park = readIORef armed >>= \a -> when a (putMVar readDone () >> takeMVar release)
+        hooks _ = noHooks { _fhAfterRead = park }
+    withNode root testConfig writeBatchSync hooks (const (return ())) $ \n -> do
+        split <- splitOfNode n
+        freezeOnce (_nEnv n) >>= (@?= Froze (frontierAt 2))
+        writeIORef armed True
+        fr <- async (freezeOnce (_nEnv n))
+        takeMVar readDone
+        -- the step to height 5 is read, not claimed; the hot store rewinds
+        -- to height 3, above the frontier: the rewind does not wait
+        r <- timeout 5_000_000 $ underLock n $ _psWithBatch split $ _psRewindDbTo split (Just (parentAt 3))
+        r @?= Just 40
+        putMVar release ()
+        timeout 10_000_000 (wait fr) >>= (@?= Just StepDropped)
+        _ccWritten (_nCold n) >>= (@?= Just (frontierAt 2))
+        _ccVerified (_nCold n) >>= (@?= Just (frontierAt 2))
+    -- the next step reads the rewound store: too short to freeze
+    withPlainNode root $ \n -> freezeOnce (_nEnv n) >>= (@?= NothingToDo)
+
+-- | The first step (I4) claims the end of its first block before the base
+-- read and its later blocks before their read, so the rewind cannot change
+-- its snapshot: a rewind below the claimed end, started during the read,
+-- waits for the step, which publishes, and is then refused below the new
+-- frontier. (Before I4 this rewind dropped the step; the old form of
+-- 'rewindDropsTest' deadlocked here: its rewind waited for the step, and
+-- the step waited for the test.)
+rewindWaitsForBaseReadTest :: Assertion
+rewindWaitsForBaseReadTest = withFixture $ \root _ -> do
     readDone <- newEmptyMVar
     release <- newEmptyMVar
     let hooks _ = noHooks { _fhAfterRead = putMVar readDone () >> takeMVar release }
@@ -319,15 +356,17 @@ rewindDropsTest = withFixture $ \root _ -> do
         split <- splitOfNode n
         fr <- async (freezeOnce (_nEnv n))
         takeMVar readDone
-        -- the step to height 2 is read; the hot store rewinds to height 1
-        r <- underLock n $ _psWithBatch split $ _psRewindDbTo split (Just (parentAt 1))
-        r @?= 20
-        putMVar release ()
-        timeout 10_000_000 (wait fr) >>= (@?= Just StepDropped)
         _ccWritten (_nCold n) >>= (@?= Nothing)
-        _ccVerified (_nCold n) >>= (@?= Nothing)
-    -- the next step reads the rewound store: too short to freeze
-    withPlainNode root $ \n -> freezeOnce (_nEnv n) >>= (@?= NothingToDo)
+        rw <- async $ underLock n $ try $ _psWithBatch split $ _psRewindDbTo split (Just (parentAt 1))
+        threadDelay 500_000
+        poll rw >>= \r -> assertBool "the rewind waits for the step" (isNothing r)
+        putMVar release ()
+        timeout 10_000_000 (wait rw) >>= \case
+            Just (Left e) -> e @?= RewindBelowFrontier cid 20 (frontierAt 2)
+            r -> assertFailure $ "expected RewindBelowFrontier, got " <> show (fmap (either show show) r)
+        timeout 10_000_000 (wait fr) >>= (@?= Just (Froze (frontierAt 2)))
+        _ccVerified (_nCold n) >>= (@?= Just (frontierAt 2))
+        fmap (\(h, _, _) -> h) <$> sqliteTip (_nPact n) >>= (@?= Just 12)
 
 -- -------------------------------------------------------------------------- --
 -- N1: trim position and outer transactions
