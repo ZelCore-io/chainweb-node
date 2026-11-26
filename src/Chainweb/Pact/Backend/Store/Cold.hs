@@ -726,6 +726,19 @@ openColdChainHooked writer midPublish cs c = do
                     when (next > fromIntegral (maxBound :: Word32)) $
                         coldError "key ids exhausted"
                     let kid = KeyId (fromIntegral next)
+                    -- Defense in depth: a new id must be free. A taken one
+                    -- means the next key id is stale (the drain data loss
+                    -- of gate B run 2); writing would overwrite the I entry
+                    -- of another key and break the T lists that name it.
+                    -- One point read per new key; the exception comes
+                    -- before the write, so nothing is written, and the
+                    -- freezer halts the chain on it.
+                    coldRawGet cs (idKey c t kid) >>= mapM_ (\old -> coldError $ T.unwords
+                        [ "chain", chainIdToText c <> ": refusing to reuse key id", T.pack (show next)
+                        , "of table id", T.pack (show t) <> ": its I entry already names the key"
+                        , T.pack (show old) <> ", and the new key is", T.pack (show k) <> "."
+                        , "The writer's next key id is stale; nothing was written."
+                        ])
                     return
                         ( kid
                         , next + 1

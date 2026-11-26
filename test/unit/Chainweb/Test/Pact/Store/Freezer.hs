@@ -391,6 +391,7 @@ tests = testGroup "Freezer step"
     , testCase "runFreezer retries a transient SQLite error (BUSY/LOCKED) with backoff, halts past the limit and on any other exception, and records the halt in the stats" runFreezerRetryTest
     , testCase "a cancel delivered as a step's cold write returns, then a drain on the same chain: no key id is reused, every T list resolves, cold equals the twin" cancelAfterWriteTest
     , testCase "drainFreezer: an exception in a step halts the chain (FreezerHalted, haltedReason) instead of propagating" drainExceptionTest
+    , testCase "a stale next key id (its I entry exists) halts the chain before the write; the I entry is not overwritten" keyIdReuseGuardTest
     ]
 
 -- | A fixture whose node SQLite file holds the given history, without a twin.
@@ -1119,6 +1120,39 @@ drainExceptionTest = withFixture $ \root _ -> do
         assertBool ("halted: " <> show (_fsHaltedReason st)) $
             maybe False ("DiskFull" `T.isInfixOf`) (_fsHaltedReason st)
         _ccVerified (_nCold n) >>= (@?= Nothing)
+
+-- | Defense in depth for the stale counter of the drain data loss: before
+-- the cold writer gives a new key an id, the id's I entry must not exist.
+-- A foreign I entry is planted at the id the writer's cached counter gives
+-- next, which is what a stale counter looks like from the database. The
+-- next step must halt the chain ('FreezerHalted', a reason naming the key
+-- id) and write nothing: the planted I entry keeps its key, no K entry
+-- points at the id, and the verified frontier stays at the first step.
+keyIdReuseGuardTest :: Assertion
+keyIdReuseGuardTest = withHistoryFixture freshKeyHistory $ \root ->
+    withNode root testConfig writeBatchSync (const noHooks) (const (return ())) $ \n -> do
+        let env = _nEnv n
+            cs = _nStore n
+        -- the first step caches the next key id of coin_table
+        freezeOnce env >>= (@?= Froze (frontierAt 2))
+        t <- coldRawGet cs (tableIdKey cid "coin_table") >>= \case
+            Just v -> return (TableId (B.foldl' (\a w -> a `shiftL` 8 .|. fromIntegral w) 0 v))
+            Nothing -> assertFailure "coin_table has no N entry"
+        let prefix = B.take 6 (idKey cid t (KeyId 0))
+        before <- filter ((prefix `B.isPrefixOf`) . fst) <$> coldEntries cs
+        let next = KeyId (fromIntegral (length before))
+            planted = idKey cid t next
+        writeBatchSync (coldStoreRocksDb cs) [R.Put planted "foreign-key"]
+        allBefore <- coldEntries cs
+        drainFreezer env
+        st <- readIORef (_feStats env)
+        assertBool ("halted: " <> show (_fsHaltedReason st)) $
+            maybe False ("key id" `T.isInfixOf`) (_fsHaltedReason st)
+        coldRawGet cs planted >>= (@?= Just "foreign-key")
+        -- nothing was written: no new I, K, R or T entry, no frontier move
+        allAfter <- coldEntries cs
+        assertEqual "cold entries after the halt" allBefore allAfter
+        _ccVerified (_nCold n) >>= (@?= Just (frontierAt 2))
 
 -- -------------------------------------------------------------------------- --
 -- Trim benchmark (opt-in)
