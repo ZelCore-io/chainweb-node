@@ -455,12 +455,7 @@ openColdChainHooked writer midPublish cs c = do
         when (S.member c open) $
             coldError $ "chain " <> chainIdToText c <> " is already open"
         return (S.insert c open)
-    meta <- coldRawGet cs (metaKey c) >>= \case
-        Nothing -> return emptyColdMeta
-        Just bytes -> either
-            (\e -> coldError $ "chain " <> chainIdToText c <> ": bad meta: " <> T.pack e)
-            return
-            (decodeColdMeta bytes)
+    meta <- readMeta
     catalog <- readCatalog
     guard' <- newRewindGuard
     metaRef <- newIORef meta
@@ -478,6 +473,7 @@ openColdChainHooked writer midPublish cs c = do
         , _wsNextKey = mempty
         , _wsUnpublished = []
         }
+    let commit = commitWith writerVar metaRef catalogRef
     -- the freezer's view: the written frontier and the writer's catalog,
     -- which includes the tables of an unpublished step
     let written = Readers
@@ -493,25 +489,22 @@ openColdChainHooked writer midPublish cs c = do
         , _ccWritten = _cmWritten <$> readIORef metaRef
         , _ccWriteStep = \s -> do
             checkWritable
-            modifyMVar_ writerVar $ \ws -> do
+            commit $ \ws -> do
                 (ops, ws') <- buildStep ws s
-                writer db ops
-                writeIORef metaRef (_wsMeta ws')
-                return ws'
+                return $ Just (ops, ws', writeIORef metaRef (_wsMeta ws'))
         , _ccWriteRows = \hi tables -> do
             checkWritable
-            modifyMVar_ writerVar $ \ws -> do
+            commit $ \ws -> do
                 let lo = frontierTxId (_cmWritten (_wsMeta ws))
                 checkRows lo hi tables
                 (ws', opsByTable) <- mapAccumM buildTable ws tables
-                writer db (concat opsByTable)
-                return ws'
+                return $ Just (concat opsByTable, ws', return ())
         , _ccPublish = do
             checkWritable
-            modifyMVar_ writerVar $ \ws -> do
+            commit $ \ws -> do
                 let m = _wsMeta ws
                 if _cmWritten m == _cmVerified m
-                then return ws
+                then return Nothing
                 else do
                     let m' = m
                             { _cmVerified = _cmWritten m
@@ -522,29 +515,31 @@ openColdChainHooked writer midPublish cs c = do
                             -- writes a step, so this is the old end.
                             , _cmTrimFrom = min (_cmTrimFrom m) (frontierTxId (_cmVerified m))
                             }
-                    writer db [R.Put (metaKey c) (encodeColdMeta m')]
-                    -- the catalog first, then the frontier: a reader that
-                    -- sees the new frontier also sees the step's tables, and
-                    -- one that sees the new catalog with the old frontier is
-                    -- still clamped to the old frontier (readers read the
-                    -- catalog first, then the frontier)
-                    atomicModifyIORef' catalogRef $ \cat ->
-                        (foldl' (\acc (n, t) -> HM.insert n t acc) cat (_wsUnpublished ws), ())
-                    midPublish
-                    atomicWriteIORef metaRef m'
-                    return ws { _wsMeta = m', _wsUnpublished = [] }
+                    return $ Just
+                        ( [R.Put (metaKey c) (encodeColdMeta m')]
+                        , ws { _wsMeta = m', _wsUnpublished = [] }
+                        , do
+                            -- the catalog first, then the frontier: a reader
+                            -- that sees the new frontier also sees the step's
+                            -- tables, and one that sees the new catalog with
+                            -- the old frontier is still clamped to the old
+                            -- frontier (readers read the catalog first, then
+                            -- the frontier)
+                            atomicModifyIORef' catalogRef $ \cat ->
+                                (foldl' (\acc (n, t) -> HM.insert n t acc) cat (_wsUnpublished ws), ())
+                            midPublish
+                            atomicWriteIORef metaRef m'
+                        )
         , _ccTrimProgress = \x -> do
             checkWritable
-            modifyMVar_ writerVar $ \ws -> do
+            commit $ \ws -> do
                 let m = _wsMeta ws
                     x' = min x (frontierTxId (_cmVerified m))
                 if x' <= _cmTrimFrom m
-                then return ws
+                then return Nothing
                 else do
                     let m' = m { _cmTrimFrom = x' }
-                    writer db [R.Put (metaKey c) (encodeColdMeta m')]
-                    atomicWriteIORef metaRef m'
-                    return ws { _wsMeta = m' }
+                    return $ Just ([R.Put (metaKey c) (encodeColdMeta m')], ws { _wsMeta = m' }, atomicWriteIORef metaRef m')
         , _ccTableId = \name -> HM.lookup (foldTableName name) <$> readIORef catalogRef
         , _ccReadNewest = readNewest readers
         , _ccDistinctKeys = distinctKeys readers
@@ -570,6 +565,65 @@ openColdChainHooked writer midPublish cs c = do
 
     checkWritable = when (_csMode cs == ColdReadOnly) $
         coldError "the cold store is open read-only"
+
+    readMeta = coldRawGet cs (metaKey c) >>= \case
+        Nothing -> return emptyColdMeta
+        Just bytes -> either
+            (\e -> coldError $ "chain " <> chainIdToText c <> ": bad meta: " <> T.pack e)
+            return
+            (decodeColdMeta bytes)
+
+    -- A change of the writer state that writes one batch. @build@ gives the
+    -- batch, the state after it, and the in-memory updates that follow the
+    -- write (or 'Nothing': no write). An exception in @build@ leaves the
+    -- state as it was: nothing was written.
+    --
+    -- Once the batch goes to the writer, the state must follow the database.
+    -- An exception from there on leaves it unknown: a failed write, or an
+    -- asynchronous exception, which a write in progress (a foreign call)
+    -- receives as soon as it returns, with the batch in the database. That
+    -- is the freezer's cancel at the drain ('drainFreezer' after 'cancel'),
+    -- and the chain is used again right after it. So the state, the
+    -- in-memory frontiers and the catalog are read back from the database
+    -- ('resyncWith') before the exception propagates. Putting back the state
+    -- from before the batch would keep a next key id below the ids the
+    -- batch wrote, and a later step would give those ids to other keys:
+    -- their I entries overwritten, the T lists of earlier steps would no
+    -- longer resolve ("missing R entry"), below a trimmed frontier.
+    commitWith writerVar metaRef catalogRef build = mask $ \restore -> do
+        ws <- takeMVar writerVar
+        b <- restore (build ws) `onException` putMVar writerVar ws
+        case b of
+            Nothing -> putMVar writerVar ws
+            Just (ops, ws', after) -> try (restore (writer db ops >> after)) >>= \case
+                Right () -> putMVar writerVar ws'
+                Left e -> do
+                    ws'' <- resyncWith metaRef catalogRef
+                        `onException` putMVar writerVar ws { _wsNextKey = mempty }
+                    putMVar writerVar ws''
+                    throwIO (e :: SomeException)
+
+    -- The writer state as a fresh open reads it, with the in-memory
+    -- frontiers and catalog brought to the database's: a publish that
+    -- reached the database makes the unpublished tables visible first,
+    -- then moves the frontier, as '_ccPublish' does.
+    resyncWith metaRef catalogRef = do
+        m <- readMeta
+        cat <- readCatalog
+        old <- readIORef metaRef
+        published <- readIORef catalogRef
+        let unpub = [ e | e@(n, _) <- HM.toList cat, not (HM.member n published) ]
+            moved = _cmVerified m /= _cmVerified old
+        when moved $ atomicModifyIORef' catalogRef $ \cat' ->
+            (foldl' (\acc (n, t) -> HM.insert n t acc) cat' unpub, ())
+        atomicWriteIORef metaRef m
+        return WriterState
+            { _wsMeta = m
+            , _wsTables = cat
+            , _wsNextTable = maybe 0 ((+ 1) . tableIdWord) (maximumMay (HM.elems cat))
+            , _wsNextKey = mempty
+            , _wsUnpublished = if moved then [] else unpub
+            }
 
     maximumMay [] = Nothing
     maximumMay xs = Just (maximum xs)

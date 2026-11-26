@@ -42,7 +42,7 @@ module Chainweb.Test.Pact.Store.Freezer
 ) where
 
 import Control.Concurrent (threadDelay)
-import Control.Concurrent.Async (cancel, withAsync)
+import Control.Concurrent.Async (AsyncCancelled(..), cancel, withAsync)
 import Control.Concurrent.MVar
 import Control.Concurrent.QSem (newQSem)
 import Control.Exception
@@ -389,6 +389,8 @@ tests = testGroup "Freezer step"
     , testCase "nextTrimWindow: halves on an overrun, doubles a full fast window only, shrinks to a row-capped window, stays within bounds" nextTrimWindowTest
     , testCase "trim benchmark (opt-in: CHAINWEB_TRIM_BENCH=<blocks>)" trimBench
     , testCase "runFreezer retries a transient SQLite error (BUSY/LOCKED) with backoff, halts past the limit and on any other exception, and records the halt in the stats" runFreezerRetryTest
+    , testCase "a cancel delivered as a step's cold write returns, then a drain on the same chain: no key id is reused, every T list resolves, cold equals the twin" cancelAfterWriteTest
+    , testCase "drainFreezer: an exception in a step halts the chain (FreezerHalted, haltedReason) instead of propagating" drainExceptionTest
     ]
 
 -- | A fixture whose node SQLite file holds the given history, without a twin.
@@ -1036,6 +1038,87 @@ runFreezerRetryTest = do
         go k = verified >>= \case
             Just f | f == finalFrontier -> return ()
             _ -> threadDelay 10_000 >> go (k - 1)
+
+-- | 'history' with one new key of @coin_table@ in every block, so that every
+-- step assigns new key ids.
+freshKeyHistory :: [BlockCommit]
+freshKeyHistory = fresh <$> history
+  where
+    fresh b = b { _bcRows = [ if t == "coin_table" then (t, rs ++ [new b]) else (t, rs) | (t, rs) <- _bcRows b ] }
+    new b = let h = fromIntegral (_bcHeight b) :: Int
+                n = B8.pack (show h)
+            in ("fresh" <> n, fromIntegral (10 * h + 9), "{\"fresh\":" <> n <> "}")
+
+-- | Gate B run 2 (W1, depth 4000): the drain cancels the running freezer
+-- ('drainFreezer' after 'cancel'). A cancel that arrives during the cold
+-- write of a step is delivered as the write returns: the batch is in the
+-- database (rows, I, K and T entries, the written frontier), but the
+-- writer's state ('modifyMVar_') was rolled back, its next key id included.
+-- The drain on the same chain then gave a later step's new keys the key ids
+-- of the interrupted step's keys, overwrote their I entries, and the T
+-- lists of the earlier, already published and trimmed step no longer
+-- resolved ("missing R entry"). The writer here commits the batch and then
+-- raises the cancel, at the first write after the first step.
+cancelAfterWriteTest :: Assertion
+cancelAfterWriteTest = withHistoryFixture freshKeyHistory $ \root ->
+  withTempSQLiteConnection chainwebPragmas $ \twin -> do
+    _psInitSchema (sqlitePactStore twin)
+    commitAll twin freshKeyHistory
+    armed <- newIORef False
+    let writer db ops = do
+            writeBatchSync db ops
+            fire <- atomicModifyIORef' armed (\a -> (False, a))
+            when fire $ throwIO AsyncCancelled
+    withNode root testConfig writer (const noHooks) (const (return ())) $ \n -> do
+        let env = _nEnv n
+            cc = _nCold n
+        freezeOnce env >>= (@?= Froze (frontierAt 2))
+        writeIORef armed True
+        r <- try (freezeOnce env)
+        case r of
+            Left AsyncCancelled -> return ()
+            Right o -> assertFailure $ "expected the cancel to propagate, got " <> show o
+        -- the drain, on the same chain
+        outcomes <- try (runToEnd env)
+        case outcomes of
+            Left (e :: SomeException) -> assertFailure $ "the drain failed: " <> displayException e
+            -- the interrupted step is in the database: the drain verifies
+            -- and publishes it, then freezes the last one
+            Right os -> os @?= [Froze (frontierAt 5), Froze finalFrontier, NothingToDo]
+        _ccVerified cc >>= (@?= Just finalFrontier)
+        -- every T list resolves to the twin's rows, order included
+        forM_ ["coin_table", "Late_Table"] $ \t -> do
+            xs <- S.toAscList . S.fromList . fmap (\(_, _, x, _) -> x) <$> rowsOf twin t
+            forM_ [ x | x <- xs, x < w64 (_frEndTxId finalFrontier) ] $ \x -> do
+                c <- try (_ccRowsAtTxId cc t (Pact4.TxId x))
+                s <- _psRowsAtTxId (sqlitePactStore twin) t (Pact4.TxId x)
+                case (c, s) of
+                    (Left (e :: SomeException), _) -> assertFailure $
+                        T.unpack t <> " at txid " <> show x <> ": " <> displayException e
+                    (Right cr, Right sr) -> assertEqual (T.unpack t <> " at txid " <> show x) (Just sr) cr
+                    (_, Left e) -> assertFailure (show e)
+        -- every key id names one key: no two K entries of a table share an
+        -- id, and each has its I entry
+        entries <- coldEntries (_nStore n)
+        let ids = [ k | (k, _) <- entries, B.take 1 k == "I" ]
+            kids = [ (B.drop 1 (B.take 6 k), v) | (k, v) <- entries, B.take 1 k == "K" ]
+        assertEqual "K entries sharing a key id" [] [ x | (x, c) <- M.toList (M.fromListWith (+) [ (x, 1 :: Int) | x <- kids ]), c > 1 ]
+        length ids @?= length kids
+
+-- | A synchronous exception in the drain ends the drain with
+-- @FreezerHalted@, like 'runFreezer'; it does not reach the node.
+drainExceptionTest :: Assertion
+drainExceptionTest = withFixture $ \root _ -> do
+    let failing _ _ = throwIO DiskFull
+    withNode root testConfig failing (const noHooks) (const (return ())) $ \n -> do
+        r <- try (drainFreezer (_nEnv n))
+        case r of
+            Left DiskFull -> assertFailure "the drain let the exception through"
+            Right () -> return ()
+        st <- readIORef (_feStats (_nEnv n))
+        assertBool ("halted: " <> show (_fsHaltedReason st)) $
+            maybe False ("DiskFull" `T.isInfixOf`) (_fsHaltedReason st)
+        _ccVerified (_nCold n) >>= (@?= Nothing)
 
 -- -------------------------------------------------------------------------- --
 -- Trim benchmark (opt-in)

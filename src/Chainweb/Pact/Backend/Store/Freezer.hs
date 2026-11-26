@@ -1265,15 +1265,21 @@ trySync act = try act >>= \case
 -- lets a chunk run (@--only-sync-pact@, after the replay). Logs
 -- @FreezerDrained { chain, seconds }@, and @FreezerHalted@ if it halts.
 --
+-- A synchronous exception halts the chain as in 'runFreezer' (logged as
+-- @FreezerHalted@, '_fsHaltedReason' set) and the drain returns: it does not
+-- reach the node, and 'freezeOnce' is crash safe. Transient SQLite errors
+-- are not retried here.
+--
 drainFreezer :: FreezerEnv -> IO ()
 drainFreezer env = do
     t0 <- getMonotonicTime
-    o <- go
+    o <- trySync go
     t1 <- getMonotonicTime
     case o of
-        HaltedVerify e -> logHalted env ("verification failed: " <> T.pack (show e))
-        HaltedHash f -> logHalted env ("another block hash at the frontier " <> T.pack (show f))
-        _ -> return ()
+        Left e -> logHalted env ("exception: " <> T.pack (displayException e))
+        Right (HaltedVerify e) -> logHalted env ("verification failed: " <> T.pack (show e))
+        Right (HaltedHash f) -> logHalted env ("another block hash at the frontier " <> T.pack (show f))
+        Right _ -> return ()
     logJson env Info $ object
         [ "FreezerDrained" .= object
             [ "chain" .= chainIdToText (_feChain env)
