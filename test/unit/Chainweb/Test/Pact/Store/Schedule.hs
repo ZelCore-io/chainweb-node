@@ -395,7 +395,7 @@ trimBench = lookupEnv "CHAINWEB_TRIM_BENCH" >>= \case
                 , _phFreezeStepHeights = 140
                 , _phFreezeStepBytes = 1_000_000_000_000
                 }
-        let tw = if mode == "fixed100" then TrimWindow 100 100 100 else defaultTrimWindow
+        let tw = if mode == "fixed100" then fixedTrimWindow 100 else defaultTrimWindow
         withNodeW tw root cfg writeBatchSync (const noHooks) (const (return ())) $ \n -> do
             t0 <- getMonotonicTime
             o <- freezeOnce (_nEnv n)
@@ -410,6 +410,7 @@ trimBench = lookupEnv "CHAINWEB_TRIM_BENCH" >>= \case
                 , "  rows trimmed: " <> show (_fsRowsTrimmed st)
                 , "  chunks: " <> show (_fsTrimChunks st) <> "; final window " <> show (_fsTrimWindow st)
                 , "  chunk ms: p10 " <> pct 0.1 <> ", p50 " <> pct 0.5 <> ", p90 " <> pct 0.9 <> ", p99 " <> pct 0.99 <> ", max " <> show (_fsTrimMaxMs st)
+                , "  trim commit max ms " <> show (_fsTrimCommitMaxMs st) <> "; GC max ms in a chunk " <> show (_fsTrimGcMaxMs st)
                 , "  trim ms total (under the lock) " <> show (_fsTrimMs st)
                     <> "; trim position writes ms " <> show (_fsTrimPositionMs st)
                 , "  write ms " <> show (_fsWriteMs st) <> "; verify ms " <> show (_fsVerifyMs st)

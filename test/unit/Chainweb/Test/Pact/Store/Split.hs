@@ -466,7 +466,7 @@ trimResumeRaceTest = do
                     c <- atomicModifyIORef' crash (\x -> (False, x))
                     when c $ throwIO (Crash 0)
                 }
-        withNodeW (TrimWindow 1 1 1) root testConfig writeBatchSync hooks (const (return ())) $ \n -> do
+        withNodeW (fixedTrimWindow 1) root testConfig writeBatchSync hooks (const (return ())) $ \n -> do
             freezeOnce (_nEnv n) >>= \case
                 Froze f -> assertEqual (what <> ": first step") (frontierAt 2) f
                 o -> assertFailure (what <> ": expected the first step, got " <> show o)

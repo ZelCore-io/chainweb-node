@@ -1,5 +1,6 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE NumericUnderscores #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RankNTypes #-}
@@ -42,6 +43,8 @@ module Chainweb.Pact.Backend.Store.Freezer
 , freezerStatsJson
 , TrimWindow(..)
 , defaultTrimWindow
+, fixedTrimWindow
+, nextTrimWindow
 
   -- * Steps
 , StepPlan(..)
@@ -93,6 +96,7 @@ import qualified Data.Text.Encoding as T
 import Data.Word (Word64)
 
 import GHC.Clock (getMonotonicTime)
+import GHC.Stats (RTSStats(gc_elapsed_ns), getRTSStats, getRTSStatsEnabled)
 
 import System.FilePath ((</>))
 import System.LogLevel
@@ -193,12 +197,21 @@ data FreezerStats = FreezerStats
     , _fsHaltedReason :: !(Maybe Text)
         -- ^ 'runFreezer' halted the chain's freezer, for this reason; it
         -- stays halted until the next start
+    , _fsTrimCommitMaxMs :: !Double
+        -- ^ the longest commit (savepoint release) of a trim chunk, part of
+        -- its time: a commit that takes the WAL over the connection's
+        -- @wal_autocheckpoint@ runs the checkpoint, which copies the whole
+        -- WAL to the database file and syncs both, whatever the chunk wrote
+    , _fsTrimGcMaxMs :: !(Maybe Double)
+        -- ^ the most GC time inside one trim chunk, part of its time (a GC
+        -- stops every thread, the writer's too); 'Nothing' unless the RTS
+        -- keeps stats (@+RTS -T@)
     }
     deriving (Eq, Show)
 
 emptyFreezerStats :: FreezerStats
 emptyFreezerStats = FreezerStats
-    0 0 0 0 0 0 0 0 0 0 Seq.empty 0 Nothing Nothing Nothing Nothing Nothing Nothing 0 0 0 0 Nothing
+    0 0 0 0 0 0 0 0 0 0 Seq.empty 0 Nothing Nothing Nothing Nothing Nothing Nothing 0 0 0 0 Nothing 0 Nothing
 
 trimSampleCap :: Int
 trimSampleCap = 8192
@@ -226,6 +239,8 @@ freezerStatsJson c st = object
         , "trimP99Ms" .= trimChunkPercentile 0.99 st
         , "trimPositionMs" .= _fsTrimPositionMs st
         , "trimWindow" .= _fsTrimWindow st
+        , "trimCommitMaxMs" .= _fsTrimCommitMaxMs st
+        , "trimGcMaxMs" .= _fsTrimGcMaxMs st
         , "halted" .= fmap (T.pack . show) (_fsHaltedHash st)
         , "split" .= fmap splitJson (_fsSplitCounters st)
         , "coldCacheHits" .= _fsCacheHits st
@@ -250,20 +265,53 @@ freezerStatsJson c st = object
         ]
 
 -- | The trim window: each trim chunk covers the txids @[lo, lo + w)@ of the
--- step, and @w@ adapts to the 20 ms target (spec 6.2 step 5): halved when a
--- chunk takes over 20 ms, doubled under 5 ms, within '_twMin' and '_twMax'.
--- A chunk's cost follows the rows of its window. Tests fix the window with
--- equal bounds.
+-- step, cut short so that it holds at most '_twMaxRows' rows over the
+-- tables the chunk trims (or a single txid, which is never split). The
+-- row cap bounds a chunk by construction: its statements cost what its
+-- window's rows cost, and a window grown over sparse txids can't take in a
+-- dense range whole. @w@ adapts to the chunk time target '_twTargetMs'
+-- (spec 6.2 step 5; 'nextTrimWindow'): halved on an overrun, doubled under
+-- half the target, within '_twMin' and '_twMax'. Tests fix the window with
+-- 'fixedTrimWindow'.
 --
 data TrimWindow = TrimWindow
     { _twStart :: !Word64
     , _twMin :: !Word64
     , _twMax :: !Word64
+    , _twMaxRows :: !Int
+        -- ^ the rows of a chunk's window, over all its tables
+    , _twTargetMs :: !Double
+        -- ^ the chunk time target: the gate's bound is 20 ms
     }
     deriving (Eq, Show)
 
+-- | Starts at 256 txids, at most 1,000 rows per chunk, target 10 ms.
 defaultTrimWindow :: TrimWindow
-defaultTrimWindow = TrimWindow 1000 1 1048576
+defaultTrimWindow = TrimWindow 256 1 1048576 1000 10
+
+-- | A window of @w@ txids that does not adapt and has no practical row cap.
+fixedTrimWindow :: Word64 -> TrimWindow
+fixedTrimWindow w = TrimWindow w w w 1_000_000_000 10
+
+-- | The window after a chunk: @nextTrimWindow tw w e capped ms@, where @w@
+-- is the chunk's window, @e@ the txids it covered (@e < w@ when the row
+-- cap or the step's end cut it short), @capped@ whether the row cap cut
+-- it, and @ms@ its time.
+--
+-- * Over the target: half of @e@ (a capped chunk's @w@ says nothing of its
+--   cost).
+-- * A capped chunk under the target: @e@, the extent the cap allows.
+-- * Under half the target: @2w@, only when the chunk covered all of @w@
+--   (a chunk cut by the step's end measured less than @w@).
+-- * Otherwise @w@.
+--
+-- Always within '_twMin' and '_twMax'.
+nextTrimWindow :: TrimWindow -> Word64 -> Word64 -> Bool -> Double -> Word64
+nextTrimWindow tw w e capped ms = max (_twMin tw) $ min (_twMax tw) $ if
+    | ms > _twTargetMs tw -> max 1 (e `div` 2)
+    | capped -> e
+    | ms < _twTargetMs tw / 2 && e >= w -> w * 2
+    | otherwise -> w
 
 data FreezerEnv = FreezerEnv
     { _feChain :: !ChainId
@@ -288,6 +336,9 @@ data FreezerEnv = FreezerEnv
     , _feShadowDifferences :: !(IO (Maybe Word64))
         -- ^ shadow mode: the differences of the chain ('_shDifferences')
     , _feTrimWindow :: !TrimWindow
+    , _feTrimClock :: !(IO Double)
+        -- ^ seconds, for the trim chunk times: 'getMonotonicTime'; tests
+        -- inject a clock
     , _feLogger :: !GenericLogger
     , _feHooks :: !FreezerHooks
     , _feStats :: !(IORef FreezerStats)
@@ -631,32 +682,42 @@ trimStep env f from = do
             | S.member (g t) seen = go' seen xs
             | otherwise = x : go' (S.insert (g t) seen) xs
 
+    clock = _feTrimClock env
+
+    -- the RTS's GC time so far, when it keeps stats (+RTS -T)
+    gcSeconds = getRTSStatsEnabled >>= \case
+        False -> return Nothing
+        True -> Just . (\st -> fromIntegral (gc_elapsed_ns st) / 1e9 :: Double) <$> getRTSStats
+
     go work lo !total
         | lo >= fe = return (Trimmed total)
         | otherwise = do
             _feBeforeTrimChunk env
             w <- maybe (_twStart tw) id . _fsTrimWindow <$> readIORef (_feStats env)
-            let hi = min fe (lo + Pact4.TxId w)
+            let hiW = min fe (lo + Pact4.TxId w)
             r <- _feWithPactDb env $ \db -> do
-                t0 <- getMonotonicTime
+                g0 <- gcSeconds
+                t0 <- clock
                 r <- sqliteWithTrimSavepoint db $ sqliteBlockHashAt db (_frHeight f) >>= \case
-                    Just h | h == _frHash f -> Just . sum <$>
-                        forM work (\(t, rule, lim) -> case lim of
-                            Just l | lo >= l -> return 0
-                            _ -> sqliteTrimChunk db t rule lo (maybe hi (min hi) lim) fe)
+                    Just h | h == _frHash f -> do
+                        (hi, capped, live) <- bound db hiW
+                        n <- sum <$> forM live (\(t, rule, lim) ->
+                            sqliteTrimChunk db t rule lo (maybe hi (min hi) lim) fe)
+                        tc <- clock
+                        return (Just (n, hi, capped, tc))
                     _ -> return Nothing
-                t1 <- getMonotonicTime
-                return ((, t1 - t0) <$> r)
+                t1 <- clock
+                g1 <- gcSeconds
+                return ((\(n, hi, capped, tc) -> ((n, hi, capped), t1 - t0, t1 - tc, (-) <$> g1 <*> g0)) <$> r)
             case r of
                 Nothing -> return TrimHashMismatch
-                Just (n, dt) -> do
-                    let w'  | dt > 0.020 = max (_twMin tw) (w `div` 2)
-                            | dt < 0.005 = min (_twMax tw) (w * 2)
-                            | otherwise = max (_twMin tw) (min (_twMax tw) w)
-                    p0 <- getMonotonicTime
-                    _ccTrimProgress (_feCold env) hi
-                    p1 <- getMonotonicTime
+                Just ((n, hi, capped), dt, cm, gc) -> do
                     let ms = dt * 1000
+                        Pact4.TxId e = hi - lo
+                        w' = nextTrimWindow tw w e capped ms
+                    p0 <- clock
+                    _ccTrimProgress (_feCold env) hi
+                    p1 <- clock
                     modifyIORef' (_feStats env) $ \s -> s
                         { _fsTrimWindow = Just w'
                         , _fsRowsTrimmed = _fsRowsTrimmed s + n
@@ -666,10 +727,33 @@ trimStep env f from = do
                         , _fsTrimSamples = Seq.drop (Seq.length (_fsTrimSamples s) + 1 - trimSampleCap)
                             (_fsTrimSamples s Seq.|> ms)
                         , _fsTrimPositionMs = _fsTrimPositionMs s + (p1 - p0) * 1000
+                        , _fsTrimCommitMaxMs = max (_fsTrimCommitMaxMs s) (cm * 1000)
+                        , _fsTrimGcMaxMs = case gc of
+                            Nothing -> _fsTrimGcMaxMs s
+                            Just g -> Just (max (g * 1000) (maybe 0 id (_fsTrimGcMaxMs s)))
                         }
                     _feAfterTrimChunk env (dt + (p1 - p0))
                     _fhAfterTrimChunk (_feHooks env)
                     go work hi (total + n)
+      where
+        -- Cuts @[lo, hiW)@ to at most '_twMaxRows' rows over the tables
+        -- ('sqliteTrimWindowEnd'), table by table: each table's rows are
+        -- counted under the end so far, and a later table can only move the
+        -- end down, so the sum stays within the cap. Returns the end, whether
+        -- the cap cut the window, and the tables to run: a 'KeepAnchors'
+        -- table without rows in the window has nothing to delete (both its
+        -- statements start from the window's rows); 'DropAll' always runs.
+        bound db hiW = goB hiW (_twMaxRows tw) [] work
+          where
+            goB hi _ acc [] = return (hi, hi < hiW, reverse acc)
+            goB hi b acc (x@(t, rule, lim) : xs) = case lim of
+                Just l | lo >= l -> goB hi b acc xs
+                _ -> do
+                    let tHi = maybe hi (min hi) lim
+                    (c, tHi') <- sqliteTrimWindowEnd db t lo tHi b
+                    let hi' = if tHi' < tHi then tHi' else hi
+                        acc' = if c > 0 || rule == DropAll then x : acc else acc
+                    goB hi' (max 0 (b - c)) acc' xs
 
 -- -------------------------------------------------------------------------- --
 -- One step

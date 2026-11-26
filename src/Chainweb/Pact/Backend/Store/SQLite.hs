@@ -31,6 +31,7 @@ module Chainweb.Pact.Backend.Store.SQLite
     , sqliteKeyRowCount
     , TrimRule(..)
     , sqliteTrimChunk
+    , sqliteTrimWindowEnd
     , sqliteWithTrimSavepoint
     , sqliteExplainTrim
     , SqliteFileStats(..)
@@ -999,6 +1000,28 @@ sqliteTrimChunk db t rule lo hi f =
             bindParams stmt ps
             void $ ExceptT (SQ3.step stmt)
         SQ3.changes db
+
+-- | Bounds a trim window by its rows: given @[lo, hi)@ and a budget of @b@
+-- rows of table @t@, returns @(n, hi')@ with @lo < hi' <= hi@, where the
+-- window @[lo, hi')@ holds @n@ rows of @t@ and either @n <= b@, or @hi' ==
+-- lo + 1@ (the rows of txid @lo@ alone exceed the budget: one txid is never
+-- split, so that the stored trim position stays a txid). @n@ is counted up
+-- to @b + 1@ only.
+--
+-- One index range read over at most @b + 1@ rows (the @txid@ index).
+sqliteTrimWindowEnd :: SQLiteEnv -> Text -> TxId -> TxId -> Int -> IO (Int, TxId)
+sqliteTrimWindowEnd db t lo hi b = do
+    rows <- freezerQry db
+        ("SELECT txid FROM " <> tbl (toUtf8 t) <> " WHERE txid >= ? AND txid < ? ORDER BY txid LIMIT ?")
+        [txIdParam lo, txIdParam hi, Pact4.SInt (fromIntegral (max 0 b) + 1)] [Pact4.RInt]
+    xs <- forM rows $ \case
+        [Pact4.SInt x] -> return (fromIntegral x :: TxId)
+        r -> internalError $ "freezer: bad txid row: " <> sshow r
+    return $ case drop (max 0 b) xs of
+        [] -> (length xs, hi)
+        x : _
+            | x > lo -> (length (takeWhile (< x) xs), x)
+            | otherwise -> (length xs, lo + 1)
 
 -- | @EXPLAIN QUERY PLAN@ of a trim chunk's statements: the @detail@ column,
 -- in order, statement after statement.

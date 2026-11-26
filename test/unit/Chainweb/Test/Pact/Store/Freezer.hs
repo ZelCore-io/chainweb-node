@@ -53,6 +53,8 @@ import qualified Data.ByteString.Char8 as B8
 import Data.Bits (shiftL, (.|.))
 import Data.Int (Int64)
 import Data.IORef
+import GHC.Clock (getMonotonicTime)
+import GHC.Stats (getRTSStatsEnabled)
 import Data.List (sort, sortOn)
 import qualified Data.Map.Strict as M
 import Data.Maybe (isJust, isNothing)
@@ -66,6 +68,7 @@ import qualified Database.RocksDB.Base as R
 import qualified Database.SQLite3.Direct as SQ3
 
 import System.Directory
+import System.Environment (lookupEnv)
 import System.FilePath
 import System.IO.Temp (withSystemTempDirectory)
 import System.LogLevel
@@ -208,7 +211,21 @@ withNodeW
     -> (Node -> IO ())
     -> (Node -> IO a)
     -> IO a
-withNodeW tw root cfg writer mkHooks gate k = do
+withNodeW = withNodeWC (const getMonotonicTime)
+
+-- | 'withNodeW' with the clock of the trim chunk times ('_feTrimClock'):
+-- the clock gets the Pact connection.
+withNodeWC
+    :: (SQLiteEnv -> IO Double)
+    -> TrimWindow
+    -> FilePath
+    -> PactHistoryConfig
+    -> (RocksDb -> [R.BatchOp] -> IO ())
+    -> (Node -> FreezerHooks)
+    -> (Node -> IO ())
+    -> (Node -> IO a)
+    -> IO a
+withNodeWC clock tw root cfg writer mkHooks gate k = do
     layout <- resolvePactLayout quietLogger HistorySplit False root
     dir <- currentSqliteDir layout
     withSQLiteConnection (dir </> chainDbFileName cid) chainwebPragmas $ \db -> do
@@ -230,6 +247,7 @@ withNodeW tw root cfg writer mkHooks gate k = do
                     , _feCacheStats = coldCacheStats cs
                     , _feShadowDifferences = return Nothing
                     , _feTrimWindow = tw
+                    , _feTrimClock = clock db
                     , _feLogger = quietLogger
                     , _feHooks = mkHooks node
                     , _feStats = stats
@@ -239,10 +257,10 @@ withNodeW tw root cfg writer mkHooks gate k = do
 -- | A node whose trim chunks are one txid wide, so that each table's trim of
 -- a step spans many chunks.
 withSmallChunkNode :: FilePath -> (Node -> FreezerHooks) -> (Node -> IO a) -> IO a
-withSmallChunkNode root hooks = withNodeW (TrimWindow 1 1 1) root testConfig writeBatchSync hooks (const (return ()))
+withSmallChunkNode root hooks = withNodeW (fixedTrimWindow 1) root testConfig writeBatchSync hooks (const (return ()))
 
 withSmallChunkNodeGate :: FilePath -> (Node -> IO ()) -> (Node -> IO a) -> IO a
-withSmallChunkNodeGate root = withNodeW (TrimWindow 1 1 1) root testConfig writeBatchSync (const noHooks)
+withSmallChunkNodeGate root = withNodeW (fixedTrimWindow 1) root testConfig writeBatchSync (const noHooks)
 
 withPlainNode :: FilePath -> (Node -> IO a) -> IO a
 withPlainNode root = withNode root testConfig writeBatchSync (const noHooks) (const (return ()))
@@ -366,6 +384,10 @@ tests = testGroup "Freezer step"
     , testCase "the first trim renames sqlite to sqlite-split and writes the marker before any DELETE" splitMarkerTest
     , testCase "a chain whose genesis is above the step heights freezes from its first block" lateGenesisTest
     , testCase "a compacted-style BlockHistory that starts at a high height freezes from its first row" compactedHistoryTest
+    , testCase "a dense txid range with a huge window: every trim chunk holds at most the row cap, or one txid; the result equals a one-txid-window trim" rowCapTest
+    , testCase "adaptive trim window (injected clock): shrinks on an overrun and converges under the target; grows from a small start without an overrun; FreezerStats match the chunks" adaptiveWindowTest
+    , testCase "nextTrimWindow: halves on an overrun, doubles a full fast window only, shrinks to a row-capped window, stays within bounds" nextTrimWindowTest
+    , testCase "trim benchmark (opt-in: CHAINWEB_TRIM_BENCH=<blocks>)" trimBench
     , testCase "runFreezer retries a transient SQLite error (BUSY/LOCKED) with backoff, halts past the limit and on any other exception, and records the halt in the stats" runFreezerRetryTest
     ]
 
@@ -515,7 +537,7 @@ baseline = withFixture $ \root _ -> do
 -- | Trim windows of 4 txids: each step's trim (30 txids) is 8 chunks, so the
 -- crash points include the middle of every trim.
 withCrashNode :: FilePath -> (Node -> FreezerHooks) -> (Node -> IO ()) -> (Node -> IO a) -> IO a
-withCrashNode root = withNodeW (TrimWindow 4 4 4) root testConfig writeBatchSync
+withCrashNode root = withNodeW (fixedTrimWindow 4) root testConfig writeBatchSync
 
 -- | Crashes at each hook call in turn; runs the check after the crash, then
 -- resumes with a fresh start and compares with the no-crash state.
@@ -693,7 +715,7 @@ largeStepWindowTest = withSystemTempDirectory "freezer-large" $ \tmp -> do
                 rows <- _fsRowsTrimmed <$> readIORef (_feStats (_nEnv n))
                 modifyIORef' chunks ((pos, rows) :)
             }
-    withNodeW (TrimWindow 100 100 100) root cfg writeBatchSync hooks (const (return ())) $ \n -> do
+    withNodeW (fixedTrimWindow 100) root cfg writeBatchSync hooks (const (return ())) $ \n -> do
         outcomes <- runToEnd (_nEnv n)
         outcomes @?= [Froze (Frontier 2 (mkHash 2 0) 6000), NothingToDo]
         cs <- reverse <$> readIORef chunks
@@ -1014,3 +1036,217 @@ runFreezerRetryTest = do
         go k = verified >>= \case
             Just f | f == finalFrontier -> return ()
             _ -> threadDelay 10_000 >> go (k - 1)
+
+-- -------------------------------------------------------------------------- --
+-- Trim benchmark (opt-in)
+
+-- | A mainnet-like history: 4 txids per block (coinbase and three
+-- transactions), the coinbase writes one of 20 miner keys, each transaction
+-- a sender and a receiver of 20,000 keys with 300-byte values, 30 user
+-- tables written now and then, and every 250th block an airdrop of 3,000
+-- rows over 1,000 txids.
+benchHistory :: Int -> [BlockCommit]
+benchHistory nBlocks = mk <$> [0 .. nBlocks - 1]
+  where
+    perBlock = 4 :: Int
+    airdrop = 1000 :: Int
+    -- txids before block h
+    base h = h * perBlock + (h `div` 250) * airdrop
+    mk h = BlockCommit
+        { _bcHeight = fromIntegral h
+        , _bcHash = mkHash (h `mod` 256) (fromIntegral (h `div` 256))
+        , _bcEndTxId = fromIntegral (base (h + 1))
+        , _bcNewTables = [ "coin_table" | h == 0 ] ++ [ ut i | h == 0, i <- [0 .. 29 :: Int] ]
+        , _bcRows = filter (not . null . snd) $
+            [ ("coin_table", concat
+                [ [ ("miner" <> n (h `mod` 20), tx 0, val h) ]
+                , concat [ [ (user (h * 7 + j), tx j, val h), (receiver (h * 13 + j * 5), tx j, val h) ] | j <- [1 .. 3] ]
+                , [ (user (h * 31 + i), tx (perBlock + i `div` 3), val h) | h `mod` 250 == 249, i <- [0 .. 3 * airdrop - 1] ]
+                ])
+            ]
+            ++ [ (ut (h `mod` 30), [ ("row" <> n (h `mod` 50), tx 2, val h) ]) | h `mod` 3 == 0 ]
+        , _bcTxHashes = [ "txhash-" <> n h ]
+        }
+      where
+        tx :: Int -> Pact4.TxId
+        tx i = fromIntegral (base h + i)
+    ut i = "user_table_" <> T.pack (show i)
+    receiver i = "r:" <> B8.pack (show ((i * 7919) `mod` 20000))
+    user i = "k:" <> B8.pack (show ((i * 7919) `mod` 20000))
+    val h = "{\"balance\":" <> n h <> ",\"guard\":\"" <> B.replicate 270 0x61 <> "\"}"
+    n = B8.pack . show
+
+-- | Runs the freezer over 'benchHistory' with the default trim window and
+-- prints the trim chunk stats. Opt-in: set @CHAINWEB_TRIM_BENCH@ to the
+-- number of blocks.
+trimBench :: Assertion
+trimBench = lookupEnv "CHAINWEB_TRIM_BENCH" >>= \case
+    Nothing -> return ()
+    Just s -> withHistoryFixture (benchHistory (read s)) $ \root -> do
+        let cfg = testConfig { _phFreezeDepth = 10, _phFreezeStepHeights = 1000 }
+        withNodeW defaultTrimWindow root cfg writeBatchSync (const noHooks) (const (return ())) $ \n -> do
+            lookupEnv "CHAINWEB_TRIM_BENCH_NOCKPT" >>= mapM_ (\_ -> P4SQL.exec_ (_nPact n) "PRAGMA wal_autocheckpoint = 0")
+            _ <- runToEnd (_nEnv n)
+            st <- readIORef (_feStats (_nEnv n))
+            let xs = sort (foldr (:) [] (_fsTrimSamples st))
+                pct q = if null xs then 0 else xs !! min (length xs - 1) (floor (q * fromIntegral (length xs) :: Double))
+            putStrLn $ "trim-bench: chunks " <> show (_fsTrimChunks st)
+                <> " rows " <> show (_fsRowsTrimmed st)
+                <> " totalMs " <> show (_fsTrimMs st)
+                <> " p50 " <> show (pct 0.5) <> " p99 " <> show (pct 0.99)
+                <> " max " <> show (_fsTrimMaxMs st)
+                <> " window " <> show (_fsTrimWindow st)
+                <> " positionMs " <> show (_fsTrimPositionMs st)
+                <> " commitMaxMs " <> show (_fsTrimCommitMaxMs st)
+                <> " gcMaxMs " <> show (_fsTrimGcMaxMs st)
+
+-- -------------------------------------------------------------------------- --
+-- Trim chunk bounds
+
+-- | Five blocks of 300 txids. A txid writes 4 rows of 400 keys, except the
+-- middle txid of each block, which writes 250 rows of its own keys: one
+-- txid over the row cap of 100.
+denseHistory :: [BlockCommit]
+denseHistory = mk <$> [0 .. 4]
+  where
+    mk h = BlockCommit
+        { _bcHeight = fromIntegral h
+        , _bcHash = mkHash h 0
+        , _bcEndTxId = fromIntegral ((h + 1) * 300)
+        , _bcNewTables = [ "big_table" | h == 0 ]
+        , _bcRows = [ ("big_table", concatMap (rowsAt h) [h * 300 .. h * 300 + 299]) ]
+        , _bcTxHashes = [ "txhash-" <> B8.pack (show h) ]
+        }
+    rowsAt h i
+        | i == h * 300 + 150 = [ ("w" <> B8.pack (show j), fromIntegral i, "{}") | j <- [0 .. 249 :: Int] ]
+        | otherwise = [ ("k" <> B8.pack (show ((i * 4 + j) `mod` 400)), fromIntegral i, "{}") | j <- [0 .. 3] ]
+
+-- | The rows of a history with @lo <= txid < hi@.
+rowsInRange :: [BlockCommit] -> Word64 -> Word64 -> Int
+rowsInRange hist lo hi = length
+    [ () | b <- hist, (_, rs) <- _bcRows b, (_, x, _) <- rs
+    , let x' = fromIntegral x, x' >= lo, x' < hi ]
+
+-- | Runs the freezer over a history to the end; returns the chunk ends
+-- (the stored position after each chunk), the stats and the rows of
+-- @big_table@.
+trimRun
+    :: (SQLiteEnv -> IO Double) -> TrimWindow -> [BlockCommit]
+    -> IO ([Word64], [Int], FreezerStats, [[Text]])
+trimRun clock tw hist = withHistoryFixture hist $ \root -> do
+    chunks <- newIORef []
+    let cfg = testConfig { _phFreezeDepth = 1, _phFreezeStepHeights = 3 }
+        hooks n = noHooks
+            { _fhAfterTrimChunk = do
+                pos <- _cmTrimFrom <$> _ccMeta (_nCold n)
+                rows <- _fsRowsTrimmed <$> readIORef (_feStats (_nEnv n))
+                modifyIORef' chunks ((fromIntegral pos, rows) :)
+            }
+    withNodeWC clock tw root cfg writeBatchSync hooks (const (return ())) $ \n -> do
+        os <- runToEnd (_nEnv n)
+        last os @?= NothingToDo
+        cs <- reverse <$> readIORef chunks
+        st <- readIORef (_feStats (_nEnv n))
+        rs <- dumpTables (_nPact n) ["big_table"]
+        return (fst <$> cs, zipWith (-) (snd <$> cs) (0 : (snd <$> cs)), st, concatMap snd rs)
+
+rowCapTest :: Assertion
+rowCapTest = do
+    let tw = TrimWindow 1_000_000 1 1_000_000 100 10
+    -- a stopped clock: no chunk overruns, so only the row cap cuts windows
+    -- and the chunk count does not depend on the machine's load
+    (ends, deleted, st, rows) <- trimRun (const (return 0)) tw denseHistory
+    (ends1, _, _, rows1) <- trimRun (const (return 0)) (fixedTrimWindow 1) denseHistory
+    last ends @?= 900
+    last ends1 @?= 900
+    let windows = zip (0 : ends) ends
+    forM_ (zip windows deleted) $ \((lo, hi), d) -> do
+        let n = rowsInRange denseHistory lo hi
+        assertBool ("chunk [" <> show lo <> ", " <> show hi <> ") holds " <> show n <> " rows")
+            (n <= 100 || hi == lo + 1)
+        -- a chunk deletes its window's rows and at most one older row per key
+        assertBool ("chunk [" <> show lo <> ", " <> show hi <> ") deleted " <> show d)
+            (d <= 2 * max 100 n)
+    -- the over-cap txids are chunks of their own
+    [ lo | (lo, hi) <- windows, rowsInRange denseHistory lo hi > 100 ] @?= [150, 450, 750]
+    -- far fewer chunks than txids, and the same rows as a one-txid trim
+    assertBool ("chunks " <> show (length ends)) (length ends < 100)
+    rows @?= rows1
+    _fsTrimChunks st @?= length ends
+
+-- | A clock of the Pact connection that advances 0.1 ms per row changed:
+-- a chunk's time is 0.1 ms per row it deletes.
+rowClock :: SQLiteEnv -> IO Double
+rowClock db = (\c -> fromIntegral c * 0.0001) <$> SQ3.totalChanges db
+
+-- | Five blocks of 2000 txids, each writing 2 rows of 50 keys: a trim chunk
+-- deletes 2 rows per txid of its window (0.2 ms on 'rowClock').
+uniformHistory :: [BlockCommit]
+uniformHistory = mk <$> [0 .. 4]
+  where
+    mk h = BlockCommit
+        { _bcHeight = fromIntegral h
+        , _bcHash = mkHash h 0
+        , _bcEndTxId = fromIntegral ((h + 1) * 2000)
+        , _bcNewTables = [ "big_table" | h == 0 ]
+        , _bcRows = [ ("big_table", concat
+            [ [ ("k" <> B8.pack (show ((2 * i + j) `mod` 50)), fromIntegral i, "{}") | j <- [0, 1 :: Int] ]
+            | i <- [h * 2000 .. h * 2000 + 1999] ]) ]
+        , _bcTxHashes = [ "txhash-" <> B8.pack (show h) ]
+        }
+
+adaptiveWindowTest :: Assertion
+adaptiveWindowTest = do
+    -- from a large start: halves on each overrun down to 32 txids (6.4 ms)
+    (ends, deleted, st, _) <- trimRun rowClock (TrimWindow 1024 1 1_048_576 1_000_000 10) uniformHistory
+    let sizes = zipWith (-) ends (0 : ends)
+        ms = (\d -> fromIntegral d * 0.1) <$> deleted :: [Double]
+    take 6 sizes @?= [1024, 512, 256, 128, 64, 32]
+    length (filter (> 10) ms) @?= 5
+    -- converged: every later chunk is under the target, the window stays
+    assertBool ("after convergence " <> show (drop 5 ms)) (all (<= 10) (drop 5 ms))
+    assertBool ("sizes " <> show sizes) (all (== 32) (init (drop 5 sizes)))
+    -- the chunk before the step's end deletes fewer rows (each key's newest
+    -- row below F stays), so the window doubles once; the last chunk, cut
+    -- by F, does not double it again
+    _fsTrimWindow st @?= Just 64
+    -- FreezerStats are the chunks'
+    _fsTrimChunks st @?= length ends
+    _fsRowsTrimmed st @?= sum deleted
+    assertApprox "trimMaxMs" (maximum ms) (_fsTrimMaxMs st)
+    assertApprox "trimMs" (sum ms) (_fsTrimMs st)
+    assertApprox "samples" 0 (sum (zipWith (-) ms (foldr (:) [] (_fsTrimSamples st))))
+    let p99 = sort ms !! min (length ms - 1) (ceiling (0.99 * fromIntegral (length ms) :: Double) - 1)
+    maybe (assertFailure "no p99") (assertApprox "trimP99Ms" p99) (trimChunkPercentile 0.99 st)
+    -- the commit deletes nothing: 0 ms on 'rowClock'
+    assertApprox "trimCommitMaxMs" 0 (_fsTrimCommitMaxMs st)
+    -- the GC time of a chunk is measured on the RTS clock, only with +RTS -T
+    rtsStats <- getRTSStatsEnabled
+    isJust (_fsTrimGcMaxMs st) @?= rtsStats
+
+    -- from a small start: doubles to 32 txids and never overruns
+    (ends', deleted', st', _) <- trimRun rowClock (TrimWindow 1 1 1_048_576 1_000_000 10) uniformHistory
+    let sizes' = zipWith (-) ends' (0 : ends')
+    take 6 sizes' @?= [1, 2, 4, 8, 16, 32]
+    assertBool "no overrun" (all (\d -> fromIntegral d * 0.1 <= (10 :: Double)) deleted')
+    _fsTrimWindow st' @?= Just 64
+  where
+    assertApprox what a b = assertBool (what <> ": " <> show a <> " /= " <> show b) (abs (a - b) < 1e-6)
+
+nextTrimWindowTest :: Assertion
+nextTrimWindowTest = do
+    let tw = TrimWindow 100 4 1000 50 10
+    -- overrun: half the effective window, not below the minimum
+    nextTrimWindow tw 100 100 False 25 @?= 50
+    nextTrimWindow tw 6 6 False 25 @?= 4
+    -- a row-capped chunk: the window shrinks to the capped extent, halved
+    -- on an overrun
+    nextTrimWindow tw 800 30 True 7 @?= 30
+    nextTrimWindow tw 800 30 True 12 @?= 15
+    -- fast: doubles only a full window, up to the maximum
+    nextTrimWindow tw 100 100 False 2 @?= 200
+    nextTrimWindow tw 800 800 False 2 @?= 1000
+    nextTrimWindow tw 100 40 False 2 @?= 100
+    nextTrimWindow tw 100 30 True 2 @?= 30
+    -- in the band: unchanged
+    nextTrimWindow tw 100 100 False 7 @?= 100
