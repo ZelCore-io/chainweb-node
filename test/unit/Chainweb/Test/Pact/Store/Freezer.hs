@@ -247,6 +247,7 @@ withNodeWC clock tw root cfg writer mkHooks gate k = do
                     , _feSplitCounters = Nothing
                     , _feCacheStats = coldCacheStats cs
                     , _feShadowDifferences = return Nothing
+                    , _feWalCheckpointer = return Nothing
                     , _feTrimWindow = tw
                     , _feTrimClock = clock db
                     , _feLogger = quietLogger

@@ -425,6 +425,10 @@ data WriterState = WriterState
     , _wsNextKey :: !(M.Map TableId Word64)
         -- ^ the next key id of the tables seen so far
     , _wsUnpublished :: ![(Text, TableId)]
+    , _wsPoisoned :: !(Maybe Text)
+        -- ^ a write failed and the state could not be read back: it is
+        -- unknown, and every later write is refused until the chain is
+        -- opened again
     }
 
 openColdChain :: ColdStore -> ChainId -> IO ColdChain
@@ -472,6 +476,7 @@ openColdChainHooked writer midPublish cs c = do
         , _wsNextTable = maybe 0 ((+ 1) . tableIdWord) (maximumMay (HM.elems catalog))
         , _wsNextKey = mempty
         , _wsUnpublished = []
+        , _wsPoisoned = Nothing
         }
     let commit = commitWith writerVar metaRef catalogRef
     -- the freezer's view: the written frontier and the writer's catalog,
@@ -590,17 +595,32 @@ openColdChainHooked writer midPublish cs c = do
     -- batch wrote, and a later step would give those ids to other keys:
     -- their I entries overwritten, the T lists of earlier steps would no
     -- longer resolve ("missing R entry"), below a trimmed frontier.
+    --
+    -- If the read back fails too (a double fault: the database cannot be
+    -- read right after a failed write), the state is unknown: the writer is
+    -- poisoned, and every later write throws until the chain is opened
+    -- again, which reads the state afresh. The write's exception
+    -- propagates, with the read's in the poison reason.
     commitWith writerVar metaRef catalogRef build = mask $ \restore -> do
         ws <- takeMVar writerVar
+        forM_ (_wsPoisoned ws) $ \reason -> do
+            putMVar writerVar ws
+            coldError $ "chain " <> chainIdToText c
+                <> ": the writer state is unknown, reopen the chain to write again (" <> reason <> ")"
         b <- restore (build ws) `onException` putMVar writerVar ws
         case b of
             Nothing -> putMVar writerVar ws
             Just (ops, ws', after) -> try (restore (writer db ops >> after)) >>= \case
                 Right () -> putMVar writerVar ws'
                 Left e -> do
-                    ws'' <- resyncWith metaRef catalogRef
-                        `onException` putMVar writerVar ws { _wsNextKey = mempty }
-                    putMVar writerVar ws''
+                    r <- try (resyncWith metaRef catalogRef) :: IO (Either SomeException WriterState)
+                    putMVar writerVar $ case r of
+                        Right ws'' -> ws''
+                        Left e' -> ws
+                            { _wsNextKey = mempty
+                            , _wsPoisoned = Just $ "a write failed (" <> T.pack (displayException e)
+                                <> ") and reading the state back failed (" <> T.pack (displayException e') <> ")"
+                            }
                     throwIO (e :: SomeException)
 
     -- The writer state as a fresh open reads it, with the in-memory
@@ -623,6 +643,7 @@ openColdChainHooked writer midPublish cs c = do
             , _wsNextTable = maybe 0 ((+ 1) . tableIdWord) (maximumMay (HM.elems cat))
             , _wsNextKey = mempty
             , _wsUnpublished = if moved then [] else unpub
+            , _wsPoisoned = Nothing
             }
 
     maximumMay [] = Nothing

@@ -207,13 +207,14 @@ walCheckpointerOn c = case _phWalCheckpointer c of
 -- the switch to WAL and so does not apply) and milliseconds.
 data WalCheckpointConfig = WalCheckpointConfig
     { _wccPollMs :: !Int
-        -- ^ how often the WAL index is read for the frames not yet
-        -- checkpointed (a read of the @-shm@ header, no lock)
+        -- ^ how often the thread looks for a file whose next PASSIVE
+        -- checkpoint is due (the earliest a checkpoint follows a commit)
     , _wccIntervalMs :: !Int
         -- ^ a PASSIVE checkpoint at least this often while frames are pending
     , _wccSoftFrames :: !Int
-        -- ^ a PASSIVE checkpoint as soon as this many frames are pending
-        -- (SQLite's autocheckpoint default is 1000)
+        -- ^ a PASSIVE checkpoint as soon as this many frames are expected to
+        -- be pending, from the WAL's growth between the last two
+        -- checkpoints (SQLite's autocheckpoint default is 1000)
     , _wccRestartFrames :: !Int
         -- ^ the writer's autocheckpoint while the thread serves it: a
         -- backstop for a WAL that the thread's checkpoints did not let
@@ -223,6 +224,10 @@ data WalCheckpointConfig = WalCheckpointConfig
         -- registration ends
     , _wccStatsLogSeconds :: !Int
         -- ^ how often each file's stats are logged (and at its stop)
+    , _wccJournalSizeLimitBytes :: !Int
+        -- ^ the writer's @journal_size_limit@ while the thread serves it:
+        -- the first commit after a WAL restart truncates a longer @-wal@
+        -- file to this size
     } deriving (Show, Eq, Generic)
 
 makeLenses ''WalCheckpointConfig
@@ -230,7 +235,9 @@ makeLenses ''WalCheckpointConfig
 -- | Poll 100 ms, PASSIVE at 1000 pending frames (SQLite's autocheckpoint
 -- threshold) or every second, the writer's backstop at a WAL of 16,384
 -- frames (64 MiB at 4 KiB pages), a final checkpoint that waits up to 1 s;
--- stats every 10 minutes.
+-- stats every 10 minutes; a WAL file truncated back to 64 MiB after a
+-- restart (the backstop's size: at rest at most 64 MiB per served file,
+-- about 1.3 GB on a 20-chain node in split mode and 2.6 GB in shadow mode).
 defaultWalCheckpointConfig :: WalCheckpointConfig
 defaultWalCheckpointConfig = WalCheckpointConfig
     { _wccPollMs = 100
@@ -239,6 +246,7 @@ defaultWalCheckpointConfig = WalCheckpointConfig
     , _wccRestartFrames = 16_384
     , _wccFinalBusyMs = 1_000
     , _wccStatsLogSeconds = 600
+    , _wccJournalSizeLimitBytes = 64 * 1024 * 1024
     }
 
 instance ToJSON WalCheckpointConfig where
@@ -249,6 +257,7 @@ instance ToJSON WalCheckpointConfig where
         , "restartFrames" .= _wccRestartFrames o
         , "finalBusyMs" .= _wccFinalBusyMs o
         , "statsLogSeconds" .= _wccStatsLogSeconds o
+        , "journalSizeLimitBytes" .= _wccJournalSizeLimitBytes o
         ]
 
 instance FromJSON (WalCheckpointConfig -> WalCheckpointConfig) where
@@ -259,6 +268,7 @@ instance FromJSON (WalCheckpointConfig -> WalCheckpointConfig) where
         <*< wccRestartFrames ..: "restartFrames" % o
         <*< wccFinalBusyMs ..: "finalBusyMs" % o
         <*< wccStatsLogSeconds ..: "statsLogSeconds" % o
+        <*< wccJournalSizeLimitBytes ..: "journalSizeLimitBytes" % o
 
 makeLenses ''PactHistoryConfig
 
@@ -394,6 +404,8 @@ validatePactHistoryConfig c = do
     let w = _phWalCheckpoint c
     when (_wccPollMs w < 1 || _wccIntervalMs w < 1 || _wccFinalBusyMs w < 0 || _wccStatsLogSeconds w < 1) $
         throwError "pactHistory.walCheckpoint: pollMs, intervalMs and statsLogSeconds must be at least 1, finalBusyMs at least 0"
+    when (_wccJournalSizeLimitBytes w < 0) $
+        throwError "pactHistory.walCheckpoint: journalSizeLimitBytes must be at least 0"
     when (_wccSoftFrames w < 1 || _wccRestartFrames w < _wccSoftFrames w) $
         throwError "pactHistory.walCheckpoint: softFrames must be at least 1 and restartFrames at least softFrames"
     when (_phCatchUpLagSeconds c < 1) $

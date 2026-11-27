@@ -792,6 +792,7 @@ test-suite chainweb-tests
         , time >= 1.12.2
         , tls >=2.1.4
         , transformers >= 0.5
+        , unix >= 2.8
         , unordered-containers >= 0.2.20
         , vector >= 0.12.2
         , wai >= 3.2

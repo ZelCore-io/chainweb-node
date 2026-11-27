@@ -115,6 +115,7 @@ import Chainweb.Pact.Backend.Store.Layout
 import Chainweb.Pact.Backend.Store.SQLite
 import Chainweb.Pact.Backend.Store.Split (SplitCounters(..))
 import Chainweb.Pact.Backend.Store.Types (PactStore(..))
+import Chainweb.Pact.Backend.Store.WalCheckpointer (WalCheckpointerLiveness(..))
 import Chainweb.Pact.Backend.Types (SQLiteEnv)
 import Chainweb.Pact.Backend.Utils (chainDbFileName)
 import Chainweb.Time (Micros(..), Time(..), TimeSpan(..), getCurrentTimeIntegral)
@@ -206,12 +207,16 @@ data FreezerStats = FreezerStats
         -- ^ the most GC time inside one trim chunk, part of its time (a GC
         -- stops every thread, the writer's too); 'Nothing' unless the RTS
         -- keeps stats (@+RTS -T@)
+    , _fsWalCheckpointer :: !(Maybe WalCheckpointerLiveness)
+        -- ^ the node's background WAL checkpointer, as of the last log:
+        -- whether its thread runs and the time since its last checkpoint
+        -- call; 'Nothing' when the node runs without it
     }
     deriving (Eq, Show)
 
 emptyFreezerStats :: FreezerStats
 emptyFreezerStats = FreezerStats
-    0 0 0 0 0 0 0 0 0 0 Seq.empty 0 Nothing Nothing Nothing Nothing Nothing Nothing 0 0 0 0 Nothing 0 Nothing
+    0 0 0 0 0 0 0 0 0 0 Seq.empty 0 Nothing Nothing Nothing Nothing Nothing Nothing 0 0 0 0 Nothing 0 Nothing Nothing
 
 trimSampleCap :: Int
 trimSampleCap = 8192
@@ -251,9 +256,14 @@ freezerStatsJson c st = object
         , "hotPeakBytes" .= _fsHotPeakBytes st
         , "transientRetries" .= _fsTransientRetries st
         , "haltedReason" .= _fsHaltedReason st
+        , "walCheckpointer" .= fmap walJson (_fsWalCheckpointer st)
         ]
     ]
   where
+    walJson l = object
+        [ "alive" .= _wclAlive l
+        , "lastCheckpointAgeSeconds" .= _wclLastCheckpointAgeSeconds l
+        ]
     splitJson sc = object
         [ "coldReads" .= _scColdReads sc
         , "sysPactsHotHits" .= _scSysPactsHotHits sc
@@ -335,6 +345,8 @@ data FreezerEnv = FreezerEnv
         -- ^ the cold block cache hits and misses ('coldCacheStats')
     , _feShadowDifferences :: !(IO (Maybe Word64))
         -- ^ shadow mode: the differences of the chain ('_shDifferences')
+    , _feWalCheckpointer :: !(IO (Maybe WalCheckpointerLiveness))
+        -- ^ the node's WAL checkpointer ('walCheckpointerLiveness')
     , _feTrimWindow :: !TrimWindow
     , _feTrimClock :: !(IO Double)
         -- ^ seconds, for the trim chunk times: 'getMonotonicTime'; tests
@@ -1148,9 +1160,11 @@ logStats env = do
     sc <- traverse readIORef (_feSplitCounters env)
     cache <- _feCacheStats env
     diffs <- _feShadowDifferences env
+    wal <- _feWalCheckpointer env
     st <- atomicModifyIORef' (_feStats env) $ \st ->
         let st' = st
                 { _fsShadowDifferences = diffs
+                , _fsWalCheckpointer = wal
                 , _fsSplitCounters = sc
                 , _fsCacheHits = fst <$> cache
                 , _fsCacheMisses = snd <$> cache

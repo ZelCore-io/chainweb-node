@@ -2,6 +2,7 @@
 {-# LANGUAGE NumericUnderscores #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TypeApplications #-}
 
 -- |
 -- Module: Chainweb.Test.Pact.Store.WalCheckpointer
@@ -11,13 +12,14 @@
 -- The background WAL checkpointer: a thread on its own connection
 -- checkpoints, the Pact connection's commits keep only a backstop; the WAL
 -- stays bounded, and restarts after a reader that pinned it; a clean stop
--- checkpoints the WAL to empty.
+-- checkpoints the WAL to empty; the polls never drop SQLite's shm locks.
 --
 module Chainweb.Test.Pact.Store.WalCheckpointer
 ( tests
 ) where
 
 import Control.Concurrent (threadDelay)
+import Control.Exception (SomeException, try)
 import Control.Monad
 
 import qualified Data.ByteString as B
@@ -27,9 +29,15 @@ import Data.Text (Text)
 import GHC.Clock (getMonotonicTime)
 
 import System.Directory (doesFileExist, getFileSize)
+import Foreign.C.Types (CInt(..))
+
+import System.Exit (ExitCode(..))
 import System.FilePath
+import System.IO (IOMode(..), SeekMode(..), withBinaryFile)
 import System.IO.Temp (withSystemTempDirectory)
 import System.LogLevel (LogLevel)
+import System.Posix.IO (LockRequest(..), OpenMode(..), defaultFileFlags, getLock, openFd)
+import System.Posix.Process (ProcessStatus(..), forkProcess, getProcessStatus)
 
 import Test.Tasty
 import Test.Tasty.HUnit
@@ -48,6 +56,9 @@ tests = testGroup "WAL checkpointer"
     [ testCase "the thread checkpoints, the writer's autocheckpoint is only the backstop (restartFrames), and the WAL stays bounded" backgroundTest
     , testCase "a reader pinning the WAL: the WAL grows while it reads, the writer does not wait, and the WAL restarts once the reader ends" pinnedTest
     , testCase "stop: the final checkpoint leaves an empty WAL, the writer's autocheckpoint is back, the rows are in the database file" stopTest
+    , testCase "the polls keep SQLite's shm locks: another process still sees the dead-man switch lock held (and a descriptor closed on the -shm file would drop it)" shmLockTest
+    , testCase "journal_size_limit: a WAL that a reader pinned past the limit shrinks back to it after the restart" journalSizeLimitTest
+    , testCase "liveness: alive with a recent checkpoint call while it runs, not alive after it stops" livenessTest
     ]
 
 quiet :: LogLevel -> Text -> IO ()
@@ -59,6 +70,7 @@ fastConfig = defaultWalCheckpointConfig
     , _wccIntervalMs = 200
     , _wccSoftFrames = 200
     , _wccRestartFrames = 400
+    , _wccJournalSizeLimitBytes = 512 * 1024
     }
 
 withDb :: (FilePath -> SQLiteEnv -> IO a) -> IO a
@@ -171,3 +183,90 @@ stopTest = withDb $ \path db -> do
     -- a new connection reads every row from the database file
     withSQLiteConnection path chainwebPragmas $ \db2 ->
         P4SQL.qry_ db2 "SELECT count(*) FROM t" [P4SQL.RInt] >>= (@?= [[P4SQL.SInt 500]])
+
+-- | Review finding I1 of 8eb132960: the thread read the wal-index header
+-- by opening and closing the @-shm@ file. Closing any descriptor of a file
+-- drops every POSIX record lock the process holds on it: SQLite's shm locks
+-- (the dead-man switch, DMS, a shared lock on byte 128 of the @-shm@ file,
+-- held by every connection while it has the file open; the read marks; the
+-- WAL write lock). Another process then finds DMS free, takes itself for
+-- the first user, and resets the wal-index under the node. The check runs
+-- in a forked child: @F_GETLK@ reports only another process's locks. It
+-- runs against the SQLite the node links (the amalgamation of
+-- @direct-sqlite@, classic @fcntl@ locks), not a system library. A control
+-- on a second file shows that the check sees a dropped lock here.
+shmLockTest :: Assertion
+shmLockTest = do
+    withDb $ \path db -> do
+        writeRows db 0 10
+        dmsHeld path >>= assertEqual "before: the writer holds DMS" (Just True)
+        withWalCheckpointer quiet fastConfig $ \cp ->
+            withWalCheckpoint cp "chain 0" db (\f -> f path) $ do
+                -- many polls (10 ms), with and without frames pending
+                forM_ [1 .. 40] $ \i -> writeRows db (i * 10) 10 >> threadDelay 5_000
+                threadDelay 200_000
+                eventually (ctxOf cp path) "a background checkpoint" $ (> 0) . _wstFrames <$> statsOf cp "chain 0"
+                dmsHeld path >>= assertEqual "after the polls: DMS still held" (Just True)
+                writeRows db 1000 1
+                threadDelay 100_000
+                dmsHeld path >>= assertEqual "after more commits and polls: DMS still held" (Just True)
+    -- control: one open and close of the -shm file in this process
+    withDb $ \path db -> do
+        writeRows db 0 1
+        dmsHeld path >>= assertEqual "control: held at first" (Just True)
+        withBinaryFile (path <> "-shm") ReadMode $ \h -> void (B.hGet h 136)
+        dmsHeld path >>= assertEqual "control: a closed descriptor of the -shm file drops DMS" (Just False)
+
+-- | Whether another process sees a lock on the DMS byte of the file's
+-- @-shm@ ('Nothing': the check itself failed).
+dmsHeld :: FilePath -> IO (Maybe Bool)
+dmsHeld path = do
+    pid <- forkProcess $ do
+        r <- try @SomeException $ do
+            fd <- openFd (path <> "-shm") ReadOnly defaultFileFlags
+            getLock fd (WriteLock, AbsoluteSeek, 128, 1)
+        -- _exit: no atexit handlers in the child (the parent's C++
+        -- libraries' destructors would join threads the child does not have)
+        c_exit $ case r of
+            Right (Just _) -> 0
+            Right Nothing -> 1
+            Left _ -> 2
+    getProcessStatus True False pid >>= \case
+        Just (Exited ExitSuccess) -> return (Just True)
+        Just (Exited (ExitFailure 1)) -> return (Just False)
+        _ -> return Nothing
+
+foreign import ccall unsafe "_exit"
+    c_exit :: CInt -> IO ()
+
+journalSizeLimitTest :: Assertion
+journalSizeLimitTest = withDb $ \path db ->
+    withWalCheckpointer quiet fastConfig $ \cp ->
+        withWalCheckpoint cp "chain 0" db (\f -> f path) $
+            withSQLiteConnection path chainwebPragmas $ \reader -> do
+                writeRows db 0 10
+                P4SQL.exec_ reader "BEGIN"
+                _ <- P4SQL.qry_ reader "SELECT count(*) FROM t" [P4SQL.RInt]
+                forM_ [1 .. 150] $ \i -> writeRows db (i * 10) 10
+                pinned <- walBytes path
+                assertBool ("the WAL grew past the limit: " <> show pinned) (pinned > 2 * 512 * 1024)
+                P4SQL.exec_ reader "COMMIT"
+                eventually (ctxOf cp path) "the WAL file shrank back to the limit" $ do
+                    writeRows db 200_000 1
+                    (<= 512 * 1024) <$> walBytes path
+
+livenessTest :: Assertion
+livenessTest = withDb $ \path db -> do
+    cp' <- withWalCheckpointer quiet fastConfig $ \cp -> do
+        withWalCheckpoint cp "chain 0" db (\f -> f path) $ do
+            writeRows db 0 10
+            eventually (ctxOf cp path) "a recent checkpoint call" $ do
+                l <- walCheckpointerLiveness cp
+                return $ _wclAlive l && maybe False (< 1) (_wclLastCheckpointAgeSeconds l)
+            -- idle: the calls go on (nothing to copy)
+            threadDelay 1_500_000
+            l <- walCheckpointerLiveness cp
+            assertBool ("idle: " <> show l) (_wclAlive l && maybe False (< 1) (_wclLastCheckpointAgeSeconds l))
+        return cp
+    l <- walCheckpointerLiveness cp'
+    assertBool ("stopped: " <> show l) (not (_wclAlive l))

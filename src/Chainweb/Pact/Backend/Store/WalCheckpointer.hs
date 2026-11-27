@@ -21,15 +21,27 @@
 -- autocheckpoint moves up to '_wccRestartFrames', a backstop that normal
 -- operation does not reach:
 --
--- * Every '_wccPollMs' the thread reads the WAL index header (the first 136
---   bytes of the @-shm@ file: @mxFrame@ and @nBackfill@, SQLite's
---   documented wal-index format) without a lock. It runs
---   @wal_checkpoint(PASSIVE)@ when '_wccSoftFrames' frames are pending, or
---   when frames are pending and '_wccIntervalMs' passed since the last
---   checkpoint (only the latter after a PASSIVE that a reader kept from
---   finishing). PASSIVE takes no lock that a writer or reader waits for:
---   commits go on during it. When the header cannot be read, the thread
---   checkpoints by time alone.
+-- * Every '_wccPollMs' the thread looks at each file whose next checkpoint
+--   is due, and runs @wal_checkpoint(PASSIVE)@ on its own connection. The
+--   result, the WAL's length in frames and the frames checkpointed, is all
+--   it reads: it never opens the @-shm@ (or @-wal@) file itself. Closing
+--   any descriptor of a file drops every POSIX record lock the process
+--   holds on it, SQLite's shm locks included (the dead-man switch at byte
+--   128 of the @-shm@ file, the read marks, the WAL write lock): another
+--   process would then take itself for the file's first user, reset the
+--   wal-index under the node's readers and run WAL recovery. A PASSIVE
+--   with nothing pending tries the checkpoint lock, finds every frame
+--   copied and returns: no I/O, no sync.
+--
+--   The next checkpoint of a file is due when '_wccSoftFrames' frames are
+--   expected to be pending, from the rate the WAL grew at between the last
+--   two checkpoints, and at the latest '_wccIntervalMs' after the last one,
+--   but not before the next poll. A checkpoint that found nothing to copy
+--   is followed by one at the next poll at or after '_wccIntervalMs' since
+--   the last one that copied (the first frames after a quiet time are
+--   copied within '_wccPollMs' of their commit). A PASSIVE that a reader
+--   kept from finishing is followed by one at the interval. PASSIVE takes
+--   no lock that a writer or reader waits for: commits go on during it.
 -- * The WAL stays bounded. SQLite restarts the WAL from its start at the
 --   first write of a transaction that began with every frame checkpointed.
 --   At the tip, with seconds between blocks, the thread's checkpoint is
@@ -62,6 +74,17 @@
 --   checkpoint (the writer is done then; the busy timeout is
 --   '_wccFinalBusyMs'), the writer's autocheckpoint back at 1000 pages, and
 --   its stats logged. The thread stops with 'withWalCheckpointer'.
+-- * Disk: the @-wal@ file keeps its high water. While the thread serves a
+--   file, the writer's @journal_size_limit@ is '_wccJournalSizeLimitBytes'
+--   (64 MiB, the backstop's size at 4 KiB pages): the first commit after a
+--   WAL restart truncates a longer file to it, so a WAL that a reader
+--   pinned past the backstop shrinks back. At rest each served file's WAL
+--   is at most that size: 64 MiB per chain in split mode, twice that in
+--   shadow mode (hot and legacy), about 1.3 and 2.6 GB on a 20-chain node,
+--   plus whatever a long reader pins for as long as it reads.
+-- * Liveness ('walCheckpointerLiveness', in the freezer's stats): whether
+--   the thread runs, and the time since its last successful checkpoint
+--   call (a PASSIVE that found nothing to copy counts: the thread works).
 --
 -- The WAL semantics are unchanged, so crash safety is: a commit is durable
 -- under the same rules (@synchronous = NORMAL@), and a crash before a
@@ -78,6 +101,8 @@ module Chainweb.Pact.Backend.Store.WalCheckpointer
 , withWalCheckpoint
 , walCheckpointStats
 , walCheckpointerActive
+, WalCheckpointerLiveness(..)
+, walCheckpointerLiveness
 ) where
 
 import Control.Concurrent
@@ -87,8 +112,6 @@ import Control.Monad
 
 import Data.Aeson (object, (.=))
 import qualified Data.Aeson as A
-import Data.Bits (shiftL, (.|.))
-import qualified Data.ByteString as B
 import qualified Data.ByteString.Lazy as BL
 import Data.IORef
 import qualified Data.Map.Strict as M
@@ -97,11 +120,9 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
 
-import GHC.ByteOrder (ByteOrder(..), targetByteOrder)
 import GHC.Clock (getMonotonicTime)
 
 import System.Directory (doesFileExist, getFileSize)
-import System.IO (IOMode(..), withBinaryFile)
 import System.LogLevel (LogLevel(..))
 
 import qualified Pact.Types.SQLite as P4SQL
@@ -128,7 +149,18 @@ data WalCheckpointer = WalCheckpointer
     , _wcFiles :: !(MVar (M.Map Int WalFile))
     , _wcNext :: !(IORef Int)
     , _wcFinished :: !(IORef (M.Map Text WalStats))
+    , _wcAlive :: !(IORef Bool)
+        -- ^ the thread runs
+    , _wcLastOk :: !(IORef (Maybe Double))
+        -- ^ the time of the last checkpoint call that returned
     }
+
+-- | Whether the thread runs, and the seconds since its last checkpoint call
+-- that returned ('Nothing' before the first).
+data WalCheckpointerLiveness = WalCheckpointerLiveness
+    { _wclAlive :: !Bool
+    , _wclLastCheckpointAgeSeconds :: !(Maybe Double)
+    } deriving (Show, Eq)
 
 data WalFile = WalFile
     { _wfLabel :: !Text
@@ -138,15 +170,15 @@ data WalFile = WalFile
     , _wfLock :: !(MVar Bool)
         -- ^ held during a checkpoint; 'False' once closed
     , _wfStats :: !(IORef WalStats)
-    , _wfLast :: !(IORef Double)
-        -- ^ the time of the last checkpoint
-    , _wfLastMx :: !(IORef Int)
-        -- ^ the WAL's length at the last poll
+    , _wfLastCall :: !(IORef (Double, Int, Int))
+        -- ^ the time of the last PASSIVE, the WAL's length in frames and
+        -- the frames checkpointed it returned
+    , _wfLastCopy :: !(IORef Double)
+        -- ^ the time of the last PASSIVE that copied frames
+    , _wfDue :: !(IORef Double)
+        -- ^ when the next PASSIVE is due
     , _wfLastLog :: !(IORef Double)
     , _wfLastWarn :: !(IORef Double)
-    , _wfStalled :: !(IORef Bool)
-        -- ^ the last PASSIVE checkpoint left frames behind: a reader pins
-        -- them, so the next one waits for the interval
     }
 
 -- | Runs an action with the file's current path, under whatever lock the
@@ -156,22 +188,27 @@ newtype AtPath = AtPath (forall b. (FilePath -> IO b) -> IO b)
 -- | A file's checkpoint stats since its registration.
 data WalStats = WalStats
     { _wstCheckpoints :: !Int
-        -- ^ PASSIVE checkpoints run
+        -- ^ PASSIVE checkpoints that copied frames
     , _wstFrames :: !Int
         -- ^ frames copied into the database file
     , _wstBusy :: !Int
         -- ^ PASSIVE checkpoints that left frames behind (a reader pinned them)
     , _wstTotalMs :: !Double
+        -- ^ the time of all checkpoint calls, those with nothing to copy
+        -- included
     , _wstMaxMs :: !Double
         -- ^ the longest checkpoint (PASSIVE or TRUNCATE)
     , _wstWalFramesMax :: !Int
-        -- ^ the high water of the WAL's length in frames
+        -- ^ the high water of the WAL's length in frames, as the PASSIVE
+        -- checkpoints saw it
     , _wstWalBytesMax :: !Integer
         -- ^ the high water of the @-wal@ file's size
     , _wstRestarts :: !Int
-        -- ^ WAL restarts seen (its length went down between two polls)
+        -- ^ WAL restarts seen (its length went down between two PASSIVE
+        -- checkpoints)
     , _wstOverRestart :: !Int
-        -- ^ polls that saw the WAL at or past '_wccRestartFrames': the
+        -- ^ PASSIVE checkpoints that saw the WAL at or past
+        -- '_wccRestartFrames': the
         -- writer's backstop checkpoint was due, or a reader pinned the WAL
     , _wstErrors :: !Int
     , _wstFinalBusy :: !(Maybe Bool)
@@ -215,7 +252,9 @@ withWalCheckpointer logFn cfg k = do
         <$> newMVar M.empty
         <*> newIORef 0
         <*> newIORef M.empty
-    withAsync (loop cp) $ \_ -> k cp
+        <*> newIORef True
+        <*> newIORef Nothing
+    withAsync (loop cp `finally` writeIORef (_wcAlive cp) False) $ \_ -> k cp
   where
     loop cp = forever (pass cp) `catch` \(e :: SomeException) -> case fromException e of
         Just (_ :: SomeAsyncException) -> throwIO e
@@ -233,6 +272,15 @@ withWalCheckpointer logFn cfg k = do
 -- | The files registered now.
 walCheckpointerActive :: WalCheckpointer -> IO Int
 walCheckpointerActive cp = M.size <$> readMVar (_wcFiles cp)
+
+-- | Whether the thread runs, and the time since its last checkpoint call
+-- that returned.
+walCheckpointerLiveness :: WalCheckpointer -> IO WalCheckpointerLiveness
+walCheckpointerLiveness cp = do
+    alive <- readIORef (_wcAlive cp)
+    lastOk <- readIORef (_wcLastOk cp)
+    now <- getMonotonicTime
+    return $ WalCheckpointerLiveness alive ((now -) <$> lastOk)
 
 -- | The stats of the registered files and of the files whose registration
 -- ended (their final stats), by label.
@@ -271,19 +319,21 @@ withWalCheckpoint cp label writer atPath act = bracket register unregister (cons
                 P4SQL.exec_ c (fromString ("PRAGMA busy_timeout = " <> show (_wccFinalBusyMs cfg)))
                 -- SQLite opens the -wal file at the first access: now, while
                 -- the path is current
-                void $ passive c
-            return c
-        flip onException (closeSQLiteConnection conn) $ do
+                r <- passive c
+                return (c, r)
+        flip onException (closeSQLiteConnection (fst conn)) $ do
           now <- getMonotonicTime
-          f <- WalFile label (AtPath atPath) writer conn
+          let (_, l, k') = snd conn
+          f <- WalFile label (AtPath atPath) writer (fst conn)
               <$> newMVar True
               <*> newIORef emptyWalStats
+              <*> newIORef (now, max 0 l, max 0 k')
+              <*> newIORef now
+              <*> newIORef now
               <*> newIORef now
               <*> newIORef 0
-              <*> newIORef now
-              <*> newIORef 0
-              <*> newIORef False
           i <- atomicModifyIORef' (_wcNext cp) (\n -> (n + 1, n))
+          setJournalSizeLimit writer (_wccJournalSizeLimitBytes cfg)
           setAutocheckpoint writer (_wccRestartFrames cfg)
           modifyMVar_ (_wcFiles cp) (return . M.insert i f)
           return (i, f)
@@ -309,83 +359,81 @@ withWalCheckpoint cp label writer atPath act = bracket register unregister (cons
 tick :: WalCheckpointer -> WalFile -> IO ()
 tick cp f = handle onError $ withMVar (_wfLock f) $ \open -> when open $ do
     now <- getMonotonicTime
-    hdr <- readHeader f
-    lastC <- readIORef (_wfLast f)
-    stalled <- readIORef (_wfStalled f)
-    lastMx <- readIORef (_wfLastMx f)
-    let elapsed t ms = (now - t) * 1000 >= fromIntegral ms
-        interval = elapsed lastC (_wccIntervalMs cfg)
-        restartAt = _wccRestartFrames cfg
-    forM_ hdr $ \(mx, _) -> modifyIORef' (_wfStats f) $ \s -> s { _wstWalFramesMax = max (_wstWalFramesMax s) mx }
-    case hdr of
-        Just (mx, nb) -> do
-            writeIORef (_wfLastMx f) mx
-            modifyIORef' (_wfStats f) $ \s -> s
-                { _wstRestarts = _wstRestarts s + (if mx < lastMx then 1 else 0)
-                , _wstOverRestart = _wstOverRestart s + (if mx >= restartAt then 1 else 0)
-                }
-            when ((mx - nb >= _wccSoftFrames cfg && not stalled) || (mx > nb && interval)) $
-                checkpoint now nb
-            lastW <- readIORef (_wfLastWarn f)
-            when (mx >= 2 * restartAt && now - lastW >= 60) $ do
-                writeIORef (_wfLastWarn f) now
-                _wcLog cp Warn $ "WAL checkpointer: the WAL of " <> _wfLabel f <> " is " <> T.pack (show mx)
-                    <> " frames long (restart at " <> T.pack (show restartAt)
-                    <> "): a long read transaction keeps it from being checkpointed and restarted"
-        Nothing -> when interval $ checkpoint now 0
+    due <- readIORef (_wfDue f)
+    when (now >= due) $ checkpoint now
     lastLog <- readIORef (_wfLastLog f)
-    when (elapsed lastLog (1000 * _wccStatsLogSeconds cfg)) $ do
+    when (elapsed now lastLog (1000 * _wccStatsLogSeconds cfg)) $ do
         writeIORef (_wfLastLog f) now
         s <- readIORef (_wfStats f)
         logJson cp Info (walStatsJson (_wfLabel f) s)
   where
     cfg = _wcConfig cp
+    restartAt = _wccRestartFrames cfg
+    sec ms = fromIntegral ms / 1000 :: Double
+    elapsed now t ms = (now - t) * 1000 >= fromIntegral ms
 
-    checkpoint now nb = do
+    checkpoint now = do
         ((busy, nLog, nCkpt), ms) <- timedCheckpoint (_wfConn f) "PASSIVE"
-        writeIORef (_wfLast f) now
-        writeIORef (_wfStalled f) (nCkpt < nLog)
-        modifyIORef' (_wfStats f) $ \s -> s
-            { _wstCheckpoints = _wstCheckpoints s + 1
-            , _wstFrames = _wstFrames s + max 0 (nCkpt - nb)
-            , _wstBusy = _wstBusy s + (if busy || nCkpt < nLog then 1 else 0)
-            , _wstTotalMs = _wstTotalMs s + ms
-            , _wstMaxMs = max (_wstMaxMs s) ms
-            , _wstWalFramesMax = max (_wstWalFramesMax s) nLog
-            }
-        walBytes f
+        writeIORef (_wcLastOk cp) (Just now)
+        (t0, log0, ckpt0) <- readIORef (_wfLastCall f)
+        lastCopy <- readIORef (_wfLastCopy f)
+        if nLog < 0 || nCkpt < 0
+        then do
+            -- no WAL information (another checkpoint ran): try again at the
+            -- next poll
+            writeIORef (_wfDue f) (now + sec (_wccPollMs cfg))
+            modifyIORef' (_wfStats f) $ \s -> s
+                { _wstTotalMs = _wstTotalMs s + ms
+                , _wstMaxMs = max (_wstMaxMs s) ms
+                , _wstBusy = _wstBusy s + 1
+                }
+        else do
+            let restarted = nLog < log0
+                -- frames appended since the last call, and copied by this one
+                written = if restarted then nLog else nLog - log0
+                copied = max 0 (if restarted then nCkpt else nCkpt - ckpt0)
+                stalled = busy || nCkpt < nLog
+                lastCopy' = if copied > 0 then now else lastCopy
+                rate = fromIntegral written / max 1e-3 (now - t0)
+                next
+                    | stalled = now + sec (_wccIntervalMs cfg)
+                    | written <= 0 = max (now + sec (_wccPollMs cfg)) (lastCopy' + sec (_wccIntervalMs cfg))
+                    | otherwise = now + min (sec (_wccIntervalMs cfg))
+                        (max (sec (_wccPollMs cfg)) (fromIntegral (_wccSoftFrames cfg) / rate))
+            writeIORef (_wfLastCall f) (now, nLog, nCkpt)
+            writeIORef (_wfLastCopy f) lastCopy'
+            writeIORef (_wfDue f) next
+            modifyIORef' (_wfStats f) $ \s -> s
+                { _wstCheckpoints = _wstCheckpoints s + (if copied > 0 then 1 else 0)
+                , _wstFrames = _wstFrames s + copied
+                , _wstBusy = _wstBusy s + (if stalled then 1 else 0)
+                , _wstTotalMs = _wstTotalMs s + ms
+                , _wstMaxMs = max (_wstMaxMs s) ms
+                , _wstWalFramesMax = max (_wstWalFramesMax s) nLog
+                , _wstRestarts = _wstRestarts s + (if restarted then 1 else 0)
+                , _wstOverRestart = _wstOverRestart s + (if nLog >= restartAt then 1 else 0)
+                }
+            when (copied > 0) $ walBytes f
+            lastW <- readIORef (_wfLastWarn f)
+            when (nLog >= 2 * restartAt && now - lastW >= 60) $ do
+                writeIORef (_wfLastWarn f) now
+                _wcLog cp Warn $ "WAL checkpointer: the WAL of " <> _wfLabel f <> " is " <> T.pack (show nLog)
+                    <> " frames long (restart at " <> T.pack (show restartAt)
+                    <> "): a long read transaction keeps it from being checkpointed and restarted"
 
     onError (e :: SomeException) = case fromException e of
         Just (_ :: SomeAsyncException) -> throwIO e
         Nothing -> do
             modifyIORef' (_wfStats f) $ \s -> s { _wstErrors = _wstErrors s + 1 }
             now <- getMonotonicTime
+            writeIORef (_wfDue f) (now + sec (_wccIntervalMs cfg))
             lastW <- readIORef (_wfLastWarn f)
             when (now - lastW >= 60) $ do
                 writeIORef (_wfLastWarn f) now
                 _wcLog cp Warn $ "WAL checkpointer: " <> _wfLabel f <> ": " <> T.pack (displayException e)
 
--- | @(mxFrame, nBackfill)@ from the wal-index header, or 'Nothing' when it
--- cannot be read or is not consistent (being written, or not initialised).
-readHeader :: WalFile -> IO (Maybe (Int, Int))
-readHeader f = do
-    let AtPath atPath = _wfAtPath f
-    r <- try @IOException $ atPath $ \p -> withBinaryFile (p <> "-shm") ReadMode (\h -> B.hGet h 136)
-    return $ case r of
-        Right h | B.length h == 136
-                , B.index h 12 == 1
-                , B.take 48 h == B.take 48 (B.drop 48 h)
-                , let mx = u32 h 16
-                , let nb = u32 h 96
-                , nb <= mx
-                -> Just (mx, nb)
-        _ -> Nothing
-  where
-    -- native byte order, as SQLite writes it
-    u32 bs o = case targetByteOrder of
-        LittleEndian -> foldr (\i a -> a `shiftL` 8 .|. fromIntegral (B.index bs (o + i))) 0 [0 .. 3]
-        BigEndian -> foldl (\a i -> a `shiftL` 8 .|. fromIntegral (B.index bs (o + i))) 0 [0 .. 3]
-
+-- | The size of the @-wal@ file, from its metadata (@stat@): the file is
+-- never opened here (see the module header).
 walBytes :: WalFile -> IO ()
 walBytes f = do
     let AtPath atPath = _wfAtPath f
@@ -415,6 +463,12 @@ timedCheckpoint c mode = do
     r <- walCheckpoint c mode
     t1 <- getMonotonicTime
     return (r, (t1 - t0) * 1000)
+
+-- | @PRAGMA journal_size_limit@ on the connection: the size the first
+-- commit after a WAL restart truncates a longer @-wal@ file to.
+setJournalSizeLimit :: SQLiteEnv -> Int -> IO ()
+setJournalSizeLimit c n = void $
+    P4SQL.qry_ c (fromString ("PRAGMA journal_size_limit = " <> show n)) [P4SQL.RInt]
 
 -- | @sqlite3_wal_autocheckpoint@ on the connection (the C call: no
 -- statement, the connection's error state left alone).

@@ -13,6 +13,9 @@ module Chainweb.Test.Pact.Store.Cold
 ( tests
 ) where
 
+import Control.Concurrent (threadDelay)
+import Control.Concurrent.Async (async, cancel, waitCatch)
+import Control.Concurrent.MVar
 import Control.Exception
 import Control.Monad
 
@@ -21,6 +24,8 @@ import qualified Data.ByteString as B
 import Data.IORef
 import Data.Text (Text)
 import qualified Data.Text as T
+
+import qualified Database.RocksDB.Base as R
 
 import System.IO.Temp (withSystemTempDirectory)
 
@@ -109,6 +114,8 @@ tests = testGroup "Cold store"
     , testCase "table name helpers" tableNameTest
     , testCase "a step that is not after the written frontier is refused" stepOrderTest
     , testCase "publish makes a step's new tables visible before it moves the frontier" publishOrderTest
+    , testCase "a cancel during publish's in-memory updates: the state is read back, the step is published, the ids continue" publishCancelTest
+    , testCase "a failed write whose state read back fails too poisons the writer: every later write is refused, nothing more is written" poisonTest
     ]
 
 -- | Review finding M1 of Task 22: a reader that sees the new frontier must
@@ -337,3 +344,77 @@ stepOrderTest = withDir $ \dir -> withStore dir $ \cs -> do
     refused "row at the step's end txid" (stp (fr 3 30) [("t", [row "a" 30 ""])])
     refused "a table that stays in SQLite" (stp (fr 3 30) [("SYS:Modules", [row "a" 20 ""])])
     assertEqual "meta unchanged" (ColdMeta (Just (fr 2 20)) Nothing 0) =<< _ccMeta cc
+
+-- | Review finding M3 of 903e51900: a cancel ('throwTo') that lands during
+-- the in-memory updates of a publish ('midPublish', between the catalog
+-- and the frontier), after the meta reached the database. The read back
+-- must finish the publish in memory (catalog, then frontier), and the
+-- writer must go on with the ids after the step's.
+publishCancelTest :: IO ()
+publishCancelTest = withDir $ \dir -> withStore dir $ \cs -> do
+    reached <- newEmptyMVar
+    armed <- newIORef False
+    let mid = do
+            a <- atomicModifyIORef' armed (\x -> (False, x))
+            when a $ putMVar reached () >> forever (threadDelay 1000000)
+    cc <- openColdChainHooked writeBatchSync mid cs cid
+    _ccWriteStep cc $ stp (fr 1 10) [("t", [row "a" 0 "a0"])]
+    _ccPublish cc
+    _ccWriteStep cc $ stp (fr 2 20) [("new", [row "x" 10 "x10"]), ("t", [row "b" 11 "b11"])]
+    writeIORef armed True
+    p <- async (_ccPublish cc)
+    takeMVar reached
+    cancel p
+    waitCatch p >>= \case
+        Left e -> assertBool ("cancelled: " <> show e) (isAsync e)
+        Right () -> assertFailure "the publish was not cancelled"
+    -- the meta is in the database: the read back published the step
+    _ccVerified cc >>= (@?= Just (fr 2 20))
+    assertBool "the new table is visible" . (/= Nothing) =<< _ccTableId cc "new"
+    _ccRowsAtTxId cc "new" 10 >>= (@?= Just [("x", "x10")])
+    _ccRowsAtTxId cc "t" 11 >>= (@?= Just [("b", "b11")])
+    -- the writer goes on, ids after the step's
+    _ccWriteStep cc $ stp (fr 3 30) [("new", [row "y" 20 "y20"]), ("t", [row "c" 21 "c21"]), ("other", [row "z" 22 ""])]
+    _ccPublish cc
+    _ccVerified cc >>= (@?= Just (fr 3 30))
+    tNew <- mustTableId cs "new"
+    t <- mustTableId cs "t"
+    assertEqual "table ids continue" (Just (TableId 2)) =<< getTableId cs "other"
+    assertEqual "key ids continue (new)" (Just (KeyId 1)) =<< getKeyId cs tNew "y"
+    assertEqual "key ids continue (t)" (Just (KeyId 2)) =<< getKeyId cs t "c"
+    _ccRowsAtTxId cc "new" 20 >>= (@?= Just [("y", "y20")])
+  where
+    isAsync e = (/= Nothing) (fmap show (fromException e :: Maybe SomeAsyncException))
+
+-- | Review finding M1 of 903e51900: a write fails and the read back of the
+-- state fails too (here the batch landed with a meta that cannot be
+-- decoded). The state is unknown: the writer refuses every later write
+-- until the chain is opened again, and writes nothing.
+poisonTest :: IO ()
+poisonTest = withDir $ \dir -> withStore dir $ \cs -> do
+    armed <- newIORef False
+    let writer db ops = do
+            a <- atomicModifyIORef' armed (\x -> (False, x))
+            if a
+            then do
+                writeBatchSync db (ops ++ [R.Put (metaKey cid) "not a meta"])
+                throwIO (userError "injected write failure")
+            else writeBatchSync db ops
+    cc <- openColdChainWith writer cs cid
+    _ccWriteStep cc $ stp (fr 1 10) [("t", [row "a" 0 ""])]
+    _ccPublish cc
+    writeIORef armed True
+    try @IOException (_ccWriteStep cc $ stp (fr 2 20) [("t", [row "b" 10 ""])]) >>= \case
+        Left e -> assertBool ("the write's exception: " <> show e) ("injected" `T.isInfixOf` T.pack (show e))
+        Right () -> assertFailure "the write did not throw"
+    keys <- coldRawKeys cs
+    let refused name act = try @ColdStoreException act >>= \case
+            Left (ColdStoreException m) -> assertBool (name <> ": " <> T.unpack m) ("reopen the chain" `T.isInfixOf` m)
+            Right _ -> assertFailure (name <> ": not refused")
+    refused "writeStep" $ _ccWriteStep cc $ stp (fr 2 20) [("t", [row "c" 11 ""])]
+    refused "writeRows" $ _ccWriteRows cc (Pact4.TxId 30) [("t", [row "d" 25 ""])]
+    refused "publish" $ _ccPublish cc
+    refused "trimProgress" $ _ccTrimProgress cc 10
+    -- refused twice: the poison stays
+    refused "writeStep again" $ _ccWriteStep cc $ stp (fr 2 20) [("t", [row "c" 11 ""])]
+    assertEqual "nothing more written" keys =<< coldRawKeys cs
