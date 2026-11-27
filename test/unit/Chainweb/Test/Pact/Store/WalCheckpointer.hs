@@ -23,7 +23,7 @@ import Control.Exception (SomeException, try)
 import Control.Monad
 
 import qualified Data.ByteString as B
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, isJust)
 import Data.Text (Text)
 
 import GHC.Clock (getMonotonicTime)
@@ -58,6 +58,7 @@ tests = testGroup "WAL checkpointer"
     , testCase "stop: the final checkpoint leaves an empty WAL, the writer's autocheckpoint is back, the rows are in the database file" stopTest
     , testCase "the polls keep SQLite's shm locks: another process still sees the dead-man switch lock held (and a descriptor closed on the -shm file would drop it)" shmLockTest
     , testCase "journal_size_limit: a WAL that a reader pinned past the limit shrinks back to it after the restart" journalSizeLimitTest
+    , testCase "a checkpoint before each trim chunk: under back-to-back commits with the thread idle, the WAL stays far under the backstop (it reaches it without), and is skipped while the WAL is short" trimCheckpointTest
     , testCase "liveness: alive with a recent checkpoint call while it runs, not alive after it stops" livenessTest
     ]
 
@@ -270,3 +271,74 @@ livenessTest = withDb $ \path db -> do
         return cp
     l <- walCheckpointerLiveness cp'
     assertBool ("stopped: " <> show l) (not (_wclAlive l))
+
+-- | Back-to-back commits (blocks) with a trim chunk after each three, the
+-- thread idle at first (its schedule after a quiet first poll is an hour
+-- away; the calls here reschedule it, as in the node). With
+-- 'checkpointBeforeWrite' before each chunk (the freezer holds the writer's
+-- lock then), every chunk's write restarts the WAL: the WAL never comes near
+-- the backstop, so no commit checkpoints inside it. Without, the WAL grows
+-- to the backstop and a commit runs it.
+trimCheckpointTest :: Assertion
+trimCheckpointTest = do
+    -- skipped: the last call, less than a poll ago, found the WAL short
+    withDb $ \path db -> withWalCheckpointer quiet idleCfg { _wccPollMs = 600_000 } $ \cp ->
+        withWalCheckpoint cp "t" db (\f -> f path) $
+            checkpointBeforeWrite cp db >>= (@?= Just WriterCheckpointSkipped)
+    -- an unregistered writer
+    withDb $ \_ db -> withWalCheckpointer quiet idleCfg $ \cp ->
+        checkpointBeforeWrite cp db >>= (@?= Nothing)
+
+    without <- run False
+    with <- run True
+    let pageFrame = 4096 + 24
+        backstopBytes = fromIntegral (_wccRestartFrames idleCfg * pageFrame) :: Integer
+        (wBytes, _) = without
+        (cBytes, results) = with
+    assertBool ("without: the WAL reached the backstop, " <> show wBytes <> " bytes") (wBytes >= backstopBytes)
+    -- a few rounds' frames at most: a chunk whose call found the thread at
+    -- the file ('WriterCheckpointBusy'), or the WAL short at the thread's
+    -- call less than a poll before ('WriterCheckpointSkipped': the calls
+    -- here reschedule the thread, as in the node), leaves the WAL to the
+    -- next chunk
+    assertBool ("with: the WAL stayed under 3/4 of the backstop, " <> show cBytes <> " bytes; " <> show results) (4 * cBytes < 3 * backstopBytes)
+    -- every chunk had a checkpoint that copied every frame, and the WAL it
+    -- found (the frames since the last chunk's restart) is short
+    length results @?= rounds
+    forM_ results $ \case
+        Just (WriterCheckpointRan _ l complete) -> do
+            assertBool "complete" complete
+            assertBool ("WAL frames before the chunk " <> show l) (4 * l < 3 * _wccRestartFrames idleCfg)
+        Just WriterCheckpointBusy -> return ()
+        Just WriterCheckpointSkipped -> return ()
+        r -> assertFailure ("not run: " <> show r)
+    assertBool ("most chunks had a checkpoint: " <> show results)
+        (2 * length [ () | Just (WriterCheckpointRan {}) <- results ] >= rounds)
+  where
+    rounds = 20 :: Int
+    idleCfg = fastConfig
+        { _wccPollMs = 20
+        , _wccIntervalMs = 3_600_000
+        , _wccSoftFrames = 100
+        , _wccRestartFrames = 2000
+        , _wccJournalSizeLimitBytes = 1024 * 1024 * 1024
+        }
+    run trimCkpt = withDb $ \path db -> withWalCheckpointer quiet idleCfg $ \cp ->
+        withWalCheckpoint cp "t" db (\f -> f path) $ do
+            -- the thread's first poll finds nothing and schedules the next
+            -- an hour later: wait for it (its first call sets the liveness
+            -- age), so that it does not run during the writes
+            eventually (ctxOf cp path) "the thread's first poll"
+                (isJust . _wclLastCheckpointAgeSeconds <$> walCheckpointerLiveness cp)
+            rs <- forM [0 .. rounds - 1] $ \r -> do
+                -- three block commits of about 60 frames each
+                forM_ [0 .. 2] $ \b -> writeRows db (100_000 + r * 1000 + b * 200) 120
+                -- the trim chunk, under the writer's lock
+                res <- if trimCkpt then checkpointBeforeWrite cp db else return Nothing
+                writeRows db (r * 10) 10
+                return res
+            st <- statsOf cp "t"
+            -- the thread stayed idle: one poll, nothing copied by it
+            unless trimCkpt $ _wstCheckpoints st @?= 0
+            w <- walBytes path
+            return (w, rs)

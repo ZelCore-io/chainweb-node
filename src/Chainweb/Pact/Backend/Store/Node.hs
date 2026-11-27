@@ -622,6 +622,7 @@ withChainFreezer cst underLock blockWaiting latestTime inner = case _cstFreezer 
                 , _feCacheStats = coldCacheStats (_cfColdStore cf)
                 , _feShadowDifferences = _cfShadowDifferences cf
                 , _feWalCheckpointer = traverse walCheckpointerLiveness (_pstWalCheckpointer st)
+                , _feTrimCheckpoint = \db -> maybe (return Nothing) (`checkpointBeforeWrite` db) (_pstWalCheckpointer st)
                 , _feTrimWindow = defaultTrimWindow
                 , _feTrimClock = getMonotonicTime
                 , _feLogger = _cfLogger cf

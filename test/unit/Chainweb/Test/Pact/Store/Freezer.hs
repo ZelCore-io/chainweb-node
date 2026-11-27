@@ -41,7 +41,7 @@ module Chainweb.Test.Pact.Store.Freezer
 , masterOf
 ) where
 
-import Control.Concurrent (threadDelay)
+import Control.Concurrent (forkIO, killThread, threadDelay)
 import Control.Concurrent.Async (AsyncCancelled(..), cancel, withAsync)
 import Control.Concurrent.MVar
 import Control.Concurrent.QSem (newQSem)
@@ -72,6 +72,7 @@ import System.Environment (lookupEnv)
 import System.FilePath
 import System.IO.Temp (withSystemTempDirectory)
 import System.LogLevel
+import System.Timeout (timeout)
 
 import Test.Tasty
 import Test.Tasty.HUnit
@@ -248,6 +249,7 @@ withNodeWC clock tw root cfg writer mkHooks gate k = do
                     , _feCacheStats = coldCacheStats cs
                     , _feShadowDifferences = return Nothing
                     , _feWalCheckpointer = return Nothing
+                    , _feTrimCheckpoint = \_ -> return Nothing
                     , _feTrimWindow = tw
                     , _feTrimClock = clock db
                     , _feLogger = quietLogger
@@ -388,6 +390,7 @@ tests = testGroup "Freezer step"
     , testCase "a compacted-style BlockHistory that starts at a high height freezes from its first row" compactedHistoryTest
     , testCase "a dense txid range with a huge window: every trim chunk holds at most the row cap, or one txid; the result equals a one-txid-window trim" rowCapTest
     , testCase "adaptive trim window (injected clock): shrinks on an overrun and converges under the target; grows from a small start without an overrun; FreezerStats match the chunks" adaptiveWindowTest
+    , testCase "the checkpoint before each trim chunk (injected clock): runs under the Pact lock, is counted in FreezerStats and is not part of any chunk's time" trimCheckpointSplitTest
     , testCase "nextTrimWindow: halves on an overrun, doubles a full fast window only, shrinks to a row-capped window, stays within bounds" nextTrimWindowTest
     , testCase "trim benchmark (opt-in: CHAINWEB_TRIM_BENCH=<blocks>)" trimBench
     , testCase "runFreezer retries a transient SQLite error (BUSY/LOCKED) with backoff, halts past the limit and on any other exception, and records the halt in the stats" runFreezerRetryTest
@@ -1213,7 +1216,13 @@ trimBench = lookupEnv "CHAINWEB_TRIM_BENCH" >>= \case
             case withCkpt of
                 Nothing -> void $ runToEnd (_nEnv n)
                 Just _ -> withWalCheckpointer (\_ _ -> return ()) defaultWalCheckpointConfig $ \cp -> do
-                    withWalCheckpoint cp "bench" (_nPact n) file $ void $ runToEnd (_nEnv n)
+                    -- CHAINWEB_TRIM_BENCH_NOTRIMCKPT: no PASSIVE before the
+                    -- trim chunks (the thread alone, as before)
+                    noTrimCkpt <- lookupEnv "CHAINWEB_TRIM_BENCH_NOTRIMCKPT"
+                    let env = case noTrimCkpt of
+                            Nothing -> (_nEnv n) { _feTrimCheckpoint = checkpointBeforeWrite cp }
+                            Just _ -> _nEnv n
+                    withWalCheckpoint cp "bench" (_nPact n) file $ void $ runToEnd env
                     walCheckpointStats cp >>= mapM_ (\(_, w) -> putStrLn $ "trim-bench: ckpt " <> show w)
             st <- readIORef (_feStats (_nEnv n))
             let xs = sort (foldr (:) [] (_fsTrimSamples st))
@@ -1227,6 +1236,12 @@ trimBench = lookupEnv "CHAINWEB_TRIM_BENCH" >>= \case
                 <> " positionMs " <> show (_fsTrimPositionMs st)
                 <> " commitMaxMs " <> show (_fsTrimCommitMaxMs st)
                 <> " gcMaxMs " <> show (_fsTrimGcMaxMs st)
+                <> " maxExGcMs " <> show (_fsTrimMaxExGcMs st)
+                <> " trimCkpts " <> show (_fsTrimCheckpoints st)
+                <> " trimCkptSkips " <> show (_fsTrimCheckpointSkips st)
+                <> " trimCkptMs " <> show (_fsTrimCheckpointMs st)
+                <> " trimCkptMaxMs " <> show (_fsTrimCheckpointMaxMs st)
+                <> " trimCkptWalFramesMax " <> show (_fsTrimCheckpointWalFramesMax st)
 
 -- -------------------------------------------------------------------------- --
 -- Trim chunk bounds
@@ -1360,6 +1375,64 @@ adaptiveWindowTest = do
     _fsTrimWindow st' @?= Just 64
   where
     assertApprox what a b = assertBool (what <> ": " <> show a <> " /= " <> show b) (abs (a - b) < 1e-6)
+
+-- | A checkpoint that takes 50 ms on the injected clock before every chunk:
+-- the chunk times are those of a run without it; the checkpoints are
+-- counted apart, and each runs under the Pact connection's lock.
+trimCheckpointSplitTest :: Assertion
+trimCheckpointSplitTest = do
+    let tw = TrimWindow 1024 1 1_048_576 1_000_000 10
+    (_, _, st0, rows0) <- trimRun rowClock tw uniformHistory
+    withHistoryFixture uniformHistory $ \root -> do
+        extra <- newIORef (0 :: Double)
+        held <- newIORef True
+        let cfg = testConfig { _phFreezeDepth = 1, _phFreezeStepHeights = 3 }
+            clock db = (+) <$> rowClock db <*> readIORef extra
+        withNodeWC clock tw root cfg writeBatchSync (const noHooks) (const (return ())) $ \n -> do
+            let env = (_nEnv n)
+                    { _feTrimCheckpoint = \_ -> do
+                        -- the Pact lock is held: a try of it from another
+                        -- thread does not get it
+                        got <- newEmptyMVar
+                        _ <- forkIO $ (lockFree (_feWithPactDb (_nEnv n)) >>= putMVar got)
+                        g <- takeMVar got
+                        when g $ writeIORef held False
+                        modifyIORef' extra (+ 0.05)
+                        return (Just (WriterCheckpointRan 50 1234 True))
+                    }
+            os <- runToEnd env
+            last os @?= NothingToDo
+            st <- readIORef (_feStats env)
+            rows <- concatMap snd <$> dumpTables (_nPact n) ["big_table"]
+            rows @?= rows0
+            readIORef held >>= assertBool "the checkpoint ran under the Pact lock"
+            -- the chunks' times are the same as without the checkpoint
+            _fsTrimChunks st @?= _fsTrimChunks st0
+            assertApprox "trimMaxMs" (_fsTrimMaxMs st0) (_fsTrimMaxMs st)
+            assertApprox "trimMs" (_fsTrimMs st0) (_fsTrimMs st)
+            assertApprox "trimCommitMaxMs" (_fsTrimCommitMaxMs st0) (_fsTrimCommitMaxMs st)
+            -- (counted in, each would be 50 ms longer)
+            -- the checkpoints, apart
+            _fsTrimCheckpoints st @?= _fsTrimChunks st
+            _fsTrimCheckpointSkips st @?= 0
+            assertApprox "trimCheckpointMaxMs" 50 (_fsTrimCheckpointMaxMs st)
+            assertApprox "trimCheckpointMs" (50 * fromIntegral (_fsTrimChunks st)) (_fsTrimCheckpointMs st)
+            _fsTrimCheckpointWalFramesMax st @?= 1234
+            -- the GC split: net of GC a chunk is never longer than it is
+            rtsStats <- getRTSStatsEnabled
+            case _fsTrimMaxExGcMs st of
+                Nothing -> rtsStats @?= False
+                Just x -> assertBool ("trimMaxExGcMs " <> show x) (x <= _fsTrimMaxMs st + 1e-6)
+  where
+    assertApprox what a b = assertBool (what <> ": " <> show a <> " /= " <> show b) (abs (a - b) < 1e-6)
+    -- whether the lock can be taken within 50 ms
+    lockFree :: ((SQLiteEnv -> IO ()) -> IO ()) -> IO Bool
+    lockFree lock = do
+        r <- newEmptyMVar
+        t <- forkIO $ lock (\_ -> putMVar r ())
+        ok <- timeout 50_000 (takeMVar r)
+        killThread t
+        return (ok == Just ())
 
 nextTrimWindowTest :: Assertion
 nextTrimWindowTest = do
