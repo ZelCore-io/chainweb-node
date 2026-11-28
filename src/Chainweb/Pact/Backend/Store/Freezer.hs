@@ -221,7 +221,8 @@ data FreezerStats = FreezerStats
     , _fsTrimCkptOutside :: !TrimCheckpointStats
         -- ^ the first phase of the checkpoint before each trim chunk, before
         -- the Pact connection's lock ('_feTrimCheckpointOutside'): block
-        -- commits go on during it; not part of any chunk's or lock time
+        -- commits go on during it; not part of any chunk's or lock time,
+        -- part of the duty time ('_feAfterTrimChunk')
     , _fsTrimCkptUnderLock :: !TrimCheckpointStats
         -- ^ the second phase, under the lock ('_feTrimCheckpoint'): part of
         -- the lock time ('_fsTrimLockMaxMs'), not of the chunk's
@@ -417,8 +418,8 @@ data FreezerEnv = FreezerEnv
         -- ^ runs before every trim chunk: 'trimGate'
     , _feAfterTrimChunk :: !(Double -> IO ())
         -- ^ runs after every trim chunk with its duty time in seconds: the
-        -- chunk under the Pact connection's lock plus the synced trim
-        -- position write ('recordTrimChunk')
+        -- checkpoint before the Pact connection's lock, the chunk under the
+        -- lock, and the synced trim position write ('recordTrimChunk')
     , _fePollMicros :: !Int
         -- ^ how often 'runFreezer' polls the tip when there is nothing to do
         -- ('defaultFreezerPollMicros')
@@ -838,8 +839,9 @@ trimStep env f from = do
                 }
             case r of
                 Nothing -> do
-                    -- the lock was held for the checkpoint and the check
-                    _feAfterTrimChunk env lt
+                    -- the lock was held for the checkpoint and the check;
+                    -- the first phase counts too
+                    _feAfterTrimChunk env ((o1 - o0) + lt)
                     return TrimHashMismatch
                 Just ((n, hi, capped), dt, cm, gc) -> do
                     let ms = dt * 1000
@@ -875,8 +877,10 @@ trimStep env f from = do
                         <> " ms, its commit " <> T.pack (show (cm * 1000))
                         <> " ms, GC " <> maybe "n/a" (\g -> T.pack (show (g * 1000))) gc
                         <> " ms); the checkpoint before the lock: " <> T.pack (show ((o1 - o0) * 1000)) <> " ms"
-                    -- the duty time: the lock time and the position write
-                    _feAfterTrimChunk env (lt + (p1 - p0))
+                    -- the duty time: the first phase, the lock time and the
+                    -- position write (the first phase is outside the lock
+                    -- but is trim's I/O: the pacing accounts for it)
+                    _feAfterTrimChunk env ((o1 - o0) + lt + (p1 - p0))
                     _fhAfterTrimChunk (_feHooks env)
                     go work hi (total + n)
       where

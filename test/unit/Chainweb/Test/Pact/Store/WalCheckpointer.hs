@@ -25,7 +25,7 @@ import Control.Monad
 
 import qualified Data.ByteString as B
 import Data.IORef
-import Data.Maybe (fromMaybe, isJust)
+import Data.Maybe (fromMaybe, isJust, isNothing)
 import Data.Text (Text)
 
 import GHC.Clock (getMonotonicTime)
@@ -62,6 +62,7 @@ tests = testGroup "WAL checkpointer"
     , testCase "journal_size_limit: a WAL that a reader pinned past the limit shrinks back to it after the restart" journalSizeLimitTest
     , testCase "a checkpoint before each trim chunk: under back-to-back commits with the thread idle, the WAL stays far under the backstop (it reaches it without), and is skipped while the WAL is short" trimCheckpointTest
     , testCase "the two phases before a trim chunk: under the lock only while the WAL is long; a pinned reader leaves frames and the chunk goes on; the thread at the file gives Busy without a wait, under a concurrent writer; the freezer's calls do not refresh the liveness" twoPhaseTest
+    , testCase "the first phase is skipped while the thread's schedule covers the file (right after its poll found a short WAL), and runs when the thread is overdue or the WAL was long" skipRuleTest
     , testCase "liveness: alive with a recent checkpoint call while it runs, not alive after it stops" livenessTest
     ]
 
@@ -276,19 +277,15 @@ livenessTest = withDb $ \path db -> do
     assertBool ("stopped: " <> show l) (not (_wclAlive l))
 
 -- | Back-to-back commits (blocks) with a trim chunk after each three, the
--- thread idle at first (its schedule after a quiet first poll is an hour
--- away; the calls here reschedule it, as in the node). With
--- 'checkpointBeforeLock' and 'checkpointUnderLock' before each chunk (the
--- freezer holds the writer's lock for the second), every chunk's write
--- restarts the WAL: the WAL never comes near
--- the backstop, so no commit checkpoints inside it. Without, the WAL grows
--- to the backstop and a commit runs it.
+-- thread asleep (its first poll ten minutes away: the file's first PASSIVE
+-- is due at the registration, and the first phase's calls then schedule
+-- the next ten minutes later). With 'checkpointBeforeLock' and
+-- 'checkpointUnderLock' before each chunk (the freezer holds the writer's
+-- lock for the second), every chunk's write restarts the WAL: the WAL
+-- never comes near the backstop, so no commit checkpoints inside it.
+-- Without, the WAL grows to the backstop and a commit runs it.
 trimCheckpointTest :: Assertion
 trimCheckpointTest = do
-    -- skipped: the last call, less than a poll ago, found the WAL short
-    withDb $ \path db -> withWalCheckpointer quiet idleCfg { _wccPollMs = 600_000 } $ \cp ->
-        withWalCheckpoint cp "t" db (\f -> f path) $
-            checkpointBeforeLock cp db >>= (@?= Just WriterCheckpointSkipped)
     -- an unregistered writer
     withDb $ \_ db -> withWalCheckpointer quiet idleCfg $ \cp -> do
         checkpointBeforeLock cp db >>= (@?= Nothing)
@@ -301,11 +298,8 @@ trimCheckpointTest = do
         (wBytes, _) = without
         (cBytes, results) = with
     assertBool ("without: the WAL reached the backstop, " <> show wBytes <> " bytes") (wBytes >= backstopBytes)
-    -- a few rounds' frames at most: a chunk whose call found the thread at
-    -- the file ('WriterCheckpointBusy'), or the WAL short at the thread's
-    -- call less than a poll before ('WriterCheckpointSkipped': the calls
-    -- here reschedule the thread, as in the node), leaves the WAL to the
-    -- next chunk
+    -- a few rounds' frames at most: a chunk whose first phase was skipped
+    -- (the WAL short at the last call) leaves the WAL to the next chunk
     assertBool ("with: the WAL stayed under 3/4 of the backstop, " <> show cBytes <> " bytes; " <> show results) (4 * cBytes < 3 * backstopBytes)
     -- every chunk had a checkpoint that copied every frame, and the WAL it
     -- found (the frames since the last chunk's restart) is short
@@ -315,19 +309,29 @@ trimCheckpointTest = do
             Just (WriterCheckpointRan _ l complete) -> do
                 assertBool "complete" complete
                 assertBool ("WAL frames before the chunk " <> show l) (4 * l < 3 * _wccRestartFrames idleCfg)
-            Just WriterCheckpointBusy -> return ()
             Just WriterCheckpointSkipped -> return ()
             r -> assertFailure ("not run: " <> show r)
         -- the first phase drained a WAL under a quarter of the backstop:
-        -- nothing to do under the lock
         -- nothing to do under the lock (a first phase that met the thread
         -- can leave a long WAL to the second)
         case (outside, under) of
             (Just (WriterCheckpointRan _ l _), r@(Just (WriterCheckpointRan {}))) | l < underLockFrames idleCfg ->
                 assertFailure ("under the lock after a short WAL: " <> show r)
             _ -> return ()
-    assertBool ("most chunks had a checkpoint: " <> show results)
-        (2 * length [ () | (Just (WriterCheckpointRan {}), _) <- results ] >= rounds)
+    -- the first phase follows the skip rule: the thread never polls, so
+    -- the first chunk's call is overdue (due at the registration) and runs;
+    -- each later one is not due, and runs exactly when the call before it
+    -- found the WAL at or past soft
+    let firsts = fst <$> results
+        expected prev = case prev of
+            Just (WriterCheckpointRan _ l _) | l < _wccSoftFrames idleCfg -> False
+            _ -> True
+        ran = \case
+            Just (WriterCheckpointRan {}) -> True
+            _ -> False
+    assertBool ("the first chunk's first phase ran: " <> show results) (ran (head firsts))
+    forM_ (zip firsts (drop 1 firsts)) $ \(prev, cur) ->
+        assertBool ("the skip rule after " <> show prev <> ": " <> show cur) (ran cur == expected prev)
     -- no PASSIVE under the lock in most rounds: skipped, or the thread at
     -- the file (under load the first phase's call reschedules the thread
     -- soon, and a slow PASSIVE of it holds the file)
@@ -336,7 +340,7 @@ trimCheckpointTest = do
   where
     rounds = 20 :: Int
     idleCfg = fastConfig
-        { _wccPollMs = 20
+        { _wccPollMs = 600_000
         , _wccIntervalMs = 3_600_000
         , _wccSoftFrames = 100
         , _wccRestartFrames = 2000
@@ -344,11 +348,6 @@ trimCheckpointTest = do
         }
     run trimCkpt = withDb $ \path db -> withWalCheckpointer quiet idleCfg $ \cp ->
         withWalCheckpoint cp "t" db (\f -> f path) $ do
-            -- the thread's first poll finds nothing and schedules the next
-            -- an hour later: wait for it (its first call sets the liveness
-            -- age), so that it does not run during the writes
-            eventually (ctxOf cp path) "the thread's first poll"
-                (isJust . _wclLastCheckpointAgeSeconds <$> walCheckpointerLiveness cp)
             rs <- forM [0 .. rounds - 1] $ \r -> do
                 -- three block commits of about 60 frames each
                 forM_ [0 .. 2] $ \b -> writeRows db (100_000 + r * 1000 + b * 200) 120
@@ -359,7 +358,7 @@ trimCheckpointTest = do
                 writeRows db (r * 10) 10
                 return res
             st <- statsOf cp "t"
-            -- the thread stayed idle: one poll, nothing copied by it
+            -- the thread stayed asleep: nothing copied by it
             unless trimCkpt $ _wstCheckpoints st @?= 0
             w <- walBytes path
             return (w, rs)
@@ -369,26 +368,18 @@ trimCheckpointTest = do
 -- concurrent writer.
 twoPhaseTest :: Assertion
 twoPhaseTest = do
-    -- 0. the freezer's calls say nothing of the thread: after the thread's
-    -- first poll (its next an hour away), they run, and the time since the
-    -- thread's last call goes on growing (a call reschedules the thread at
-    -- the soonest a poll later)
-    withDb $ \path db -> withWalCheckpointer quiet idleCfg $ \cp ->
+    -- 0. the freezer's calls say nothing of the thread: with the thread
+    -- asleep (its first poll ten minutes away), they run, and the thread
+    -- still has no checkpoint call of its own
+    withDb $ \path db -> withWalCheckpointer quiet pinCfg $ \cp ->
       withWalCheckpoint cp "t" db (\f -> f path) $ do
-        eventually (ctxOf cp path) "the thread's first poll"
-            (isJust . _wclLastCheckpointAgeSeconds <$> walCheckpointerLiveness cp)
-        threadDelay 300_000
         forM_ [0 .. 3 :: Int] $ \b -> writeRows db (b * 200) 200
-        -- (Busy when it meets the thread's poll: again)
-        let retryBusy act = act >>= \case
-                Just WriterCheckpointBusy -> threadDelay 1000 >> retryBusy act
-                r -> return r
-        retryBusy (checkpointBeforeLock cp db) >>= \case
+        checkpointBeforeLock cp db >>= \case
             Just (WriterCheckpointRan {}) -> return ()
             r -> assertFailure ("first phase: " <> show r)
         _ <- checkpointUnderLock cp db
         l <- walCheckpointerLiveness cp
-        assertBool ("liveness: " <> show l) (_wclAlive l && maybe False (>= 0.3) (_wclLastCheckpointAgeSeconds l))
+        assertBool ("liveness: " <> show l) (_wclAlive l && isNothing (_wclLastCheckpointAgeSeconds l))
 
     -- 1. a pinned reader, the thread asleep (its first poll ten minutes
     -- away: no call is Busy), the first phase never skipped
@@ -486,3 +477,72 @@ twoPhaseTest = do
         , _wccRestartFrames = 100_000
         , _wccJournalSizeLimitBytes = 1024 * 1024 * 1024
         }
+
+-- | The first phase's skip rule ('checkpointBeforeLock'): skipped, with no
+-- I/O, while the file's next PASSIVE is not yet due and the last call found
+-- the WAL under '_wccSoftFrames'; run when the thread is overdue, or when
+-- the last call found the WAL at or past soft.
+skipRuleTest :: Assertion
+skipRuleTest = do
+    -- right after the thread's poll found a short WAL (its first poll finds
+    -- it empty and schedules the next an hour later): skipped, both phases
+    withDb $ \path db -> withWalCheckpointer quiet idleCfg $ \cp ->
+      withWalCheckpoint cp "t" db (\f -> f path) $ do
+        eventually (ctxOf cp path) "the thread's first poll"
+            (isJust . _wclLastCheckpointAgeSeconds <$> walCheckpointerLiveness cp)
+        st0 <- statsOf cp "t"
+        writeRows db 0 10
+        retryBusy (checkpointBeforeLock cp db) >>= (@?= Just WriterCheckpointSkipped)
+        retryBusy (checkpointUnderLock cp db) >>= (@?= Just WriterCheckpointSkipped)
+        -- no checkpoint call: the stats' time of all calls did not move
+        st1 <- statsOf cp "t"
+        _wstTotalMs st1 @?= _wstTotalMs st0
+
+    -- the thread overdue (asleep, its first poll ten minutes away: the
+    -- file's first PASSIVE is due at the registration): run; then not due
+    -- and the WAL short: skipped
+    withDb $ \path db -> withWalCheckpointer quiet sleepCfg $ \cp ->
+      withWalCheckpoint cp "t" db (\f -> f path) $ do
+        writeRows db 0 10
+        checkpointBeforeLock cp db >>= \case
+            Just (WriterCheckpointRan _ l complete) -> do
+                assertBool "complete" complete
+                assertBool ("short: " <> show l) (l < _wccSoftFrames sleepCfg)
+            r -> assertFailure ("overdue: " <> show r)
+        writeRows db 100 10
+        checkpointBeforeLock cp db >>= (@?= Just WriterCheckpointSkipped)
+
+    -- the WAL long at the last call: run although not due, until a call
+    -- finds it short
+    withDb $ \path db -> withWalCheckpointer quiet sleepCfg $ \cp ->
+      withWalCheckpoint cp "t" db (\f -> f path) $ do
+        forM_ [0 .. 3 :: Int] $ \b -> writeRows db (b * 200) 200
+        l1 <- checkpointBeforeLock cp db >>= \case
+            Just (WriterCheckpointRan _ l _) -> return l
+            r -> assertFailure ("overdue: " <> show r)
+        assertBool ("long: " <> show l1) (l1 >= _wccSoftFrames sleepCfg)
+        -- the next PASSIVE is now ten minutes away
+        writeRows db 5000 10
+        checkpointBeforeLock cp db >>= \case
+            Just (WriterCheckpointRan _ l complete) -> do
+                assertBool "complete" complete
+                assertBool ("restarted, short: " <> show l) (l < _wccSoftFrames sleepCfg)
+            r -> assertFailure ("long at the last call: " <> show r)
+        writeRows db 6000 10
+        checkpointBeforeLock cp db >>= (@?= Just WriterCheckpointSkipped)
+        st <- statsOf cp "t"
+        _wstErrors st @?= 0
+  where
+    -- (Busy when a call meets the thread's poll, which takes the file's
+    -- lock even when nothing is due: again)
+    retryBusy act = act >>= \case
+        Just WriterCheckpointBusy -> threadDelay 1000 >> retryBusy act
+        r -> return r
+    idleCfg = fastConfig
+        { _wccPollMs = 20
+        , _wccIntervalMs = 3_600_000
+        , _wccSoftFrames = 100
+        , _wccRestartFrames = 2000
+        , _wccJournalSizeLimitBytes = 1024 * 1024 * 1024
+        }
+    sleepCfg = idleCfg { _wccPollMs = 600_000 }

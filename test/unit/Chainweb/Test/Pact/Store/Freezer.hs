@@ -392,7 +392,7 @@ tests = testGroup "Freezer step"
     , testCase "a compacted-style BlockHistory that starts at a high height freezes from its first row" compactedHistoryTest
     , testCase "a dense txid range with a huge window: every trim chunk holds at most the row cap, or one txid; the result equals a one-txid-window trim" rowCapTest
     , testCase "adaptive trim window (injected clock): shrinks on an overrun and converges under the target; grows from a small start without an overrun; FreezerStats match the chunks" adaptiveWindowTest
-    , testCase "the checkpoint before each trim chunk (injected clock): the first phase outside the Pact lock, the second under it; each counted by result in FreezerStats; the lock hold is the chunk plus the second phase" trimCheckpointSplitTest
+    , testCase "the checkpoint before each trim chunk (injected clock): the first phase outside the Pact lock, the second under it; each counted by result in FreezerStats; the lock hold is the chunk plus the second phase; the duty time counts both" trimCheckpointSplitTest
     , testCase "nextTrimWindow: halves on an overrun, doubles a full fast window only, shrinks to a row-capped window, stays within bounds" nextTrimWindowTest
     , testCase "trim benchmark (opt-in: CHAINWEB_TRIM_BENCH=<blocks>)" trimBench
     , testCase "runFreezer retries a transient SQLite error (BUSY/LOCKED) with backoff, halts past the limit and on any other exception, and records the halt in the stats" runFreezerRetryTest
@@ -1430,7 +1430,7 @@ adaptiveWindowTest = do
 -- lock meanwhile); the second under it, in turn ran (50 ms), skipped, busy
 -- and failed. The chunk times are those of a run without them; each phase
 -- is counted apart by result; the lock hold of a chunk is its time plus
--- the second phase's, and not the first's.
+-- the second phase's, and not the first's; the duty time counts both.
 trimCheckpointSplitTest :: Assertion
 trimCheckpointSplitTest = do
     let tw = TrimWindow 1024 1 1_048_576 1_000_000 10
@@ -1440,11 +1440,13 @@ trimCheckpointSplitTest = do
         held <- newIORef True
         freeOutside <- newIORef True
         calls <- newIORef (0 :: Int)
+        duties <- newIORef []
         let cfg = testConfig { _phFreezeDepth = 1, _phFreezeStepHeights = 3 }
             clock db = (+) <$> rowClock db <*> readIORef extra
         withNodeWC clock tw root cfg writeBatchSync (const noHooks) (const (return ())) $ \n -> do
             let env = (_nEnv n)
-                    { _feTrimCheckpointOutside = do
+                    { _feAfterTrimChunk = \d -> modifyIORef' duties (d :)
+                    , _feTrimCheckpointOutside = do
                         -- the Pact lock is not held: a probe gets it
                         g <- lockFree (_feWithPactDb (_nEnv n))
                         unless g $ writeIORef freeOutside False
@@ -1498,6 +1500,11 @@ trimCheckpointSplitTest = do
                 got = foldr (:) [] (_fsTrimLockSamples st)
             length got @?= length expected
             forM_ (zip got expected) $ \(x, y) -> assertApprox "lock hold" y x
+            -- the duty time: the first phase (30 ms), the lock hold and the
+            -- position write (no rows: no time on this clock)
+            ds <- reverse <$> readIORef duties
+            length ds @?= chunks
+            forM_ (zip ds got) $ \(d, x) -> assertApprox "duty" (30 + x) (d * 1000)
             assertApprox "trimLockMaxMs" (maximum expected) (_fsTrimLockMaxMs st)
             -- the GC split: net of GC a chunk is never longer than it is
             rtsStats <- getRTSStatsEnabled

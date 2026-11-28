@@ -61,8 +61,10 @@
 --   both PASSIVE on this thread's connection and schedule, neither waiting
 --   for the thread. First, before it takes the Pact connection's lock,
 --   'checkpointBeforeLock' copies the bulk of the WAL and syncs while
---   block commits go on (skipped while the WAL is short: the last call,
---   less than a poll ago, found fewer than '_wccSoftFrames' frames). It
+--   block commits go on (skipped while the thread's schedule covers the
+--   file: its next PASSIVE is not yet due and the last call found fewer
+--   than '_wccSoftFrames' frames; so it runs only when the thread is
+--   overdue, Busy-stalled or behind). It
 --   leaves the frames committed while it runs, or that a reader pins, and
 --   the WAL then does not restart at the chunk's write. (A commit after a
 --   complete first phase restarts the WAL itself.) So second, under the lock (no Pact
@@ -490,18 +492,21 @@ data WriterCheckpoint
 -- | The first phase before a write of the given writer: a PASSIVE
 -- checkpoint of its file now, on the checkpointer's connection, for a
 -- caller that does not hold the writer's lock. It copies the bulk of the
--- WAL and syncs while the writer goes on. Skipped when the last call (the
--- thread's or one of these), less than '_wccPollMs' ago, found fewer than
--- '_wccSoftFrames' frames: that reads only the state the thread keeps, no
--- I/O. It never waits for the thread: when the thread checkpoints the file
--- at that moment it returns 'WriterCheckpointBusy'. Like the thread it
--- never opens the @-shm@ or @-wal@ file and never runs anything but
--- PASSIVE. 'Nothing' when the writer is not registered.
+-- WAL and syncs while the writer goes on. Skipped while the thread's
+-- schedule covers the file: the file's next PASSIVE is not yet due
+-- ('_wfDue') and the last call (the thread's or one of these) found fewer
+-- than '_wccSoftFrames' frames. It runs only when the thread is overdue
+-- (stalled on another file, or on a Busy), or the WAL was at or past soft
+-- (the thread is behind): then it adds a drain the thread does not give,
+-- and otherwise it would only double the thread's syncs. The decision
+-- reads only the state the thread keeps, no I/O. It never waits for the
+-- thread: when the thread checkpoints the file at that moment it returns
+-- 'WriterCheckpointBusy'. Like the thread it never opens the @-shm@ or
+-- @-wal@ file and never runs anything but PASSIVE. 'Nothing' when the
+-- writer is not registered.
 checkpointBeforeLock :: WalCheckpointer -> SQLiteEnv -> IO (Maybe WriterCheckpoint)
-checkpointBeforeLock cp = writerCheckpoint cp $ \now (t, nLog, _) ->
-    (now - t) * 1000 < fromIntegral (_wccPollMs cfg) && nLog < _wccSoftFrames cfg
-  where
-    cfg = _wcConfig cp
+checkpointBeforeLock cp = writerCheckpoint cp $ \now due (_, nLog, _) ->
+    now < due && nLog < _wccSoftFrames (_wcConfig cp)
 
 -- | The second phase, for a caller that holds the writer's lock (no
 -- transaction of the writer is open, and none begins during the call): a
@@ -515,7 +520,7 @@ checkpointBeforeLock cp = writerCheckpoint cp $ \now (t, nLog, _) ->
 -- checkpoints from ever finding that moment). Busy, failure and
 -- registration as 'checkpointBeforeLock'.
 checkpointUnderLock :: WalCheckpointer -> SQLiteEnv -> IO (Maybe WriterCheckpoint)
-checkpointUnderLock cp = writerCheckpoint cp $ \_ (_, nLog, _) ->
+checkpointUnderLock cp = writerCheckpoint cp $ \_ _ (_, nLog, _) ->
     nLog < underLockFrames (_wcConfig cp)
 
 -- | The WAL length, in frames, from which 'checkpointUnderLock' runs: a
@@ -524,10 +529,10 @@ underLockFrames :: WalCheckpointConfig -> Int
 underLockFrames cfg = max 1 (_wccRestartFrames cfg `div` 4)
 
 -- | A PASSIVE of the writer's file under its '_wfLock', unless the rule
--- (given the time and the file's last call) skips it.
+-- (given the time, the file's next due PASSIVE and its last call) skips it.
 writerCheckpoint
     :: WalCheckpointer
-    -> (Double -> (Double, Int, Int) -> Bool)
+    -> (Double -> Double -> (Double, Int, Int) -> Bool)
     -> SQLiteEnv
     -> IO (Maybe WriterCheckpoint)
 writerCheckpoint cp skip writer = do
@@ -539,8 +544,9 @@ writerCheckpoint cp skip writer = do
             Just False -> putMVar (_wfLock f) False >> return Nothing
             Just True -> (`finally` putMVar (_wfLock f) True) $ restore $ do
                 now <- getMonotonicTime
+                due <- readIORef (_wfDue f)
                 lastCall <- readIORef (_wfLastCall f)
-                if skip now lastCall
+                if skip now due lastCall
                 then return (Just WriterCheckpointSkipped)
                 else handle (onError f) $ do
                     (_, ((busy, l, k), ms)) <- passiveNow cp f now
