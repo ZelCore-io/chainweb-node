@@ -72,7 +72,7 @@ defaultsTest = do
     _phFreezeStepHeights c @?= 1000
     _phColdBlockCacheBytes c @?= 1073741824
     _phTrimDutyCycle c @?= 0.1
-    _phTrimChunkRows c @?= 500
+    _phTrimChunkRows c @?= 1000
     _phCatchUpLagSeconds c @?= 600
     _phFreezerConcurrency c @?= 2
     _phFreezerEnabled c @?= True
@@ -107,6 +107,9 @@ roundTripTest = do
             , _phTrimChunkRows = 250
             }
     (_configPactHistory . ($ def) <$> parseArgs args) @?= Just expected
+    -- the cap's upper bound itself is accepted
+    (_phTrimChunkRows . _configPactHistory . ($ def) <$> parseArgs ["--pact-trim-chunk-rows", "100000"])
+        @?= Just 100000
     (_configPactHistory . ($ def) <$> parseArgs ["--pact-trim-duty-cycle", "1"])
         @?= Just defaultPactHistoryConfig { _phTrimDutyCycle = 1 }
     -- JSON, alone and in the node configuration
@@ -138,6 +141,7 @@ rejectTest = do
             , (["--pact-trim-duty-cycle", "1.5"], "pact-trim-duty-cycle")
             , (["--pact-trim-duty-cycle", "-0.1"], "pact-trim-duty-cycle")
             , (["--pact-trim-chunk-rows", "0"], "pact-trim-chunk-rows")
+            , (["--pact-trim-chunk-rows", "100001"], "pact-trim-chunk-rows")
             ]
     forM_ cases $ \(args, opt) ->
         case execParserPure defaultPrefs parser args of
@@ -154,6 +158,7 @@ rejectTest = do
             , (defaultPactHistoryConfig { _phFreezeStepBytes = 0 }, "freezeStepBytes")
             , (defaultPactHistoryConfig { _phFreezeStepHeights = 0 }, "freezeStepHeights")
             , (defaultPactHistoryConfig { _phTrimChunkRows = 0 }, "trimChunkRows")
+            , (defaultPactHistoryConfig { _phTrimChunkRows = 100001 }, "trimChunkRows")
             , (defaultPactHistoryConfig { _phColdBlockCacheBytes = 0 }, "coldBlockCacheBytes")
             , (defaultPactHistoryConfig { _phFreezerConcurrency = 0 }, "freezerConcurrency")
             ]

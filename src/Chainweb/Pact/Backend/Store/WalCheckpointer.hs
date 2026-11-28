@@ -73,16 +73,13 @@
 --   complete first phase restarts the WAL itself.) So second, under the lock (no Pact
 --   transaction open), 'checkpointUnderLock' copies what is left, only
 --   while the WAL is long: the last known length (that first call's, or
---   the thread's if later) at or over half of '_wccRestartFrames'.
+--   the thread's if later) at or over a quarter of '_wccRestartFrames'.
 --   That PASSIVE copies every frame unless a reader pins some, so the
 --   chunk's write restarts the WAL and its commit does not run the
 --   backstop; a shorter WAL is far enough from the backstop that a chunk
---   cannot reach it, and the next chunk checks again. The thread and the
---   first phase keep the WAL well under half the backstop (gate B run 4:
---   peaks of 4.3-6.2k frames against 16,384), so the second phase is a
---   safety net that seldom holds the lock; at half, the backstop is still
---   about 8k frames away. (At a quarter it ran on about 5% of the W1 trim
---   chunks, for 12-49 ms each under the lock on Ceph.)
+--   cannot reach it, and the next chunk checks again. The lock is so held
+--   for a checkpoint about once per quarter backstop of frames, and then
+--   only for the frames written since the first phase.
 --
 --   Considered and rejected: a RESTART or TRUNCATE checkpoint from the
 --   thread at a hard limit. It takes the write lock and waits for readers
@@ -536,10 +533,10 @@ checkpointUnderLock :: WalCheckpointer -> SQLiteEnv -> IO (Maybe WriterCheckpoin
 checkpointUnderLock cp = writerCheckpoint cp $ \_ _ (_, nLog, _) ->
     nLog < underLockFrames (_wcConfig cp)
 
--- | The WAL length, in frames, from which 'checkpointUnderLock' runs: half
--- of '_wccRestartFrames' (8,192 at the default 16,384).
+-- | The WAL length, in frames, from which 'checkpointUnderLock' runs: a
+-- quarter of '_wccRestartFrames' (4,096 at the default 16,384).
 underLockFrames :: WalCheckpointConfig -> Int
-underLockFrames cfg = max 1 (_wccRestartFrames cfg `div` 2)
+underLockFrames cfg = max 1 (_wccRestartFrames cfg `div` 4)
 
 -- | A PASSIVE of the writer's file under its '_wfLock', unless the rule
 -- (given the time, the file's next due PASSIVE and its last call) skips it.

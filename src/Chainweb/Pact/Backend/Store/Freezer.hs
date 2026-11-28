@@ -380,10 +380,10 @@ data TrimWindow = TrimWindow
     }
     deriving (Eq, Show)
 
--- | Starts at 256 txids, at most 500 rows per chunk (the default of
+-- | Starts at 256 txids, at most 1000 rows per chunk (the default of
 -- '_phTrimChunkRows'), target 10 ms.
 defaultTrimWindow :: TrimWindow
-defaultTrimWindow = TrimWindow 256 1 1048576 500 10
+defaultTrimWindow = TrimWindow 256 1 1048576 1000 10
 
 -- | 'defaultTrimWindow' with the configuration's row cap
 -- ('_phTrimChunkRows', @--pact-trim-chunk-rows@).

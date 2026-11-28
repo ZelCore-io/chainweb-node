@@ -395,7 +395,7 @@ tests = testGroup "Freezer step"
     , testCase "adaptive trim window (injected clock): shrinks on an overrun and converges under the target; grows from a small start without an overrun; FreezerStats match the chunks" adaptiveWindowTest
     , testCase "the checkpoint before each trim chunk (injected clock): the first phase outside the Pact lock, the second under it; each counted by result in FreezerStats; the lock hold is the chunk plus the second phase; the duty time counts both" trimCheckpointSplitTest
     , testCase "nextTrimWindow: halves on an overrun, doubles a full fast window only, shrinks to a row-capped window, stays within bounds" nextTrimWindowTest
-    , testCase "the trim chunk row cap comes from --pact-trim-chunk-rows; the default is 500" trimChunkRowsTest
+    , testCase "the trim chunk row cap comes from --pact-trim-chunk-rows; the default is 1000" trimChunkRowsTest
     , testCase "trim benchmark (opt-in: CHAINWEB_TRIM_BENCH=<blocks>)" trimBench
     , testCase "runFreezer retries a transient SQLite error (BUSY/LOCKED) with backoff, halts past the limit and on any other exception, and records the halt in the stats" runFreezerRetryTest
     , testCase "a cancel delivered as a step's cold write returns, then a drain on the same chain: no key id is reused, every T list resolves, cold equals the twin" cancelAfterWriteTest
@@ -1222,7 +1222,7 @@ benchHistory nBlocks = mk <$> [0 .. nBlocks - 1]
 -- default.
 trimChunkRowsTest :: Assertion
 trimChunkRowsTest = do
-    _twMaxRows defaultTrimWindow @?= 500
+    _twMaxRows defaultTrimWindow @?= 1000
     _twMaxRows defaultTrimWindow @?= _phTrimChunkRows defaultPactHistoryConfig
     configTrimWindow defaultPactHistoryConfig @?= defaultTrimWindow
     configTrimWindow testConfig { _phTrimChunkRows = 7 } @?= defaultTrimWindow { _twMaxRows = 7 }

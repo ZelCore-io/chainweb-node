@@ -36,6 +36,7 @@ module Chainweb.Pact.Backend.Store.Config
 , phColdBlockCacheBytes
 , phTrimDutyCycle
 , phTrimChunkRows
+, maxTrimChunkRows
 , phCatchUpLagSeconds
 , phFreezerConcurrency
 , phFreezerEnabled
@@ -281,9 +282,9 @@ makeLenses ''PactHistoryConfig
 -- | The defaults: @sqlite@; depth 4000 (spec 3); a step of at most 64 MiB (the
 -- batch size M0 used on chains 3 and 19) and 1000 heights; a 1 GiB cold block
 -- cache (as M0 measured); a trim duty cycle of 0.1 (spec 6.5, "about 10%");
--- trim chunks of at most 500 rows (gate B run 4: 1,000-row chunks reached
--- 21-29 ms on Ceph against the 20 ms bar); catch-up lag 600 s and two chains freezing at once. The last four are start
--- values, tuned in gate B.
+-- trim chunks of at most 1000 rows; catch-up lag 600 s and two chains
+-- freezing at once. The duty cycle, the chunk rows, the lag and the
+-- concurrency are start values, tuned in gate B.
 --
 defaultPactHistoryConfig :: PactHistoryConfig
 defaultPactHistoryConfig = PactHistoryConfig
@@ -293,7 +294,7 @@ defaultPactHistoryConfig = PactHistoryConfig
     , _phFreezeStepHeights = 1_000
     , _phColdBlockCacheBytes = 1_073_741_824
     , _phTrimDutyCycle = 0.1
-    , _phTrimChunkRows = 500
+    , _phTrimChunkRows = 1_000
     , _phCatchUpLagSeconds = 600
     , _phFreezerConcurrency = 2
     , _phFreezerEnabled = True
@@ -346,6 +347,16 @@ instance FromJSON PactHistoryConfig where
 
 -- | A reader for a whole number of at least 1. The message names the option.
 --
+-- | The most rows a trim chunk may be capped at: a larger value would turn
+-- the cap off and bring back chunks that hold the Pact lock for long.
+maxTrimChunkRows :: Int
+maxTrimChunkRows = 100_000
+
+trimChunkRowsReader :: ReadM Int
+trimChunkRowsReader = eitherReader $ \s -> case readMaybe @Integer s of
+    Just n | n >= 1 && n <= fromIntegral maxTrimChunkRows -> Right (fromIntegral n)
+    _ -> Left $ "--pact-trim-chunk-rows must be a whole number from 1 to " <> show maxTrimChunkRows <> ", got " <> show s
+
 positiveReader :: (Integral a) => String -> ReadM a
 positiveReader opt = eitherReader $ \s -> case readMaybe @Integer s of
     Just n | n >= 1 && n <= fromIntegral (maxBound :: Int) -> Right (fromIntegral n)
@@ -385,10 +396,10 @@ pPactHistoryConfig = id
         % long "pact-trim-duty-cycle"
         <> metavar "X"
         <> help "With split or shadow: the share of time, in (0, 1], that trimming SQLite may take while the node catches up."
-    <*< phTrimChunkRows .:: option (positiveReader "--pact-trim-chunk-rows")
+    <*< phTrimChunkRows .:: option trimChunkRowsReader
         % long "pact-trim-chunk-rows"
         <> metavar "ROWS"
-        <> help "With split or shadow: the most rows one trim chunk deletes from SQLite under the Pact lock (default 500). A single transaction with more rows is not split."
+        <> help "With split or shadow: the most rows one trim chunk deletes from SQLite under the Pact lock (default 1000; at least 1, at most 100000). A single transaction with more rows is not split."
     <*< phWalCheckpointer .:: option (eitherReader (walCheckpointerModeFromText . T.pack))
         % long "pact-wal-checkpointer"
         <> metavar "auto|on|off"
@@ -411,8 +422,8 @@ validatePactHistoryConfig c = do
         throwError "pactHistory.freezeStepBytes (--pact-freeze-step-bytes) must be at least 1"
     when (_phFreezeStepHeights c < 1) $
         throwError "pactHistory.freezeStepHeights (--pact-freeze-step-heights) must be at least 1"
-    when (_phTrimChunkRows c < 1) $
-        throwError "pactHistory.trimChunkRows (--pact-trim-chunk-rows) must be at least 1"
+    when (_phTrimChunkRows c < 1 || _phTrimChunkRows c > maxTrimChunkRows) $
+        throwError $ "pactHistory.trimChunkRows (--pact-trim-chunk-rows) must be from 1 to " <> sshow maxTrimChunkRows
     when (_phColdBlockCacheBytes c < 1) $
         throwError "pactHistory.coldBlockCacheBytes (--pact-cold-block-cache) must be at least 1"
     when (_phFreezerConcurrency c < 1) $

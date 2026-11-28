@@ -61,6 +61,7 @@ tests = testGroup "WAL checkpointer"
     , testCase "the polls keep SQLite's shm locks: another process still sees the dead-man switch lock held (and a descriptor closed on the -shm file would drop it)" shmLockTest
     , testCase "journal_size_limit: a WAL that a reader pinned past the limit shrinks back to it after the restart" journalSizeLimitTest
     , testCase "a checkpoint before each trim chunk: under back-to-back commits with the thread idle, the WAL stays far under the backstop (it reaches it without), and is skipped while the WAL is short" trimCheckpointTest
+    , testCase "the under-lock checkpoint trigger is a quarter of the backstop: 4096 frames at the default" underLockFramesTest
     , testCase "the two phases before a trim chunk: under the lock only while the WAL is long; a pinned reader leaves frames and the chunk goes on; the thread at the file gives Busy without a wait, under a concurrent writer; the freezer's calls do not refresh the liveness" twoPhaseTest
     , testCase "the first phase is skipped while the thread's schedule covers the file (right after its poll found a short WAL), and runs when the thread is overdue or the WAL was long" skipRuleTest
     , testCase "a call that finds the WAL restarted does not know the rate: the next is due at the next poll, and a burst right after the restart is copied then" restartScheduleTest
@@ -277,6 +278,14 @@ livenessTest = withDb $ \path db -> do
     l <- walCheckpointerLiveness cp'
     assertBool ("stopped: " <> show l) (not (_wclAlive l))
 
+-- | The second (under-lock) phase runs from a quarter of the backstop:
+-- 4,096 frames at the default 16,384. Every other assertion is relative to
+-- 'underLockFrames', so this pins the ratio itself.
+underLockFramesTest :: Assertion
+underLockFramesTest = do
+    _wccRestartFrames defaultWalCheckpointConfig @?= 16384
+    underLockFrames defaultWalCheckpointConfig @?= 4096
+
 -- | Back-to-back commits (blocks) with a trim chunk after each three, the
 -- thread asleep (its first poll ten minutes away: the file's first PASSIVE
 -- is due at the registration, and the first phase's calls then schedule
@@ -312,7 +321,7 @@ trimCheckpointTest = do
                 assertBool ("WAL frames before the chunk " <> show l) (4 * l < 3 * _wccRestartFrames idleCfg)
             Just WriterCheckpointSkipped -> return ()
             r -> assertFailure ("not run: " <> show r)
-        -- the first phase drained a WAL under half the backstop:
+        -- the first phase drained a WAL under a quarter of the backstop:
         -- nothing to do under the lock (a first phase that met the thread
         -- can leave a long WAL to the second)
         case (outside, under) of
@@ -325,7 +334,10 @@ trimCheckpointTest = do
     -- ran (a skipped one leaves the file's state as it was) found the WAL at
     -- or past soft. The full rounds write about 180 frames, more than soft,
     -- so their chunks' calls run; the short round before the last finds the
-    -- WAL short, and the last round's call is skipped
+    -- WAL short, and the last round's call is skipped. Scope: the check
+    -- below covers the run side exactly, and the skip side only at the
+    -- last round; a skip followed by a skip is not reached here (no full
+    -- round leaves a WAL under soft) and is covered by 'skipRuleTest'
     let firsts = fst <$> results
         ran = \case
             Just (WriterCheckpointRan {}) -> True
@@ -402,9 +414,9 @@ twoPhaseTest = do
             writeRows db 0 10
             P4SQL.exec_ reader "BEGIN"
             _ <- P4SQL.qry_ reader "SELECT count(*) FROM t" [P4SQL.RInt]
-            -- a long WAL behind the reader's snapshot: over half the
-            -- backstop
-            forM_ [0 .. 11 :: Int] $ \b -> writeRows db (1000 + b * 200) 200
+            -- a long WAL behind the reader's snapshot: over a quarter of
+            -- the backstop
+            forM_ [0 .. 7 :: Int] $ \b -> writeRows db (1000 + b * 200) 200
             o1 <- checkpointBeforeLock cp db
             l1 <- case o1 of
                 Just (WriterCheckpointRan _ l complete) -> do
