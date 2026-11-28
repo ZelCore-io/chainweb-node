@@ -72,6 +72,7 @@ defaultsTest = do
     _phFreezeStepHeights c @?= 1000
     _phColdBlockCacheBytes c @?= 1073741824
     _phTrimDutyCycle c @?= 0.1
+    _phTrimChunkRows c @?= 500
     _phCatchUpLagSeconds c @?= 600
     _phFreezerConcurrency c @?= 2
     _phFreezerEnabled c @?= True
@@ -94,6 +95,7 @@ roundTripTest = do
             , "--pact-freeze-step-heights", "7"
             , "--pact-cold-block-cache", "4096"
             , "--pact-trim-duty-cycle", "0.25"
+            , "--pact-trim-chunk-rows", "250"
             ]
         expected = defaultPactHistoryConfig
             { _phStore = HistorySplit
@@ -102,6 +104,7 @@ roundTripTest = do
             , _phFreezeStepHeights = 7
             , _phColdBlockCacheBytes = 4096
             , _phTrimDutyCycle = 0.25
+            , _phTrimChunkRows = 250
             }
     (_configPactHistory . ($ def) <$> parseArgs args) @?= Just expected
     (_configPactHistory . ($ def) <$> parseArgs ["--pact-trim-duty-cycle", "1"])
@@ -134,6 +137,7 @@ rejectTest = do
             , (["--pact-trim-duty-cycle", "0"], "pact-trim-duty-cycle")
             , (["--pact-trim-duty-cycle", "1.5"], "pact-trim-duty-cycle")
             , (["--pact-trim-duty-cycle", "-0.1"], "pact-trim-duty-cycle")
+            , (["--pact-trim-chunk-rows", "0"], "pact-trim-chunk-rows")
             ]
     forM_ cases $ \(args, opt) ->
         case execParserPure defaultPrefs parser args of
@@ -149,6 +153,7 @@ rejectTest = do
             , (defaultPactHistoryConfig { _phTrimDutyCycle = 1.5 }, "trimDutyCycle")
             , (defaultPactHistoryConfig { _phFreezeStepBytes = 0 }, "freezeStepBytes")
             , (defaultPactHistoryConfig { _phFreezeStepHeights = 0 }, "freezeStepHeights")
+            , (defaultPactHistoryConfig { _phTrimChunkRows = 0 }, "trimChunkRows")
             , (defaultPactHistoryConfig { _phColdBlockCacheBytes = 0 }, "coldBlockCacheBytes")
             , (defaultPactHistoryConfig { _phFreezerConcurrency = 0 }, "freezerConcurrency")
             ]

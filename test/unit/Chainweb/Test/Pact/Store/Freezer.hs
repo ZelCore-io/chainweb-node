@@ -395,6 +395,7 @@ tests = testGroup "Freezer step"
     , testCase "adaptive trim window (injected clock): shrinks on an overrun and converges under the target; grows from a small start without an overrun; FreezerStats match the chunks" adaptiveWindowTest
     , testCase "the checkpoint before each trim chunk (injected clock): the first phase outside the Pact lock, the second under it; each counted by result in FreezerStats; the lock hold is the chunk plus the second phase; the duty time counts both" trimCheckpointSplitTest
     , testCase "nextTrimWindow: halves on an overrun, doubles a full fast window only, shrinks to a row-capped window, stays within bounds" nextTrimWindowTest
+    , testCase "the trim chunk row cap comes from --pact-trim-chunk-rows; the default is 500" trimChunkRowsTest
     , testCase "trim benchmark (opt-in: CHAINWEB_TRIM_BENCH=<blocks>)" trimBench
     , testCase "runFreezer retries a transient SQLite error (BUSY/LOCKED) with backoff, halts past the limit and on any other exception, and records the halt in the stats" runFreezerRetryTest
     , testCase "a cancel delivered as a step's cold write returns, then a drain on the same chain: no key id is reused, every T list resolves, cold equals the twin" cancelAfterWriteTest
@@ -1216,7 +1217,23 @@ benchHistory nBlocks = mk <$> [0 .. nBlocks - 1]
     val h = "{\"balance\":" <> n h <> ",\"guard\":\"" <> B.replicate 270 0x61 <> "\"}"
     n = B8.pack . show
 
--- | Runs the freezer over 'benchHistory' with the default trim window and
+-- | The node's trim window takes its row cap from the configuration and
+-- otherwise is 'defaultTrimWindow', whose cap is the configuration's
+-- default.
+trimChunkRowsTest :: Assertion
+trimChunkRowsTest = do
+    _twMaxRows defaultTrimWindow @?= 500
+    _twMaxRows defaultTrimWindow @?= _phTrimChunkRows defaultPactHistoryConfig
+    configTrimWindow defaultPactHistoryConfig @?= defaultTrimWindow
+    configTrimWindow testConfig { _phTrimChunkRows = 7 } @?= defaultTrimWindow { _twMaxRows = 7 }
+    -- a smaller cap cuts the same dense range into more chunks; the rows
+    -- trimmed are the same
+    (ends500, _, _, rows500) <- trimRun (const (return 0)) (TrimWindow 1_000_000 1 1_000_000 500 10) denseHistory
+    (ends250, _, _, rows250) <- trimRun (const (return 0)) (TrimWindow 1_000_000 1 1_000_000 250 10) denseHistory
+    rows250 @?= rows500
+    assertBool ("more chunks at 250 rows: " <> show (length ends250, length ends500)) (length ends250 > length ends500)
+
+-- | Runs the freezer over 'benchHistory' with the configured trim window and
 -- prints the trim chunk stats. Opt-in: set @CHAINWEB_TRIM_BENCH@ to the
 -- number of blocks.
 trimBench :: Assertion
@@ -1224,7 +1241,7 @@ trimBench = lookupEnv "CHAINWEB_TRIM_BENCH" >>= \case
     Nothing -> return ()
     Just s -> withHistoryFixture (benchHistory (read s)) $ \root -> do
         let cfg = testConfig { _phFreezeDepth = 10, _phFreezeStepHeights = 1000 }
-        withNodeW defaultTrimWindow root cfg writeBatchSync (const noHooks) (const (return ())) $ \n -> do
+        withNodeW (configTrimWindow cfg) root cfg writeBatchSync (const noHooks) (const (return ())) $ \n -> do
             lookupEnv "CHAINWEB_TRIM_BENCH_NOCKPT" >>= mapM_ (\_ -> P4SQL.exec_ (_nPact n) "PRAGMA wal_autocheckpoint = 0")
             -- CHAINWEB_TRIM_BENCH_CKPT: the background checkpointer serves the
             -- Pact connection, as in split mode
@@ -1239,7 +1256,11 @@ trimBench = lookupEnv "CHAINWEB_TRIM_BENCH" >>= \case
             writerOpt <- lookupEnv "CHAINWEB_TRIM_BENCH_WRITER"
             waits <- newIORef []
             totals <- newIORef []
-            let runEnv e = case writerOpt of
+            -- the trim duty time (what the duty cycle paces) and the wall
+            -- time of the run, for the trim rate
+            duty <- newIORef (0 :: Double)
+            w0 <- getMonotonicTime
+            let runEnv e0 = let e = e0 { _feAfterTrimChunk = \d -> modifyIORef' duty (+ d) >> _feAfterTrimChunk e0 d } in case writerOpt of
                     Nothing -> void $ runToEnd e
                     Just o -> do
                         let (msS, rowsS) = break (== ',') o
@@ -1262,6 +1283,8 @@ trimBench = lookupEnv "CHAINWEB_TRIM_BENCH" >>= \case
                             Just _ -> _nEnv n
                     withWalCheckpoint cp "bench" (_nPact n) file $ runEnv env
                     walCheckpointStats cp >>= mapM_ (\(_, w) -> putStrLn $ "trim-bench: ckpt " <> show w)
+            w1 <- getMonotonicTime
+            dutyS <- readIORef duty
             st <- readIORef (_feStats (_nEnv n))
             let xs = sort (foldr (:) [] (_fsTrimSamples st))
                 pct q = if null xs then 0 else xs !! min (length xs - 1) (floor (q * fromIntegral (length xs) :: Double))
@@ -1279,6 +1302,9 @@ trimBench = lookupEnv "CHAINWEB_TRIM_BENCH" >>= \case
                 <> " lockP99Ms " <> show (trimLockPercentile 0.99 st)
                 <> " underLock " <> show (_fsTrimCkptUnderLock st)
                 <> " outside " <> show (_fsTrimCkptOutside st)
+            putStrLn $ "trim-bench: dutyMs " <> show (dutyS * 1000)
+                <> " wallMs " <> show ((w1 - w0) * 1000)
+                <> " rowsPerDutySecond " <> show (fromIntegral (_fsRowsTrimmed st) / max 1e-9 dutyS)
 
             ws <- sort <$> readIORef waits
             ts <- sort <$> readIORef totals

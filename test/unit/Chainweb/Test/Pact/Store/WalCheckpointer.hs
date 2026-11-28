@@ -312,7 +312,7 @@ trimCheckpointTest = do
                 assertBool ("WAL frames before the chunk " <> show l) (4 * l < 3 * _wccRestartFrames idleCfg)
             Just WriterCheckpointSkipped -> return ()
             r -> assertFailure ("not run: " <> show r)
-        -- the first phase drained a WAL under a quarter of the backstop:
+        -- the first phase drained a WAL under half the backstop:
         -- nothing to do under the lock (a first phase that met the thread
         -- can leave a long WAL to the second)
         case (outside, under) of
@@ -402,9 +402,9 @@ twoPhaseTest = do
             writeRows db 0 10
             P4SQL.exec_ reader "BEGIN"
             _ <- P4SQL.qry_ reader "SELECT count(*) FROM t" [P4SQL.RInt]
-            -- a long WAL behind the reader's snapshot: over a quarter of
-            -- the backstop
-            forM_ [0 .. 7 :: Int] $ \b -> writeRows db (1000 + b * 200) 200
+            -- a long WAL behind the reader's snapshot: over half the
+            -- backstop
+            forM_ [0 .. 11 :: Int] $ \b -> writeRows db (1000 + b * 200) 200
             o1 <- checkpointBeforeLock cp db
             l1 <- case o1 of
                 Just (WriterCheckpointRan _ l complete) -> do
