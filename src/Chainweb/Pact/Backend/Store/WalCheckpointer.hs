@@ -36,7 +36,10 @@
 --   The next checkpoint of a file is due when '_wccSoftFrames' frames are
 --   expected to be pending, from the rate the WAL grew at between the last
 --   two checkpoints, and at the latest '_wccIntervalMs' after the last one,
---   but not before the next poll. A checkpoint that found nothing to copy
+--   but not before the next poll. A checkpoint that found the WAL restarted
+--   since the last one does not know the rate (the frames since the
+--   restart do not span the time since the last call): the next one is
+--   due at the next poll. A checkpoint that found nothing to copy
 --   is followed by one at the next poll at or after '_wccIntervalMs' since
 --   the last one that copied (the first frames after a quiet time are
 --   copied within '_wccPollMs' of their commit). A PASSIVE that a reader
@@ -442,6 +445,13 @@ passiveNow cp f now = do
             lastCopy' = if copied > 0 then now else lastCopy
             rate = fromIntegral written / max 1e-3 (now - t0)
             next
+                -- the WAL restarted since the last call: the frames since
+                -- the restart over the time since that call (before the
+                -- restart) would underestimate the rate, and a burst right
+                -- after the restart would go unseen until a far due time.
+                -- The rate is unknown: the next call, at the next poll,
+                -- measures it
+                | restarted = now + sec (_wccPollMs cfg)
                 | stalled = now + sec (_wccIntervalMs cfg)
                 | written <= 0 = max (now + sec (_wccPollMs cfg)) (lastCopy' + sec (_wccIntervalMs cfg))
                 | otherwise = now + min (sec (_wccIntervalMs cfg))

@@ -59,6 +59,7 @@ import Data.List (sort, sortOn)
 import qualified Data.Map.Strict as M
 import Data.Maybe (isJust, isNothing)
 import Data.String (fromString)
+import qualified Data.Sequence as Seq
 import qualified Data.Set as S
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -909,8 +910,23 @@ hashMismatchTest = withFixture $ \root twin -> do
         a @?= b
         -- the halt holds
         freezeOnce (_nEnv n) >>= (@?= HaltedHash (frontierAt 2))
-        -- trimStep on its own reports the mismatch
-        trimStep (_nEnv n) (frontierAt 2) 0 >>= (@?= TrimHashMismatch)
+        -- trimStep on its own reports the mismatch; the chunk's duty time
+        -- is the first phase (a fake of at least 30 ms) plus the lock hold
+        duties <- newIORef []
+        let env = (_nEnv n)
+                { _feAfterTrimChunk = \d -> modifyIORef' duties (d :)
+                , _feTrimCheckpointOutside = do
+                    threadDelay 30_000
+                    return (Just (WriterCheckpointRan 30 0 True))
+                }
+        trimStep env (frontierAt 2) 0 >>= (@?= TrimHashMismatch)
+        lockMs <- Seq.lookup 0 . Seq.reverse . _fsTrimLockSamples <$> readIORef (_feStats env)
+        readIORef duties >>= \case
+            [d] -> case lockMs of
+                Just l -> assertBool ("duty " <> show (d * 1000) <> " ms = the first phase (>= 30 ms) + the lock hold " <> show l <> " ms")
+                    (d * 1000 - l >= 30 && d * 1000 - l < 2000)
+                Nothing -> assertFailure "no lock hold sample"
+            ds -> assertFailure ("one duty per chunk: " <> show ds)
     -- a restart retries the trim and halts again, deleting nothing
     withPlainNode root $ \n -> do
         freezeOnce (_nEnv n) >>= (@?= HaltedHash (frontierAt 2))
