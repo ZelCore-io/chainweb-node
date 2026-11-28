@@ -44,6 +44,7 @@ module Chainweb.Pact.Backend.Store.Node
 , sqliteChainStorage
 , withChainStorage
 , withChainFreezer
+, freezerTrimCheckpoints
 , drainChainFreezer
 , shadowBrokenFileName
 ) where
@@ -622,7 +623,8 @@ withChainFreezer cst underLock blockWaiting latestTime inner = case _cstFreezer 
                 , _feCacheStats = coldCacheStats (_cfColdStore cf)
                 , _feShadowDifferences = _cfShadowDifferences cf
                 , _feWalCheckpointer = traverse walCheckpointerLiveness (_pstWalCheckpointer st)
-                , _feTrimCheckpoint = \db -> maybe (return Nothing) (`checkpointBeforeWrite` db) (_pstWalCheckpointer st)
+                , _feTrimCheckpointOutside = fst (freezerTrimCheckpoints cf)
+                , _feTrimCheckpoint = snd (freezerTrimCheckpoints cf)
                 , _feTrimWindow = defaultTrimWindow
                 , _feTrimClock = getMonotonicTime
                 , _feLogger = _cfLogger cf
@@ -635,6 +637,19 @@ withChainFreezer cst underLock blockWaiting latestTime inner = case _cstFreezer 
             inner (void $ tryPutMVar started ())
                 `finally` writeIORef (_cstDrain cst) Nothing
     _ -> inner (return ())
+
+-- | The checkpoints before a trim chunk that 'withChainFreezer' gives the
+-- freezer: the WAL checkpointer's 'checkpointBeforeLock' of the hot
+-- connection (the one the freezer trims), and its 'checkpointUnderLock' of
+-- the connection the freezer holds. Both 'Nothing' when the node runs
+-- without the checkpointer.
+--
+freezerTrimCheckpoints
+    :: ChainFreezer
+    -> (IO (Maybe WriterCheckpoint), SQLiteEnv -> IO (Maybe WriterCheckpoint))
+freezerTrimCheckpoints cf = case _pstWalCheckpointer (_cfStorage cf) of
+    Nothing -> (return Nothing, \_ -> return Nothing)
+    Just cp -> (checkpointBeforeLock cp (_cfHot cf), checkpointUnderLock cp)
 
 -- | Stops the chain's freezer and runs it to the end (@--only-sync-pact@).
 -- 'False' when no freezer runs.

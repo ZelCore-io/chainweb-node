@@ -57,14 +57,24 @@
 --   once per 1000 frames before. The backstop is SQLite's own mechanism, so
 --   it holds when the thread is slow or dead.
 --
---   The freezer keeps the backstop out of its trim chunks: before each
---   chunk, under the Pact connection's lock (no Pact transaction open), it
---   calls 'checkpointBeforeWrite', a PASSIVE on this thread's connection and
---   schedule. That PASSIVE copies every frame unless a reader pins some, so
---   the chunk's write restarts the WAL and its commit does not run the
---   backstop. It is skipped while the WAL is short (the last call, less
---   than a poll ago, found fewer than '_wccSoftFrames' frames) and never
---   waits for the thread.
+--   The freezer keeps the backstop out of its trim chunks in two phases,
+--   both PASSIVE on this thread's connection and schedule, neither waiting
+--   for the thread. First, before it takes the Pact connection's lock,
+--   'checkpointBeforeLock' copies the bulk of the WAL and syncs while
+--   block commits go on (skipped while the WAL is short: the last call,
+--   less than a poll ago, found fewer than '_wccSoftFrames' frames). It
+--   leaves the frames committed while it runs, or that a reader pins, and
+--   the WAL then does not restart at the chunk's write. (A commit after a
+--   complete first phase restarts the WAL itself.) So second, under the lock (no Pact
+--   transaction open), 'checkpointUnderLock' copies what is left, only
+--   while the WAL is long: the last known length (that first call's, or
+--   the thread's if later) at or over a quarter of '_wccRestartFrames'.
+--   That PASSIVE copies every frame unless a reader pins some, so the
+--   chunk's write restarts the WAL and its commit does not run the
+--   backstop; a shorter WAL is far enough from the backstop that a chunk
+--   cannot reach it, and the next chunk checks again. The lock is so held
+--   for a checkpoint about once per quarter backstop of frames, and then
+--   only for the frames written since the first phase.
 --
 --   Considered and rejected: a RESTART or TRUNCATE checkpoint from the
 --   thread at a hard limit. It takes the write lock and waits for readers
@@ -94,6 +104,7 @@
 -- * Liveness ('walCheckpointerLiveness', in the freezer's stats): whether
 --   the thread runs, and the time since its last successful checkpoint
 --   call (a PASSIVE that found nothing to copy counts: the thread works).
+--   The freezer's calls do not count: they say nothing of the thread.
 --
 -- The WAL semantics are unchanged, so crash safety is: a commit is durable
 -- under the same rules (@synchronous = NORMAL@), and a crash before a
@@ -113,7 +124,9 @@ module Chainweb.Pact.Backend.Store.WalCheckpointer
 , WalCheckpointerLiveness(..)
 , walCheckpointerLiveness
 , WriterCheckpoint(..)
-, checkpointBeforeWrite
+, checkpointBeforeLock
+, checkpointUnderLock
+, underLockFrames
 ) where
 
 import Control.Concurrent
@@ -163,7 +176,7 @@ data WalCheckpointer = WalCheckpointer
     , _wcAlive :: !(IORef Bool)
         -- ^ the thread runs
     , _wcLastOk :: !(IORef (Maybe Double))
-        -- ^ the time of the last checkpoint call that returned
+        -- ^ the time of the thread's last checkpoint call that returned
     }
 
 -- | Whether the thread runs, and the seconds since its last checkpoint call
@@ -384,6 +397,8 @@ tick cp f = handle onError $ withMVar (_wfLock f) $ \open -> when open $ do
 
     checkpoint now = do
         (copied, _) <- passiveNow cp f now
+        -- liveness: the thread's calls only
+        writeIORef (_wcLastOk cp) (Just now)
         when (copied > 0) $ walBytes f
 
     onError (e :: SomeException) = case fromException e of
@@ -403,7 +418,6 @@ tick cp f = handle onError $ withMVar (_wfLock f) $ \open -> when open $ do
 passiveNow :: WalCheckpointer -> WalFile -> Double -> IO (Int, ((Bool, Int, Int), Double))
 passiveNow cp f now = do
     r@((busy, nLog, nCkpt), ms) <- timedCheckpoint (_wfConn f) "PASSIVE"
-    writeIORef (_wcLastOk cp) (Just now)
     (t0, log0, ckpt0) <- readIORef (_wfLastCall f)
     lastCopy <- readIORef (_wfLastCopy f)
     if nLog < 0 || nCkpt < 0
@@ -458,36 +472,65 @@ passiveNow cp f now = do
 -- -------------------------------------------------------------------------- --
 -- A checkpoint before a write, on request
 
--- | What 'checkpointBeforeWrite' did.
+-- | What 'checkpointBeforeLock' or 'checkpointUnderLock' did.
 data WriterCheckpoint
     = WriterCheckpointRan !Double !Int !Bool
         -- ^ a PASSIVE ran: its time in ms, the WAL's length in frames it
         -- found, and whether it copied every frame
     | WriterCheckpointSkipped
-        -- ^ none was needed: the last checkpoint call, less than
-        -- '_wccPollMs' ago, found the WAL under '_wccSoftFrames' frames
+        -- ^ none was needed (no I/O)
     | WriterCheckpointBusy
         -- ^ the thread was checkpointing the file at that moment
+    | WriterCheckpointFailed
+        -- ^ the PASSIVE failed: counted in 'WalStats' errors and logged at
+        -- Warn (at most once a minute per file); the caller goes on and
+        -- the backstop holds
     deriving (Show, Eq)
 
--- | A PASSIVE checkpoint of the given writer's file now, on the
--- checkpointer's connection, for a caller that holds the writer's lock (no
--- transaction of the writer is open, and none begins during the call). The
--- PASSIVE then copies every frame unless a reader pins some, and the
+-- | The first phase before a write of the given writer: a PASSIVE
+-- checkpoint of its file now, on the checkpointer's connection, for a
+-- caller that does not hold the writer's lock. It copies the bulk of the
+-- WAL and syncs while the writer goes on. Skipped when the last call (the
+-- thread's or one of these), less than '_wccPollMs' ago, found fewer than
+-- '_wccSoftFrames' frames: that reads only the state the thread keeps, no
+-- I/O. It never waits for the thread: when the thread checkpoints the file
+-- at that moment it returns 'WriterCheckpointBusy'. Like the thread it
+-- never opens the @-shm@ or @-wal@ file and never runs anything but
+-- PASSIVE. 'Nothing' when the writer is not registered.
+checkpointBeforeLock :: WalCheckpointer -> SQLiteEnv -> IO (Maybe WriterCheckpoint)
+checkpointBeforeLock cp = writerCheckpoint cp $ \now (t, nLog, _) ->
+    (now - t) * 1000 < fromIntegral (_wccPollMs cfg) && nLog < _wccSoftFrames cfg
+  where
+    cfg = _wcConfig cp
+
+-- | The second phase, for a caller that holds the writer's lock (no
+-- transaction of the writer is open, and none begins during the call): a
+-- PASSIVE checkpoint when the WAL's last known length (the first phase's,
+-- or the thread's if later) is at least 'underLockFrames'; skipped, without
+-- I/O, below. The PASSIVE copies what the first phase left (the frames
+-- committed during or after it), every frame unless a reader pins some, so the
 -- writer's next transaction restarts the WAL: its commit cannot reach the
 -- '_wccRestartFrames' backstop and checkpoint inside it. The freezer calls
 -- it before each trim chunk (back-to-back block commits keep the thread's
--- checkpoints from ever finding that moment).
---
--- It is cheap when the WAL is short: skipped when the last call (the
--- thread's or this one), less than '_wccPollMs' ago, found fewer than
--- '_wccSoftFrames' frames; that reads only the state the thread keeps, no
--- I/O. It never waits for the thread: when the thread checkpoints the file
--- at that moment it returns 'WriterCheckpointBusy'. Like the thread it never
--- opens the @-shm@ or @-wal@ file and never runs anything but PASSIVE.
--- 'Nothing' when the writer is not registered.
-checkpointBeforeWrite :: WalCheckpointer -> SQLiteEnv -> IO (Maybe WriterCheckpoint)
-checkpointBeforeWrite cp writer = do
+-- checkpoints from ever finding that moment). Busy, failure and
+-- registration as 'checkpointBeforeLock'.
+checkpointUnderLock :: WalCheckpointer -> SQLiteEnv -> IO (Maybe WriterCheckpoint)
+checkpointUnderLock cp = writerCheckpoint cp $ \_ (_, nLog, _) ->
+    nLog < underLockFrames (_wcConfig cp)
+
+-- | The WAL length, in frames, from which 'checkpointUnderLock' runs: a
+-- quarter of '_wccRestartFrames' (4,096 at the default 16,384).
+underLockFrames :: WalCheckpointConfig -> Int
+underLockFrames cfg = max 1 (_wccRestartFrames cfg `div` 4)
+
+-- | A PASSIVE of the writer's file under its '_wfLock', unless the rule
+-- (given the time and the file's last call) skips it.
+writerCheckpoint
+    :: WalCheckpointer
+    -> (Double -> (Double, Int, Int) -> Bool)
+    -> SQLiteEnv
+    -> IO (Maybe WriterCheckpoint)
+writerCheckpoint cp skip writer = do
     files <- readMVar (_wcFiles cp)
     case filter ((== writer) . _wfWriter) (M.elems files) of
         [] -> return Nothing
@@ -496,21 +539,27 @@ checkpointBeforeWrite cp writer = do
             Just False -> putMVar (_wfLock f) False >> return Nothing
             Just True -> (`finally` putMVar (_wfLock f) True) $ restore $ do
                 now <- getMonotonicTime
-                (t, nLog, _) <- readIORef (_wfLastCall f)
-                if (now - t) * 1000 < fromIntegral (_wccPollMs cfg) && nLog < _wccSoftFrames cfg
+                lastCall <- readIORef (_wfLastCall f)
+                if skip now lastCall
                 then return (Just WriterCheckpointSkipped)
                 else handle (onError f) $ do
                     (_, ((busy, l, k), ms)) <- passiveNow cp f now
                     return $ Just $ WriterCheckpointRan ms (max 0 l) (not busy && k >= l)
   where
-    cfg = _wcConfig cp
-    -- counted and left to the thread, as a failed tick is; the caller's
-    -- write goes on and the backstop holds
+    -- counted and logged (rate-limited, as a failed tick is); the caller's
+    -- write goes on and the backstop holds. Runs under '_wfLock', as the
+    -- other updates of the stats do.
     onError f (e :: SomeException) = case fromException e of
         Just (_ :: SomeAsyncException) -> throwIO e
         Nothing -> do
             modifyIORef' (_wfStats f) $ \s -> s { _wstErrors = _wstErrors s + 1 }
-            return (Just WriterCheckpointBusy)
+            now <- getMonotonicTime
+            lastW <- readIORef (_wfLastWarn f)
+            when (now - lastW >= 60) $ do
+                writeIORef (_wfLastWarn f) now
+                _wcLog cp Warn $ "WAL checkpointer: a checkpoint before a write of " <> _wfLabel f
+                    <> " failed: " <> T.pack (displayException e)
+            return (Just WriterCheckpointFailed)
 
 -- | The size of the @-wal@ file, from its metadata (@stat@): the file is
 -- never opened here (see the module header).

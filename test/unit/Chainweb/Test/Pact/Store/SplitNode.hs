@@ -96,7 +96,7 @@ tests = testGroup "Split store node"
     , testCase "restart at freeze depth 3: the freezer waits for the startup rewind, so a recent rewind is not refused" freezerAfterRewindTest
     , testCase "split start on a fresh directory: the hot file has no schema yet; the chain starts and the store runs" freshSplitTest
     , testCase "shadow start on a fresh directory: the split side does not break" freshShadowTest
-    , testCase "WAL checkpointer: auto is on in split and shadow (every writer: hot, legacy) and off in sqlite; on works in sqlite; off is off; the final checkpoint empties the WAL" walCheckpointerWiringTest
+    , testCase "WAL checkpointer: auto is on in split and shadow (every writer: hot, legacy) and off in sqlite; on works in sqlite; off is off; the final checkpoint empties the WAL; the freezer's trim checkpoints reach it for the hot connection" walCheckpointerWiringTest
     , testCase "a failed SQLite statement names SQLite's message, not only the error code" errorDetailTest
     , testCase "test storage: a shadow chain whose split side broke fails the test, with the storage log" shadowBrokenFailsTestTest
     , testCase "test storage: the release closes the storage also when the shadow check fails" releaseAfterFailedCheckTest
@@ -382,6 +382,14 @@ walCheckpointerWiringTest = forM_ cases $ \(store, mode, expect) ->
                     >> void (return env)
                 ChainStoreSplit _ -> return ()
                 ChainStoreSqlite -> return ()
+            -- the freezer's checkpoints before a trim chunk reach the
+            -- checkpointer for the hot connection: 'Just' with one,
+            -- 'Nothing' without
+            forM_ (_cstFreezer cst) $ \fz -> do
+                let (outside, under) = freezerTrimCheckpoints fz
+                o <- outside
+                u <- under (_cfHot fz)
+                assertEqual (what <> ": trim checkpoints wired (" <> show (o, u) <> ")") (expect, expect) (isJust o, isJust u)
     when expect $ do
         wals <- filter ((== "-wal") . reverse . take 4 . reverse) <$> listDirectoryRec root
         forM_ wals $ \w -> getFileSize w >>= assertEqual (what <> ": " <> takeFileName w) 0

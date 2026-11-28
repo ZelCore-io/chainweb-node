@@ -38,6 +38,9 @@ module Chainweb.Pact.Backend.Store.Freezer
 , noHooks
 , FreezerStats(..)
 , emptyFreezerStats
+, TrimCheckpointStats(..)
+, emptyTrimCheckpointStats
+, trimLockPercentile
 , isTransientSqliteError
 , trimChunkPercentile
 , freezerStatsJson
@@ -215,32 +218,76 @@ data FreezerStats = FreezerStats
         -- ^ the longest trim chunk net of the GC time inside it: a chunk
         -- over the bar only by a GC pause is under it here; 'Nothing'
         -- unless the RTS keeps stats (@+RTS -T@)
-    , _fsTrimCheckpoints :: !Int
-        -- ^ PASSIVE checkpoints run before a trim chunk, under the Pact
-        -- connection's lock ('_feTrimCheckpoint'); not part of any chunk's
-        -- time
-    , _fsTrimCheckpointSkips :: !Int
-        -- ^ trim chunks that needed none (the WAL was short at a recent
-        -- check) or found the checkpointer's thread at the file
-    , _fsTrimCheckpointMs :: !Double
-    , _fsTrimCheckpointMaxMs :: !Double
-    , _fsTrimCheckpointWalFramesMax :: !Int
-        -- ^ the longest WAL, in frames, a checkpoint before a trim chunk
-        -- found: the WAL a chunk's commit would have added to
+    , _fsTrimCkptOutside :: !TrimCheckpointStats
+        -- ^ the first phase of the checkpoint before each trim chunk, before
+        -- the Pact connection's lock ('_feTrimCheckpointOutside'): block
+        -- commits go on during it; not part of any chunk's or lock time
+    , _fsTrimCkptUnderLock :: !TrimCheckpointStats
+        -- ^ the second phase, under the lock ('_feTrimCheckpoint'): part of
+        -- the lock time ('_fsTrimLockMaxMs'), not of the chunk's
+    , _fsTrimLockMaxMs :: !Double
+        -- ^ the longest hold of the Pact connection's lock for a trim chunk:
+        -- the checkpoint under it and the chunk. A block commit waits for
+        -- it.
+    , _fsTrimLockSamples :: !(Seq.Seq Double)
+        -- ^ the last 'trimSampleCap' lock holds, in ms
     }
     deriving (Eq, Show)
+
+-- | The calls of one phase of the checkpoint before the trim chunks, by
+-- result ('WriterCheckpoint'), and their time on the trim clock.
+data TrimCheckpointStats = TrimCheckpointStats
+    { _tcsRuns :: !Int
+        -- ^ PASSIVE checkpoints run
+    , _tcsSkips :: !Int
+        -- ^ none needed (no I/O)
+    , _tcsBusy :: !Int
+        -- ^ the checkpointer's thread was at the file; none ran
+    , _tcsErrors :: !Int
+        -- ^ the PASSIVE failed (logged by the checkpointer)
+    , _tcsMs :: !Double
+        -- ^ the time of all calls
+    , _tcsMaxMs :: !Double
+    , _tcsWalFramesMax :: !Int
+        -- ^ the longest WAL, in frames, a PASSIVE found
+    }
+    deriving (Eq, Show)
+
+emptyTrimCheckpointStats :: TrimCheckpointStats
+emptyTrimCheckpointStats = TrimCheckpointStats 0 0 0 0 0 0 0
+
+-- | One call ('Nothing': no checkpointer, not counted) and its time in ms.
+addTrimCheckpoint :: Maybe WriterCheckpoint -> Double -> TrimCheckpointStats -> TrimCheckpointStats
+addTrimCheckpoint Nothing _ s = s
+addTrimCheckpoint (Just r) ms s = counted
+    { _tcsMs = _tcsMs s + ms
+    , _tcsMaxMs = max (_tcsMaxMs s) ms
+    }
+  where
+    counted = case r of
+        WriterCheckpointRan _ l _ -> s { _tcsRuns = _tcsRuns s + 1, _tcsWalFramesMax = max (_tcsWalFramesMax s) l }
+        WriterCheckpointSkipped -> s { _tcsSkips = _tcsSkips s + 1 }
+        WriterCheckpointBusy -> s { _tcsBusy = _tcsBusy s + 1 }
+        WriterCheckpointFailed -> s { _tcsErrors = _tcsErrors s + 1 }
 
 emptyFreezerStats :: FreezerStats
 emptyFreezerStats = FreezerStats
     0 0 0 0 0 0 0 0 0 0 Seq.empty 0 Nothing Nothing Nothing Nothing Nothing Nothing 0 0 0 0 Nothing 0 Nothing Nothing
-    Nothing 0 0 0 0 0
+    Nothing emptyTrimCheckpointStats emptyTrimCheckpointStats 0 Seq.empty
 
 trimSampleCap :: Int
 trimSampleCap = 8192
 
 -- | A percentile (in [0, 1]) of the recent trim chunk times, in ms.
 trimChunkPercentile :: Double -> FreezerStats -> Maybe Double
-trimChunkPercentile q st = case sort (foldr (:) [] (_fsTrimSamples st)) of
+trimChunkPercentile q = samplePercentile q . _fsTrimSamples
+
+-- | A percentile (in [0, 1]) of the recent trim lock holds, in ms.
+trimLockPercentile :: Double -> FreezerStats -> Maybe Double
+trimLockPercentile q = samplePercentile q . _fsTrimLockSamples
+
+samplePercentile :: Double -> Seq.Seq Double -> Maybe Double
+samplePercentile q xs0 = case sort (foldr (:) [] xs0) of
     [] -> Nothing
     xs -> Just $ xs !! min (length xs - 1) (floor (q * fromIntegral (length xs)))
 
@@ -264,11 +311,22 @@ freezerStatsJson c st = object
         , "trimCommitMaxMs" .= _fsTrimCommitMaxMs st
         , "trimGcMaxMs" .= _fsTrimGcMaxMs st
         , "trimMaxExGcMs" .= _fsTrimMaxExGcMs st
-        , "trimCheckpoints" .= _fsTrimCheckpoints st
-        , "trimCheckpointSkips" .= _fsTrimCheckpointSkips st
-        , "trimCheckpointMs" .= _fsTrimCheckpointMs st
-        , "trimCheckpointMaxMs" .= _fsTrimCheckpointMaxMs st
-        , "trimCheckpointWalFramesMax" .= _fsTrimCheckpointWalFramesMax st
+        , "trimLockMaxMs" .= _fsTrimLockMaxMs st
+        , "trimLockP99Ms" .= trimLockPercentile 0.99 st
+        , "trimCheckpoints" .= _tcsRuns ul
+        , "trimCheckpointSkips" .= _tcsSkips ul
+        , "trimCheckpointBusy" .= _tcsBusy ul
+        , "trimCheckpointErrors" .= _tcsErrors ul
+        , "trimCheckpointMs" .= _tcsMs ul
+        , "trimCheckpointMaxMs" .= _tcsMaxMs ul
+        , "trimCheckpointWalFramesMax" .= _tcsWalFramesMax ul
+        , "trimOutsideCheckpoints" .= _tcsRuns ol
+        , "trimOutsideCheckpointSkips" .= _tcsSkips ol
+        , "trimOutsideCheckpointBusy" .= _tcsBusy ol
+        , "trimOutsideCheckpointErrors" .= _tcsErrors ol
+        , "trimOutsideCheckpointMs" .= _tcsMs ol
+        , "trimOutsideCheckpointMaxMs" .= _tcsMaxMs ol
+        , "trimOutsideCheckpointWalFramesMax" .= _tcsWalFramesMax ol
         , "halted" .= fmap (T.pack . show) (_fsHaltedHash st)
         , "split" .= fmap splitJson (_fsSplitCounters st)
         , "coldCacheHits" .= _fsCacheHits st
@@ -283,6 +341,8 @@ freezerStatsJson c st = object
         ]
     ]
   where
+    ul = _fsTrimCkptUnderLock st
+    ol = _fsTrimCkptOutside st
     walJson l = object
         [ "alive" .= _wclAlive l
         , "lastCheckpointAgeSeconds" .= _wclLastCheckpointAgeSeconds l
@@ -370,10 +430,14 @@ data FreezerEnv = FreezerEnv
         -- ^ shadow mode: the differences of the chain ('_shDifferences')
     , _feWalCheckpointer :: !(IO (Maybe WalCheckpointerLiveness))
         -- ^ the node's WAL checkpointer ('walCheckpointerLiveness')
+    , _feTrimCheckpointOutside :: !(IO (Maybe WriterCheckpoint))
+        -- ^ runs before each trim chunk, before the Pact connection's lock:
+        -- the WAL checkpointer's 'checkpointBeforeLock' of the connection
+        -- ('Nothing' without one)
     , _feTrimCheckpoint :: !(SQLiteEnv -> IO (Maybe WriterCheckpoint))
         -- ^ runs under the Pact connection's lock before each trim chunk,
         -- given the connection: the WAL checkpointer's
-        -- 'checkpointBeforeWrite' ('Nothing' without one)
+        -- 'checkpointUnderLock' ('Nothing' without one)
     , _feTrimWindow :: !TrimWindow
     , _feTrimClock :: !(IO Double)
         -- ^ seconds, for the trim chunk times: 'getMonotonicTime'; tests
@@ -734,11 +798,20 @@ trimStep env f from = do
             _feBeforeTrimChunk env
             w <- maybe (_twStart tw) id . _fsTrimWindow <$> readIORef (_feStats env)
             let hiW = min fe (lo + Pact4.TxId w)
-            r <- _feWithPactDb env $ \db -> do
-                -- a PASSIVE checkpoint while no Pact transaction is open:
-                -- the chunk's write then restarts the WAL, and its commit
-                -- cannot reach the writer's backstop autocheckpoint. Timed
-                -- apart from the chunk.
+            -- the checkpoint before the chunk, in two phases (see
+            -- 'checkpointBeforeLock'): the bulk of the WAL first, while
+            -- block commits go on
+            o0 <- clock
+            ock <- _feTrimCheckpointOutside env
+            o1 <- clock
+            modifyIORef' (_feStats env) $ \s -> s
+                { _fsTrimCkptOutside = addTrimCheckpoint ock ((o1 - o0) * 1000) (_fsTrimCkptOutside s) }
+            (ck, kt, lt, r) <- _feWithPactDb env $ \db -> do
+                -- then, under the lock and while no Pact transaction is
+                -- open, the rest when the WAL is long: the chunk's write
+                -- then restarts the WAL, and its commit cannot reach the
+                -- writer's backstop autocheckpoint. Timed apart from the
+                -- chunk, and part of the lock time.
                 k0 <- clock
                 ck <- _feTrimCheckpoint env db
                 k1 <- clock
@@ -754,18 +827,24 @@ trimStep env f from = do
                     _ -> return Nothing
                 t1 <- clock
                 g1 <- gcSeconds
-                return ((\(n, hi, capped, tc) -> ((n, hi, capped), t1 - t0, t1 - tc, (-) <$> g1 <*> g0, (ck, k1 - k0))) <$> r)
+                return (ck, k1 - k0, t1 - k0, (\(n, hi, capped, tc) -> ((n, hi, capped), t1 - t0, t1 - tc, (-) <$> g1 <*> g0)) <$> r)
+            let ckMs = kt * 1000
+                lockMs = lt * 1000
+            modifyIORef' (_feStats env) $ \s -> s
+                { _fsTrimCkptUnderLock = addTrimCheckpoint ck ckMs (_fsTrimCkptUnderLock s)
+                , _fsTrimLockMaxMs = max (_fsTrimLockMaxMs s) lockMs
+                , _fsTrimLockSamples = Seq.drop (Seq.length (_fsTrimLockSamples s) + 1 - trimSampleCap)
+                    (_fsTrimLockSamples s Seq.|> lockMs)
+                }
             case r of
-                Nothing -> return TrimHashMismatch
-                Just ((n, hi, capped), dt, cm, gc, (ck, kt)) -> do
+                Nothing -> do
+                    -- the lock was held for the checkpoint and the check
+                    _feAfterTrimChunk env lt
+                    return TrimHashMismatch
+                Just ((n, hi, capped), dt, cm, gc) -> do
                     let ms = dt * 1000
                         Pact4.TxId e = hi - lo
                         w' = nextTrimWindow tw w e capped ms
-                        ckMs = kt * 1000
-                        (ran, skipped, ckFrames) = case ck of
-                            Just (WriterCheckpointRan _ l _) -> (1, 0, l)
-                            Just _ -> (0, 1, 0)
-                            Nothing -> (0, 0, 0 :: Int)
                     p0 <- clock
                     _ccTrimProgress (_feCold env) hi
                     p1 <- clock
@@ -785,22 +864,19 @@ trimStep env f from = do
                         , _fsTrimMaxExGcMs = case gc of
                             Nothing -> _fsTrimMaxExGcMs s
                             Just g -> Just (max (ms - g * 1000) (maybe 0 id (_fsTrimMaxExGcMs s)))
-                        , _fsTrimCheckpoints = _fsTrimCheckpoints s + ran
-                        , _fsTrimCheckpointSkips = _fsTrimCheckpointSkips s + skipped
-                        , _fsTrimCheckpointMs = _fsTrimCheckpointMs s + ckMs
-                        , _fsTrimCheckpointMaxMs = max (_fsTrimCheckpointMaxMs s) ckMs
-                        , _fsTrimCheckpointWalFramesMax = max (_fsTrimCheckpointWalFramesMax s) ckFrames
                         }
-                    -- a chunk over the gate's bar (twice the target): its
-                    -- split, so that a GC pause or the checkpoint before it
-                    -- tells apart from trim work
-                    when (ms > 2 * _twTargetMs tw) $ logg env Info $ "trim chunk over "
-                        <> T.pack (show (2 * _twTargetMs tw)) <> " ms: " <> T.pack (show ms)
-                        <> " ms (commit " <> T.pack (show (cm * 1000))
+                    -- a lock hold over the gate's bar (twice the target): its
+                    -- split, so that a GC pause or the checkpoint under the
+                    -- lock tells apart from trim work
+                    when (lockMs > 2 * _twTargetMs tw) $ logg env Info $ "trim lock hold over "
+                        <> T.pack (show (2 * _twTargetMs tw)) <> " ms: " <> T.pack (show lockMs)
+                        <> " ms (checkpoint " <> T.pack (show ckMs)
+                        <> " ms, chunk " <> T.pack (show ms)
+                        <> " ms, its commit " <> T.pack (show (cm * 1000))
                         <> " ms, GC " <> maybe "n/a" (\g -> T.pack (show (g * 1000))) gc
-                        <> " ms); the checkpoint before it, not counted: " <> T.pack (show ckMs) <> " ms"
-                    -- the duty time: the lock was held for the checkpoint too
-                    _feAfterTrimChunk env (dt + kt + (p1 - p0))
+                        <> " ms); the checkpoint before the lock: " <> T.pack (show ((o1 - o0) * 1000)) <> " ms"
+                    -- the duty time: the lock time and the position write
+                    _feAfterTrimChunk env (lt + (p1 - p0))
                     _fhAfterTrimChunk (_feHooks env)
                     go work hi (total + n)
       where
